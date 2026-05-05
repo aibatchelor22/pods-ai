@@ -190,7 +190,7 @@ After reviewing the predictions you can move the segments into the appropriate
 
 ```
 usage: python add_samples.py <wav_file> [--node-name NAME] [--timestamp TIMESTAMP]
-                             [--output-dir DIR] [--model-path PATH]
+                             [--output-dir DIR] [--model-path PATH] [--uri URI]
 ```
 
 | Argument | Description |
@@ -200,6 +200,7 @@ usage: python add_samples.py <wav_file> [--node-name NAME] [--timestamp TIMESTAM
 | `--timestamp` | PST timestamp of the **start** of the recording (e.g. `2025_01_15_12_30_00_PST`). **Inferred from the input filename if omitted.** |
 | `--output-dir` | Directory to save segments (default: `new`) |
 | `--model-path` | HuggingFace Hub model ID or path to a local podsai model directory (default: `davethaler/whale-call-detector`) |
+| `--uri` | Optional custom URI to use for all segments. If provided, all output rows will use this URI instead of generating one per segment. Useful when all segments come from the same detection. |
 
 **Example — node name and timestamp inferred from filename**
 
@@ -216,6 +217,20 @@ python add_samples.py /path/to/recording.wav \
     --node-name rpi_orcasound_lab \
     --timestamp 2025_01_15_12_30_00_PST \
     --model-path /path/to/local-model
+```
+
+
+**Example — use custom URI for all segments**
+
+When all segments come from the same detection event, you can specify a single URI
+to use for all output rows:
+
+```bash
+cd src
+python add_samples.py /path/to/recording.wav \
+    --node-name rpi_orcasound_lab \
+    --timestamp 2025_01_15_12_30_00_PST \
+    --uri "https://live.orcasound.net/bouts/new/rpi_orcasound_lab?time=2025-01-15T20%3A30%3A00.000Z"
 ```
 
 Output:
@@ -250,13 +265,13 @@ usage: python run_inference.py <wav_file> [--model {podsai,fastai,orcahello}] [-
 |---|---|
 | `wav_file` | Path to the wav file to score |
 | `--model` | Model type: `podsai` (default), `fastai`, or `orcahello` |
-| `--model-path` | Path to model directory or HuggingFace Hub model ID. Required for `podsai`; defaults to `./model` for `fastai`; defaults to `orcasound/orcahello-srkw-detector-v1` for `orcahello` |
+| `--model-path` | Path to model directory or HuggingFace Hub model ID. Required for `podsai`; defaults to `./model` for `fastai`; defaults to `orcasound/orcahello-srkw-detector-v1` for `orcahello`; defaults to `davethaler/whale-call-detector` for `podsai` |
 
 **Example — PODS-AI model**
 
 ```bash
 cd src
-python run_inference.py sample.wav --model podsai --model-path /path/to/podsai-model
+python run_inference.py sample.wav --model podsai
 ```
 
 Output:
@@ -323,7 +338,7 @@ Per-class probabilities:
   resident: 0.8000
 ```
 
-You can compare results between the FastAI model and the OrcaHello model by running both on the
+You can compare results between models by running each on the
 same file and comparing the output.
 
 ### compare_models.py

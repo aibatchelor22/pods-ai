@@ -226,8 +226,6 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         if num_positions < 1:
             num_positions = 1
 
-        print(f"  Processing {num_positions} positions with {segment_duration}s window, {hop_duration}s hop...")
-
         # Collect all segments first, then batch-process them in a single forward pass
         # for better performance (fewer model calls, better hardware utilization).
         segments = []

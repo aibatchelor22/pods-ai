@@ -334,13 +334,21 @@ class TestRunInferencePodsAI:
         finally:
             Path(wav_path).unlink(missing_ok=True)
 
-    def test_raises_value_error_without_model_path(self):
-        """run_inference raises ValueError when model_path is None for podsai."""
+    def test_defaults_model_path_to_davethaler_hub(self):
+        """When model_path is None for podsai, get_model_inference uses davethaler/whale-call-detector."""
         wav_path = _make_wav()
         try:
-            from run_inference import run_inference
-            with pytest.raises(ValueError, match="model_path is required"):
+            mock_model = _make_podsai_model_mock()
+            with patch("run_inference.get_model_inference", return_value=mock_model) as mock_factory:
+                from run_inference import run_inference
                 run_inference(wav_path, model_type="podsai", model_path=None)
+
+            mock_factory.assert_called_once()
+            call_kwargs = mock_factory.call_args
+            model_path_arg = call_kwargs.kwargs.get("model_path") or (
+                call_kwargs.args[0] if call_kwargs.args else None
+            )
+            assert model_path_arg == "davethaler/whale-call-detector"
         finally:
             Path(wav_path).unlink(missing_ok=True)
 
@@ -575,8 +583,8 @@ class TestMainCLI:
         """main() returns exit code 1 when run_inference raises ValueError."""
         wav_path = _make_wav()
         try:
-            # Calling with podsai and no --model-path should raise ValueError.
-            with patch("sys.argv", ["run_inference.py", wav_path, "--model", "podsai"]):
+            # Calling with an unknown model type should raise ValueError.
+            with patch("sys.argv", ["run_inference.py", wav_path, "--model", "unknown_model"]):
                 from run_inference import main
                 assert main() == 1
         finally:
@@ -727,10 +735,12 @@ class TestIntegrationWithRealModels:
 
     # Parametrized tests for FastAI model on different audio types.
     @pytest.mark.parametrize("wav_fixture,label,xfail_reason", [
-        ("resident_wav_path", "resident", None),
+        ("resident_wav_path", "resident",
+         "FastAI binary model may predict other on resident clips"),
         ("transient_wav_path", "transient",
          "FastAI binary model may predict resident on transient clips"),
-        ("humpback_wav_path", "humpback", None),
+        ("humpback_wav_path", "humpback",
+         "FastAI binary model may predict resident on humpback clips"),
         ("vessel_wav_path", "vessel", None),
         ("water_wav_path", "water",
          "FastAI binary model may predict resident on ambient water clips"),

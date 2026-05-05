@@ -309,38 +309,56 @@ class TestSplitWavIntoSegments:
 class TestGetSegmentPrediction:
     """Tests for get_segment_prediction."""
 
-    def test_podsai_returns_global_prediction_label(self, tmp_path):
-        """Prediction label comes from global_prediction_label."""
+    def test_podsai_returns_label_and_confidence(self, tmp_path):
+        """Prediction returns both label and confidence from model output."""
         fake_path = tmp_path / "seg.wav"
         fake_path.write_bytes(b"")
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "humpback"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "humpback",
+            "global_confidence": 0.85
+        }
 
-        label = get_segment_prediction(mock_model, fake_path)
+        label, confidence = get_segment_prediction(mock_model, fake_path)
 
         assert label == "humpback"
+        assert confidence == 0.85
 
-    def test_returns_unknown_when_label_missing(self, tmp_path):
-        """get_segment_prediction should return 'unknown' when key is absent."""
+    def test_returns_unknown_and_zero_confidence_when_label_missing(self, tmp_path):
+        """get_segment_prediction should return ('unknown', 0.0) when key is absent."""
         fake_path = tmp_path / "seg.wav"
         fake_path.write_bytes(b"")
         mock_model = MagicMock()
         mock_model.predict.return_value = {}
 
-        label = get_segment_prediction(mock_model, fake_path)
+        label, confidence = get_segment_prediction(mock_model, fake_path)
 
         assert label == "unknown"
+        assert confidence == 0.0
 
-    def test_returns_unknown_on_inference_failure(self, tmp_path, capsys):
-        """get_segment_prediction should return 'unknown' if inference raises."""
+    def test_returns_label_with_default_confidence_when_confidence_missing(self, tmp_path):
+        """get_segment_prediction should return label with 0.0 confidence if confidence key is absent."""
+        fake_path = tmp_path / "seg.wav"
+        fake_path.write_bytes(b"")
+        mock_model = MagicMock()
+        mock_model.predict.return_value = {"global_prediction_label": "resident"}
+
+        label, confidence = get_segment_prediction(mock_model, fake_path)
+
+        assert label == "resident"
+        assert confidence == 0.0
+
+    def test_returns_unknown_and_zero_on_inference_failure(self, tmp_path, capsys):
+        """get_segment_prediction should return ('unknown', 0.0) if inference raises."""
         fake_path = tmp_path / "seg.wav"
         fake_path.write_bytes(b"")
         mock_model = MagicMock()
         mock_model.predict.side_effect = RuntimeError("model error")
 
-        label = get_segment_prediction(mock_model, fake_path)
+        label, confidence = get_segment_prediction(mock_model, fake_path)
 
         assert label == "unknown"
+        assert confidence == 0.0
         captured = capsys.readouterr()
         assert "Warning" in captured.err
 
@@ -364,14 +382,19 @@ class TestAddSamples:
             (seg2, "2025_01_15_12_30_02_PST"),
         ]
 
-    def test_returns_list_of_filepath_label_tuples(self, tmp_path):
-        """add_samples should return (filepath, label) pairs for each segment."""
+    def test_returns_list_of_dicts_with_manual_samples_format(self, tmp_path):
+        """add_samples should return list of dicts matching manual_samples.csv format."""
         fake_segments = self._fake_split(tmp_path)
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "water"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.92
+        }
 
         with patch("add_samples.split_wav_into_segments", return_value=fake_segments), \
-             patch("add_samples.get_model_inference", return_value=mock_model):
+             patch("add_samples.get_model_inference", return_value=mock_model), \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
 
             results = add_samples(
                 wav_file="fake.wav",
@@ -382,18 +405,29 @@ class TestAddSamples:
             )
 
         assert len(results) == 2
-        for filepath, label in results:
-            assert isinstance(filepath, str)
-            assert label == "water"
+        for row in results:
+            assert isinstance(row, dict)
+            assert row["Category"] == "water"
+            assert row["NodeName"] == "rpi_orcasound_lab"
+            assert row["Timestamp"] in ["2025_01_15_12_30_00_PST", "2025_01_15_12_30_02_PST"]
+            assert row["URI"] == "https://example.com/test"
+            assert row["Description"] == ""
+            assert row["Notes"] == "manual"
+            assert row["Confidence"] == "92.0"  # Confidence is percentage string (0.92 * 100 = 92.0)
 
     def test_default_model_path_is_used(self, tmp_path):
         """add_samples should use DEFAULT_MODEL_PATH when model_path is not provided."""
         fake_segments = self._fake_split(tmp_path)
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "water"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.75
+        }
 
         with patch("add_samples.split_wav_into_segments", return_value=fake_segments), \
-             patch("add_samples.get_model_inference", return_value=mock_model) as mock_get_model:
+             patch("add_samples.get_model_inference", return_value=mock_model) as mock_get_model, \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
 
             add_samples(
                 wav_file="fake.wav",
@@ -422,10 +456,15 @@ class TestAddSamples:
         """The model should be loaded exactly once regardless of the number of segments."""
         fake_segments = self._fake_split(tmp_path)
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "water"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.80
+        }
 
         with patch("add_samples.split_wav_into_segments", return_value=fake_segments), \
-             patch("add_samples.get_model_inference", return_value=mock_model) as mock_get_model:
+             patch("add_samples.get_model_inference", return_value=mock_model) as mock_get_model, \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
 
             add_samples(
                 wav_file="fake.wav",
@@ -442,10 +481,15 @@ class TestAddSamples:
         """add_samples should always call get_model_inference with model_type='podsai'."""
         fake_segments = self._fake_split(tmp_path)
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "water"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.70
+        }
 
         with patch("add_samples.split_wav_into_segments", return_value=fake_segments), \
-             patch("add_samples.get_model_inference", return_value=mock_model) as mock_get_model:
+             patch("add_samples.get_model_inference", return_value=mock_model) as mock_get_model, \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
 
             add_samples(
                 wav_file="fake.wav",
@@ -462,10 +506,15 @@ class TestAddSamples:
         """add_samples should parse node_name and base_timestamp from a well-formed filename."""
         fake_segments = self._fake_split(tmp_path)
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "water"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.65
+        }
 
         with patch("add_samples.split_wav_into_segments", return_value=fake_segments) as mock_split, \
-             patch("add_samples.get_model_inference", return_value=mock_model):
+             patch("add_samples.get_model_inference", return_value=mock_model), \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
 
             add_samples(
                 wav_file="rpi-orcasound-lab_2025_01_15_12_30_00_PST.wav",
@@ -482,10 +531,15 @@ class TestAddSamples:
         """Explicit node_name and base_timestamp should take precedence over filename."""
         fake_segments = self._fake_split(tmp_path)
         mock_model = MagicMock()
-        mock_model.predict.return_value = {"global_prediction_label": "water"}
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.88
+        }
 
         with patch("add_samples.split_wav_into_segments", return_value=fake_segments) as mock_split, \
-             patch("add_samples.get_model_inference", return_value=mock_model):
+             patch("add_samples.get_model_inference", return_value=mock_model), \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
 
             add_samples(
                 wav_file="rpi-orcasound-lab_2025_01_15_12_30_00_PST.wav",

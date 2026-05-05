@@ -36,6 +36,8 @@ humpback,rpi_andrews_bay,2025_12_12_02_16_29_PST,https://live.orcasound.net/bout
 humpback,rpi_andrews_bay,2025_12_17_22_12_00_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-18T06%3A12%3A00.000Z,Clear humpback calls,tp_human_only,56.1
 humpback,rpi_andrews_bay,2025_12_17_22_18_52_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-18T06%3A18%3A52.000Z,Clear humpback calls continuing,tp_human_only,57.8
 humpback,rpi_andrews_bay,2025_12_17_22_40_45_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-18T06%3A40%3A45.000Z,Humpback song continues in quiet seas,tp_human_only,70.0
+humpback,rpi_orcasound_lab,2023_10_28_07_33_43_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T14%3A33%3A43.000Z,Humpback vocalizing,tp_human_only,51.8
+humpback,rpi_orcasound_lab,2023_10_28_07_33_42_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T14%3A33%3A42.000Z,Humpback vocalizing,tp_human_only,36.0
 humpback,rpi_orcasound_lab,2025_11_27_06_03_55_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-27T14%3A03%3A55.000Z,Humpback song,tp_machine_only,100.0
 humpback,rpi_orcasound_lab,2025_12_04_01_40_31_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-12-04T09%3A40%3A31.000Z,Humpback songlike calls,tp_machine_only,65.9
 humpback,rpi_orcasound_lab,2025_12_04_01_41_03_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-12-04T09%3A41%3A03.000Z,Humpback calls,tp_machine_only,100.0
@@ -89,6 +91,8 @@ jingle,rpi_orcasound_lab,2026_01_11_08_23_07_PST,https://live.orcasound.net/bout
 jingle,rpi_port_townsend,2025_12_10_10_18_35_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2025-12-10T18%3A18%3A35.000Z,Jingle,fp_machine_only,79.4
 resident,rpi_andrews_bay,2026_02_16_22_52_59_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T06%3A52%3A59.000Z,"Good calls, clicks and a whistle",tp_machine_only,93.2
 resident,rpi_andrews_bay,2026_02_16_23_08_05_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A08%3A05.000Z,"Good calls and clicks, water slosh",tp_machine_only,96.6
+resident,rpi_andrews_bay,2026_02_16_23_09_04_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A04.000Z,Lots of J-Pod calls,tp_both,100.0
+resident,rpi_andrews_bay,2026_02_16_23_09_04_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A04.000Z,Lots of J-Pod calls,tp_both,100.0
 resident,rpi_andrews_bay,2026_02_16_23_09_04_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A04.000Z,"Good calls and clicks, water slosh",tp_machine_only,100.0
 resident,rpi_andrews_bay,2026_02_16_23_10_21_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A10%3A21.000Z,"Good calls and clicks, water slosh",tp_machine_only,94.5
 resident,rpi_bush_point,2023_11_28_13_42_57_PST,https://live.orcasound.net/bouts/new/bush-point?time=2023-11-28T21%3A42%3A57.000Z,J pod,tp_human_only,34.4

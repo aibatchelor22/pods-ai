@@ -623,7 +623,7 @@ def compute_correct_timestamp_for_tp_human_only(
         end_time = get_aligned_end_time(timestamp_str)
         wav_start_time = end_time - timedelta(seconds=60 + AUDIO_OFFSET_SECONDS)
 
-        # The detected call is at wav_start_time + time_offset_seconds.
+        # The detected call is at wav_start_time + timedelta(seconds=time_offset_seconds).
         call_time = wav_start_time + timedelta(seconds=time_offset_seconds)
         print(f"  Call detected at: {call_time}")
 
@@ -867,6 +867,123 @@ def load_manual_corrections(corrections_path: Path) -> tuple[dict[str, str], dic
     return manual_timestamps, manual_confidences
 
 
+def load_manual_samples(manual_samples_path: Path) -> list[dict]:
+    """
+    Load manually-specified training samples from CSV file.
+
+    These samples are added to training_samples.csv in addition to the automatically
+    selected samples, without displacing any existing selections. Multiple rows with
+    the same URI but different timestamps are supported (e.g., multiple 3-second
+    segments from the same detection).
+
+    Args:
+        manual_samples_path: Path to manual_samples.csv file
+
+    Returns:
+        List of sample dictionaries with same format as training_samples.csv.
+        Returns empty list if file doesn't exist or has errors.
+    """
+    manual_samples = []
+
+    if not manual_samples_path.exists():
+        return manual_samples
+
+    try:
+        print(f"\nLoading manual training samples from {manual_samples_path}...")
+        with open(manual_samples_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+
+            # Validate required columns (same as training_samples.csv format).
+            required_fields = {'Category', 'NodeName', 'Timestamp', 'URI'}
+            if not required_fields.issubset(set(reader.fieldnames or [])):
+                missing = required_fields - set(reader.fieldnames or [])
+                print(f"  Warning: Required columns missing in {manual_samples_path}: {missing}")
+                print(f"  Skipping manual samples.")
+                return []
+
+            for row_num, row in enumerate(reader, start=2):  # start=2 accounts for header.
+                try:
+                    # Validate that required fields are not empty.
+                    if not all(row.get(field, '').strip() for field in required_fields):
+                        print(f"  Warning: Skipping row {row_num} - required fields are empty")
+                        continue
+
+                    # Create sample dict with all fields from training_samples.csv format.
+                    sample = {
+                        'Category': row.get('Category', '').strip(),
+                        'NodeName': row.get('NodeName', '').strip(),
+                        'Timestamp': row.get('Timestamp', '').strip(),
+                        'URI': row.get('URI', '').strip(),
+                        'Description': row.get('Description', '').strip(),
+                        'Notes': row.get('Notes', '').strip(),
+                        'Confidence': row.get('Confidence', '').strip(),
+                    }
+
+                    manual_samples.append(sample)
+
+                except Exception as e:
+                    print(f"  Warning: Skipping row {row_num} due to error: {e}")
+                    continue
+
+        if manual_samples:
+            print(f"  Loaded {len(manual_samples)} manual training samples")
+
+    except Exception as e:
+        print(f"  Warning: Failed to load manual samples from {manual_samples_path}: {e}")
+        return []
+
+    return manual_samples
+
+
+def merge_manual_samples(
+    selected_samples: list[dict],
+    manual_samples: list[dict]
+) -> list[dict]:
+    """
+    Merge manual samples with automatically selected samples.
+
+    Manual samples are added unless they already exist (same Category, NodeName,
+    Timestamp, and URI). This allows multiple 3-second segments from the same
+    detection (same URI, different Timestamp) without causing duplicates.
+
+    Args:
+        selected_samples: Automatically selected training samples.
+        manual_samples: Manually-specified training samples from manual_samples.csv.
+
+    Returns:
+        Combined list of samples with manual samples added (no duplicates).
+    """
+    if not manual_samples:
+        return selected_samples
+
+    # Create a set of (Category, NodeName, Timestamp, URI) tuples for deduplication.
+    # This allows multiple timestamps for the same URI.
+    existing_keys = {
+        (s['Category'], s['NodeName'], s['Timestamp'], s['URI'])
+        for s in selected_samples
+    }
+
+    added_count = 0
+    duplicate_count = 0
+    merged = list(selected_samples)  # Copy the list.
+
+    for sample in manual_samples:
+        key = (sample['Category'], sample['NodeName'], sample['Timestamp'], sample['URI'])
+        if key not in existing_keys:
+            merged.append(sample)
+            existing_keys.add(key)
+            added_count += 1
+        else:
+            duplicate_count += 1
+
+    if added_count > 0:
+        print(f"\n  Added {added_count} manual samples to training set")
+    if duplicate_count > 0:
+        print(f"  Skipped {duplicate_count} duplicate manual samples (already in training set)")
+
+    return merged
+
+
 def main():
     """Main function to extract training samples."""
     # Parse command line arguments.
@@ -893,6 +1010,7 @@ def main():
         input_path = REPO_ROOT / input_path
     output_path = REPO_ROOT / 'output' / 'csv' / 'training_samples.csv'
     testing_output_path = REPO_ROOT / 'output' / 'csv' / 'testing_samples.csv'
+    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'  # ADD THIS
 
     # Load manual confidences for sorting.
     manual_corrections_path = REPO_ROOT / 'output' / 'csv' / 'manual_timestamps.csv'
@@ -915,9 +1033,14 @@ def main():
 
     print("\nSelecting training samples...")
     samples = select_training_samples(organized_data, manual_confidences)
+
+    # Load and merge manual samples.  # ADD THIS BLOCK
+    manual_samples = load_manual_samples(manual_samples_path)
+    samples = merge_manual_samples(samples, manual_samples)
+
     testing_samples = select_testing_samples(detections, samples, manual_confidences)
 
-    print(f"\nSelected {len(samples)} training samples")
+    print(f"\nSelected {len(samples)} training samples")  # This count now includes manual samples
 
     # Print breakdown by category.
     category_counts = defaultdict(int)
@@ -997,8 +1120,15 @@ def main():
         print(f"  Cannot proceed without model for tp_human_only timestamp correction.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nWriting training samples to {output_path}...")
-    write_training_samples(samples, output_path, manual_timestamps, manual_confidences, model_inference, args.duration)
+    # Merge in manual samples from manual_samples.csv
+    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'
+    manual_samples = load_manual_samples(manual_samples_path)
+
+    # Combine manual samples with auto-selected samples.
+    all_training_samples = merge_manual_samples(samples, manual_samples)
+
+    print(f"\nWriting {len(all_training_samples)} training samples to {output_path}...")
+    write_training_samples(all_training_samples, output_path, manual_timestamps, manual_confidences, model_inference, args.duration)
     print(f"Writing testing samples to {testing_output_path}...")
     write_testing_samples(testing_samples, testing_output_path)
     print("Done!")
