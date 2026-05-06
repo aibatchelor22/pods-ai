@@ -4,3 +4,4 @@ resident,rpi_andrews_bay,2026_02_16_23_09_04_PST,https://live.orcasound.net/bout
 resident,rpi_andrews_bay,2026_02_16_23_09_08_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A08.000Z,Lots of J-Pod calls,tp_both,83.8
 jingle,rpi_north_sjc,2026_03_10_13_45_42_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2026-03-10T20%3A45%3A42.000Z,chain jingle high confidence false positive,fp_machine_only,56.4
 jingle,rpi_north_sjc,2026_03_10_13_46_18_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2026-03-10T20%3A46%3A18.000Z,chain jingle high confidence false positive,fp_machine_only,60.5
+vessel,rpi_orcasound_lab,2025_06_24_20_33_46_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-06-25T03%3A33%3A46.000Z,Squeaky ship,fp_machine_only,0.0

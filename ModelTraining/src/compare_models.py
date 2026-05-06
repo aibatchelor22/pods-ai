@@ -238,7 +238,7 @@ def evaluate_model(
 
         print(
             f"  [{model_type}] {sample.category}/{sample.node_name}/{sample.timestamp}: "
-            f"predicted={predicted_label!r} → {status} ({predict_time:.2f}s)"
+            f"predicted={predicted_label!r} -> {status} ({predict_time:.2f}s)"
         )
 
     return result

@@ -22,6 +22,7 @@ jingle,rpi_orcasound_lab,2026_01_11_09_14_18_PST,https://live.orcasound.net/bout
 jingle,rpi_orcasound_lab,2026_01_11_09_16_06_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-11T17%3A16%3A06.915Z,Jingle,fp_machine_only,58.5821
 jingle,rpi_orcasound_lab,2026_01_11_09_16_17_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-11T17%3A16%3A17.000Z,Jingle,fp_machine_only,53.8842
 resident,rpi_andrews_bay,2026_02_16_23_09_06_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A06.000Z,Lots of J-Pod calls,tp_both,93.1313
+resident,rpi_andrews_bay,2026_02_16_23_09_33_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A33.237Z,"Good calls and clicks, water slosh",tp_machine_only,90.0780
 resident,rpi_mast_center,2023_11_05_10_02_28_PST,https://live.orcasound.net/bouts/new/mast-center?time=2023-11-05T18%3A02%3A28.000Z,J pod,tp_human_only,
 resident,rpi_mast_center,2023_11_05_10_14_51_PST,https://live.orcasound.net/bouts/new/mast-center?time=2023-11-05T18%3A14%3A51.000Z,J pod calls consistent and increasing in volume,tp_human_only,
 resident,rpi_mast_center,2023_11_05_10_27_44_PST,https://live.orcasound.net/bouts/new/mast-center?time=2023-11-05T18%3A27%3A44.000Z,"J pod calls masked by recreational, small vessels",tp_human_only,
@@ -40,7 +41,6 @@ resident,rpi_sunset_bay,2023_11_04_06_49_50_PST,https://live.orcasound.net/bouts
 resident,rpi_sunset_bay,2023_11_07_20_50_46_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2023-11-08T04%3A50%3A46.000Z,"clik clik clik clik clik clik clik i thank it is the l pod (SV: interesting knock sequence, but not KW clicks)",tp_human_only,
 resident,rpi_sunset_bay,2023_11_07_20_54_40_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2023-11-08T04%3A54%3A40.000Z,clik clik l pod is here,tp_human_only,
 resident,rpi_sunset_bay,2025_09_13_19_22_02_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-09-14T02%3A22%3A02.711Z,"Clear S01 and other calls, including an S10 excitement call near the end.",tp_machine_only,75.8136
-resident,rpi_sunset_bay,2025_11_01_04_05_21_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-11-01T11%3A05%3A21.000Z,"Moderate to strong calls, natural ambient",tp_machine_only,75.0795
 transient,rpi_orcasound_lab,2024_12_29_13_37_23_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-12-29T21%3A37%3A23.186Z,"Good transient calls, lots of water noise",tp_machine_only,66.1314
 transient,rpi_orcasound_lab,2024_12_29_14_08_02_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-12-29T22%3A08%3A02.000Z,"Strong transient (Bigg's) calls, loud ship noise",tp_machine_only,65.2061
 transient,rpi_orcasound_lab,2024_12_29_14_54_13_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-12-29T22%3A54%3A13.355Z,"Faint to strongTransient (Bigg's) calls, loud ship",tp_machine_only,75.4079

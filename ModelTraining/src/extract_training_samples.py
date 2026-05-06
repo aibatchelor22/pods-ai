@@ -792,7 +792,7 @@ def write_training_samples(
             processed_rows.append(output_row)
 
         # Write all rows to CSV after validation passes.
-        print(f"\n✓ Validated: All {len(processed_rows)} output samples have unique URIs")
+        print(f"\nValidated: All {len(processed_rows)} output samples have unique URIs")
         print(f"\nWriting to {output_path}...")
 
         with open(output_path, 'w', newline='', encoding='utf-8') as f:
@@ -990,51 +990,107 @@ def load_manual_samples(manual_samples_path: Path) -> list[dict]:
     return manual_samples
 
 
+def predict_output_timestamp(
+    sample: dict,
+    manual_timestamps: dict[str, str],
+    segment_duration: int = SEGMENT_DURATION_SECONDS
+) -> str:
+    """
+    Predict what timestamp a sample will have after process_sample() runs.
+
+    This mirrors the logic in process_sample() to determine the corrected timestamp
+    without actually running model inference or doing I/O.
+
+    Args:
+        sample: Detection sample dictionary.
+        manual_timestamps: Dictionary mapping URIs to corrected timestamp strings.
+        segment_duration: Duration of each audio segment in seconds.
+
+    Returns:
+        Predicted output timestamp string.
+    """
+    # Check if sample came from manual_samples.csv.
+    is_from_manual_samples = sample.get('_from_manual_samples', False)
+
+    # Strategy 1: Manual correction via manual_timestamps.csv.
+    if sample['URI'] in manual_timestamps:
+        return manual_timestamps[sample['URI']]
+
+    # Strategy 2: tp_human_only - we can't predict this without running the model,
+    # so we return the original timestamp. This means tp_human_only samples won't
+    # be caught as duplicates at merge time, but they're rare and unlikely to collide.
+    elif sample['Notes'] == 'tp_human_only':
+        # Can't predict model-based correction; assume no collision.
+        return sample['Timestamp']
+
+    # Strategy 3: Manual samples keep their timestamp as-is.
+    elif is_from_manual_samples:
+        return sample['Timestamp']
+
+    # Strategy 4: Fixed offset - subtract segment_duration.
+    else:
+        return subtract_segment_duration(sample['Timestamp'], segment_duration)
+
+
 def merge_manual_samples(
     selected_samples: list[dict],
-    manual_samples: list[dict]
+    manual_samples: list[dict],
+    manual_timestamps: dict[str, str],
+    segment_duration: int = SEGMENT_DURATION_SECONDS
 ) -> list[dict]:
     """
     Merge manual samples with automatically selected samples.
 
-    Manual samples are added unless they already exist (same Category, NodeName,
-    Timestamp, and URI). This allows multiple 3-second segments from the same
-    detection (same URI, different Timestamp) without causing duplicates.
+    Manual samples replace any automatically selected samples that would have the same
+    output (Category, NodeName, Timestamp) after process_sample() runs. This handles
+    cases where:
+    1. An auto-selected sample's timestamp will be corrected (via manual_timestamps,
+       fixed offset, or model-based correction)
+    2. That corrected timestamp matches a manual_samples.csv entry
+    3. We want the manual sample's metadata (Description, Notes) instead
 
     Args:
         selected_samples: Automatically selected training samples.
         manual_samples: Manually-specified training samples from manual_samples.csv.
+        manual_timestamps: Dictionary mapping URIs to corrected timestamp strings.
+        segment_duration: Duration of each audio segment in seconds (for fixed offset).
 
     Returns:
-        Combined list of samples with manual samples added (no duplicates).
+        Combined list of samples with manual samples replacing duplicates.
     """
     if not manual_samples:
         return selected_samples
 
-    # Create a set of (Category, NodeName, Timestamp, URI) tuples for deduplication.
-    # This allows multiple timestamps for the same URI.
-    existing_keys = {
-        (s['Category'], s['NodeName'], s['Timestamp'], s['URI'])
-        for s in selected_samples
-    }
+    # Build a set of (Category, NodeName, output_Timestamp) from manual samples.
+    manual_keys = set()
+    for s in manual_samples:
+        # Manual samples keep their timestamp as-is (they have _from_manual_samples marker).
+        output_ts = predict_output_timestamp(s, manual_timestamps, segment_duration)
+        manual_keys.add((s['Category'], s['NodeName'], output_ts))
 
-    added_count = 0
-    duplicate_count = 0
-    merged = list(selected_samples)  # Copy the list.
+    # Filter out auto-selected samples that would conflict after timestamp correction.
+    filtered_selected = []
+    replaced_count = 0
 
-    for sample in manual_samples:
-        key = (sample['Category'], sample['NodeName'], sample['Timestamp'], sample['URI'])
-        if key not in existing_keys:
-            merged.append(sample)
-            existing_keys.add(key)
-            added_count += 1
+    for sample in selected_samples:
+        # Predict what the output timestamp will be after process_sample().
+        output_ts = predict_output_timestamp(sample, manual_timestamps, segment_duration)
+
+        key = (sample['Category'], sample['NodeName'], output_ts)
+        if key in manual_keys:
+            replaced_count += 1
+            print(f"  Replacing auto-selected sample (URI: {sample['URI']}, timestamp: {sample['Timestamp']} → {output_ts}) with manual sample")
+            # Skip this auto-selected sample; it will be replaced by manual sample.
         else:
-            duplicate_count += 1
+            filtered_selected.append(sample)
 
-    if added_count > 0:
-        print(f"\n  Added {added_count} manual samples to training set")
-    if duplicate_count > 0:
-        print(f"  Skipped {duplicate_count} duplicate manual samples (already in training set)")
+    # Add all manual samples.
+    merged = filtered_selected + list(manual_samples)
+
+    if manual_samples:
+        print(f"\n  Added {len(manual_samples)} manual samples to training set")
+    if replaced_count > 0:
+        print(f"  Replaced {replaced_count} auto-selected samples with manual samples")
 
     return merged
 
@@ -1091,7 +1147,7 @@ def main():
 
     # Load and merge manual samples.
     manual_samples = load_manual_samples(manual_samples_path)
-    samples = merge_manual_samples(samples, manual_samples)
+    samples = merge_manual_samples(samples, manual_samples, manual_timestamps, args.duration)
 
     testing_samples = select_testing_samples(detections, samples, manual_confidences)
 

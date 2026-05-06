@@ -78,7 +78,7 @@ jobs:
         if: steps.skip_check.outputs.should_skip != 'true'
         working-directory: ModelTraining
         run: |
-          python -m pytest tests/ -v
+          python -m pytest tests/ -v -s
 
 
   run_tests_windows:
@@ -136,4 +136,4 @@ jobs:
         if: steps.skip_check.outputs.should_skip != 'true'
         working-directory: ModelTraining
         run: |
-          python -m pytest tests/ -v
+          python -m pytest tests/ -v -s

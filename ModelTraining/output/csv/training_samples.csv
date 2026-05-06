@@ -94,7 +94,6 @@ resident,rpi_andrews_bay,2026_02_16_22_52_59_PST,https://live.orcasound.net/bout
 resident,rpi_andrews_bay,2026_02_16_23_08_05_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A08%3A05.000Z,"Good calls and clicks, water slosh",tp_machine_only,96.6
 resident,rpi_andrews_bay,2026_02_16_23_09_04_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A04.000Z,Lots of J-Pod calls,tp_both,81.7
 resident,rpi_andrews_bay,2026_02_16_23_09_08_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A08.000Z,Lots of J-Pod calls,tp_both,83.8
-resident,rpi_andrews_bay,2026_02_16_23_09_04_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A04.000Z,"Good calls and clicks, water slosh",tp_machine_only,100.0
 resident,rpi_andrews_bay,2026_02_16_23_10_21_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A10%3A21.000Z,"Good calls and clicks, water slosh",tp_machine_only,94.5
 resident,rpi_bush_point,2023_11_28_13_42_57_PST,https://live.orcasound.net/bouts/new/bush-point?time=2023-11-28T21%3A42%3A57.000Z,J pod,tp_human_only,34.4
 resident,rpi_bush_point,2023_11_28_14_12_43_PST,https://live.orcasound.net/bouts/new/bush-point?time=2023-11-28T22%3A12%3A43.000Z,"J pod, getting louder now",tp_human_only,72.9
@@ -173,6 +172,7 @@ vessel,rpi_orcasound_lab,2025_03_15_08_41_44_PST,https://live.orcasound.net/bout
 vessel,rpi_orcasound_lab,2025_03_19_11_55_43_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-03-19T18%3A55%3A43.000Z,"Nice example of singing propeller on a ship. From M2 and MarExPS AIS logs it seems likely the source was a heavily-laden cargo ship, the Great Perseus (MMSI 372178000).",fp_machine_only,56.3
 vessel,rpi_orcasound_lab,2025_05_18_05_15_38_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-05-18T12%3A15%3A38.000Z,"Very loud, squeaky ship",fp_machine_only,62.2
 vessel,rpi_orcasound_lab,2025_06_11_01_40_27_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-06-11T08%3A40%3A27.000Z,Squeaky ship,fp_machine_only,58.6
+vessel,rpi_orcasound_lab,2025_06_24_20_33_46_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-06-25T03%3A33%3A46.000Z,Squeaky ship,fp_machine_only,0.0
 vessel,rpi_port_townsend,2024_07_21_03_17_25_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2024-07-21T10%3A17%3A25.000Z,Bell buoy and squeaky ship,fp_machine_only,64.0
 vessel,rpi_port_townsend,2025_11_25_00_47_56_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2025-11-25T08%3A47%3A56.000Z,Squeaky ship,fp_machine_only,57.1
 vessel,rpi_port_townsend,2025_11_25_00_52_50_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2025-11-25T08%3A52%3A50.000Z,Squeaky ship,fp_machine_only,59.8
