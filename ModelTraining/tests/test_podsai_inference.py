@@ -22,7 +22,7 @@ def mock_podsai_model():
     """Create a mock PODS-AI model for testing."""
     mock_model = Mock()
     mock_config = Mock()
-    
+
     # Define label mapping for multi-class model.
     # Current schema matches train_podsai_model.py:
     # ["water", "resident", "transient", "humpback", "vessel", "jingle", "human"]
@@ -44,11 +44,16 @@ def mock_podsai_model():
         "jingle": 5,
         "human": 6
     }
-    
+
+    # Set metadata attributes that _print_model_metadata expects.
+    mock_config._name_or_path = "test-model"
+    mock_config.architectures = ["Wav2Vec2ForSequenceClassification"]
+    mock_config._commit_hash = None  # Optional, can be None
+
     mock_model.config = mock_config
     mock_model.to = Mock(return_value=mock_model)
     mock_model.eval = Mock(return_value=mock_model)
-    
+
     # Mock model output. Handles batched input by returning one row per segment.
     def mock_forward(**kwargs):
         # Return logits for "water" class with high confidence.
@@ -58,9 +63,9 @@ def mock_podsai_model():
         mock_output = Mock()
         mock_output.logits = logits
         return mock_output
-    
+
     mock_model.side_effect = mock_forward
-    
+
     return mock_model
 
 
@@ -68,7 +73,7 @@ def mock_podsai_model():
 def mock_feature_extractor():
     """Create a mock feature extractor."""
     mock_extractor = Mock()
-    
+
     def mock_extract(audio, sampling_rate, return_tensors, padding):
         # Return dummy tensors. Supports both single array and batched list inputs.
         if isinstance(audio, list):
@@ -81,10 +86,10 @@ def mock_feature_extractor():
             "input_values": torch.randn(batch_size, seq_len),
             "attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long)
         }
-    
+
     mock_extractor.side_effect = mock_extract
     mock_extractor.from_pretrained = Mock(return_value=mock_extractor)
-    
+
     return mock_extractor
 
 
@@ -94,26 +99,26 @@ def synthetic_audio_60s():
     sr = 16000
     duration = 60
     samples = sr * duration
-    
+
     # Create silence with a 1-second tone at second 30.
     audio = np.zeros(samples, dtype=np.float32)
     tone_start = 30 * sr
     tone_end = 31 * sr
     t = np.linspace(0, 1, sr)
     audio[tone_start:tone_end] = 0.5 * np.sin(2 * np.pi * 440 * t)  # 440 Hz tone
-    
+
     # Save to temporary file.
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
         sf.write(f.name, audio, sr)
         yield f.name
-    
+
     # Cleanup.
     Path(f.name).unlink(missing_ok=True)
 
 
 class TestPodsAIInferenceIndexing:
     """Test indexing semantics for timestamp correction."""
-    
+
     @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
     @patch('podsai_inference.Wav2Vec2FeatureExtractor')
     def test_output_length_with_hop_duration_2(
@@ -123,12 +128,12 @@ class TestPodsAIInferenceIndexing:
         """Test that local_confidences length is correct with 2-second hop."""
         mock_extractor_class.from_pretrained = Mock(return_value=mock_feature_extractor)
         mock_model_class.from_pretrained = Mock(return_value=mock_podsai_model)
-        
+
         from podsai_inference import PodsAIInference
-        
+
         model = PodsAIInference("test-model-path")
         result = model.predict(synthetic_audio_60s, segment_duration=3, hop_duration=2)
-        
+
         # With hop_duration=2, a 60-second audio should produce 29 positions:
         # num_positions = floor((60 - 3) / 2) + 1 = floor(57/2) + 1 = 28 + 1 = 29
         # This is the CURRENT behavior, but it doesn't give per-second indexing.
@@ -333,7 +338,7 @@ class TestPodsAIInferenceIndexing:
             assert result["local_predictions"] == []
             assert result["local_confidences"] == []
             assert result["local_probs"] == []
-            # global_prediction should be one of the negative classes (water=0, vessel=4, jingle=5, human=6)
+            # global_prediction should be one of the negative classes (water=0, vessel=4, jingle=5, human=6).
             assert result["global_prediction"] in [0, 4, 5, 6]
             assert result["global_confidence"] == 0.0
             # Error returns must always include hop_duration and segment_duration (matching orcahello behavior).
@@ -364,10 +369,15 @@ class TestPodsAIInferenceIndexing:
         mock_model.config = mock_config
         mock_model.to = Mock(return_value=mock_model)
         mock_model.eval = Mock(return_value=mock_model)
+
+        # Set metadata attributes that _print_model_metadata expects.
+        mock_config._name_or_path = "test-model"
+        mock_config.architectures = ["Wav2Vec2ForSequenceClassification"]
+        mock_config._commit_hash = None  # Optional, can be None
         
         # Return known probabilities. Handles batched input.
         # water=0.1, resident=0.4, transient=0.1, humpback=0.1, vessel=0.1, jingle=0.1, human=0.1
-        # Total negative (water+vessel+jingle+human) = 0.4, so call-likelihood should be 0.6
+        # Total negative (water+vessel+jingle+human) = 0.4, so call-likelihood should be 0.6.
         def mock_forward(**kwargs):
             # Logits that represent the desired distribution.
             batch_size = kwargs["input_values"].shape[0]
@@ -415,7 +425,7 @@ class TestPodsAIInferenceErrorHandling:
         assert result["local_predictions"] == []
         assert result["local_confidences"] == []
         assert result["local_probs"] == []
-        # Should be one of the negative classes (water=0, vessel=4, jingle=5, human=6)
+        # Should be one of the negative classes (water=0, vessel=4, jingle=5, human=6).
         assert result["global_prediction"] in [0, 4, 5, 6]
         assert result["global_confidence"] == 0.0
         # Error returns must always include hop_duration and segment_duration (matching orcahello behavior).
@@ -437,6 +447,11 @@ class TestPodsAIInferenceErrorHandling:
         mock_config.id2label = {0: "resident", 1: "transient", 2: "humpback"}
         mock_config.label2id = {"resident": 0, "transient": 1, "humpback": 2}
         mock_model.config = mock_config
+
+        # Set metadata attributes that _print_model_metadata expects.
+        mock_config._name_or_path = "test-model"
+        mock_config.architectures = ["Wav2Vec2ForSequenceClassification"]
+        mock_config._commit_hash = None  # Optional, can be None
         
         mock_model_class.from_pretrained = Mock(return_value=mock_model)
         

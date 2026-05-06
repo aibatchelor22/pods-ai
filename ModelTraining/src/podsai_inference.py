@@ -14,6 +14,8 @@ import numpy as np
 from collections import Counter
 from typing import Optional
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
+from pathlib import Path
+from datetime import datetime
 
 # Import base class to establish inheritance
 from model_inference import ModelInference
@@ -83,6 +85,9 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
 
         print(f"Model loaded successfully. Label mapping: {self.label2id}")
 
+        # Print model version/date information.
+        self._print_model_metadata(model_path)
+
         # Validate that model has at least one negative/background class.
         # Accept either explicit "other" or treat specific classes as negative.
         negative_classes = {"other", "water", "vessel", "jingle", "human"}
@@ -114,6 +119,65 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         # Store which classes are considered negative (non-whale)
         self.negative_class_ids = {self.label2id[label] for label in found_negative}
         print(f"Treating classes as negative/background: {found_negative}")
+
+    def _print_model_metadata(self, model_path: str) -> None:
+        """
+        Print model metadata including version, date, and architecture information.
+
+        Args:
+            model_path: Path to model directory or HuggingFace Hub model ID
+        """
+        config = self.model.config
+        metadata_found = False
+
+        # Print model name/path from config.
+        if hasattr(config, '_name_or_path') and config._name_or_path:
+            print(f"Model name/path: {config._name_or_path}")
+            metadata_found = True
+
+        # Print architecture information.
+        if hasattr(config, 'architectures') and config.architectures:
+            print(f"Model architecture: {', '.join(config.architectures)}")
+            metadata_found = True
+
+        # Print HuggingFace Hub commit hash if available.
+        if hasattr(config, '_commit_hash') and config._commit_hash:
+            print(f"Model commit hash: {config._commit_hash}")
+            metadata_found = True
+
+        # Check for local model directory and extract file timestamps.
+        model_path_obj = Path(model_path)
+        if model_path_obj.exists() and model_path_obj.is_dir():
+            # Check config.json modification time.
+            config_json_path = model_path_obj / "config.json"
+            if config_json_path.exists():
+                mtime = datetime.fromtimestamp(config_json_path.stat().st_mtime)
+                print(f"Model config last modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+                metadata_found = True
+
+            # Check pytorch_model.bin modification time.
+            model_bin_path = model_path_obj / "pytorch_model.bin"
+            if model_bin_path.exists():
+                mtime = datetime.fromtimestamp(model_bin_path.stat().st_mtime)
+                print(f"Model weights last modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+                metadata_found = True
+
+            # Check for training_args.bin with training metadata.
+            training_args_path = model_path_obj / "training_args.bin"
+            if training_args_path.exists():
+                try:
+                    training_args = torch.load(training_args_path, map_location='cpu', weights_only=False)
+                    if hasattr(training_args, 'output_dir'):
+                        print(f"Training output directory: {training_args.output_dir}")
+                    if hasattr(training_args, 'num_train_epochs'):
+                        print(f"Training epochs: {training_args.num_train_epochs}")
+                    metadata_found = True
+                except Exception as e:
+                    # Silently skip if training_args.bin can't be loaded.
+                    pass
+
+        if not metadata_found:
+            print("Model metadata: No version or date information available.")
 
     def predict(self, wav_path: str, segment_duration: int = 3, hop_duration: int = 2,
                 threshold: Optional[float] = None, min_num_positive_calls_threshold: Optional[int] = None) -> dict[str, object]:

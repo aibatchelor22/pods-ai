@@ -654,14 +654,16 @@ def process_sample(
     """
     Process a single sample, adjusting its timestamp, URI, and confidence.
 
-    Applies one of three strategies based on the sample's Notes field and available data:
+    Applies one of four strategies based on the sample's Notes field and available data:
     1. Manual correction: if the sample's URI has a manual timestamp override.
     2. Model-based correction: if Notes is 'tp_human_only' and model_inference is provided.
-    3. Fixed offset: subtract segment_duration seconds from the timestamp.
+    3. No offset: if sample came from manual_samples.csv (has _from_manual_samples marker).
+    4. Fixed offset: subtract segment_duration seconds from the timestamp.
 
     Args:
         sample: Detection sample dictionary with keys Category, NodeName, Timestamp,
-            URI, Description, Notes, Confidence.
+            URI, Description, Notes, Confidence. May also contain _from_manual_samples
+            internal marker.
         manual_timestamps: Dictionary mapping URIs to corrected timestamp strings.
         manual_confidences: Dictionary mapping URIs to confidence strings (0.0-100.0).
         model_inference: Optional model inference instance for tp_human_only timestamp correction.
@@ -673,9 +675,12 @@ def process_sample(
     """
     output_row = sample.copy()
 
+    # Remove internal marker if present (don't write to CSV).
+    is_from_manual_samples = output_row.pop('_from_manual_samples', False)
+
     # Check if there's a manual timestamp correction for this sample.
     if sample['URI'] in manual_timestamps:
-        print(f"  Using manual timestamp for {sample['URI']}")
+        print(f"  Using manual timestamp correction for {sample['URI']}")
         output_row['Timestamp'] = manual_timestamps[sample['URI']]
         output_row['Confidence'] = manual_confidences[sample['URI']]
 
@@ -686,6 +691,21 @@ def process_sample(
         )
         output_row['Timestamp'] = timestamp
         output_row['Confidence'] = f"{confidence:.1f}"
+
+    # For samples from manual_samples.csv, keep timestamp as-is (already correct).
+    elif is_from_manual_samples:
+        print(f"  Keeping timestamp as-is for manual sample: {sample['Timestamp']}")
+        # Timestamp remains unchanged from manual_samples.csv.
+        confidence_str = sample.get('Confidence', '')
+        if confidence_str:
+            try:
+                confidence = float(confidence_str)
+                output_row['Confidence'] = f"{confidence:.1f}"
+            except (ValueError, TypeError):
+                output_row['Confidence'] = confidence_str  # Keep as-is if not a valid number.
+        else:
+            output_row['Confidence'] = ''
+
     else:
         # For all other detections, use the timestamp from segment_duration seconds earlier
         # since machine detection timestamps in the orcasite UI seem to be off by that much currently.
@@ -724,31 +744,65 @@ def write_training_samples(
         manual_confidences: Dictionary mapping URIs to confidence strings (0.0-100.0)
         model_inference: Optional model inference instance for tp_human_only timestamp correction
         segment_duration: Duration of each audio segment in seconds
+
+    Raises:
+        ValueError: If duplicate output URIs are detected after processing.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Sort samples by Category, then NodeName, then Timestamp.
     sorted_samples = sorted(samples, key=lambda s: (s['Category'], s['NodeName'], s['Timestamp']))
 
+    # Track output URIs to detect duplicates.
+    output_uris_seen = {}  # URI -> (Category, NodeName, Timestamp)
+    processed_rows = []
+
     # Create a temporary directory for audio downloads.
     with TemporaryDirectory() as tmp_dir:
+        total_samples = len(sorted_samples)
+        print(f"\nProcessing {total_samples} samples...")
+
+        for idx, sample in enumerate(sorted_samples, start=1):
+            print(f"\n[{idx}/{total_samples}] Processing: {sample['Category']} - {sample['NodeName']} - {sample['Timestamp']}")
+
+            output_row = process_sample(
+                sample, manual_timestamps, manual_confidences, model_inference, tmp_dir, segment_duration
+            )
+
+            # Check for duplicate output URI.
+            output_uri = output_row['URI']
+            if output_uri in output_uris_seen:
+                prev_info = output_uris_seen[output_uri]
+                error_msg = (
+                    f"\nError: Duplicate output URI detected after processing:\n"
+                    f"  URI: {output_uri}\n"
+                    f"  First occurrence: {prev_info[0]}, {prev_info[1]}, {prev_info[2]}\n"
+                    f"  Second occurrence: {output_row['Category']}, {output_row['NodeName']}, {output_row['Timestamp']}\n"
+                    f"\nEach training sample must have a unique output URI.\n"
+                    f"This typically means the same timestamp appears twice, or timestamp correction\n"
+                    f"produced the same result for different input samples."
+                )
+                raise ValueError(error_msg)
+
+            output_uris_seen[output_uri] = (
+                output_row['Category'],
+                output_row['NodeName'],
+                output_row['Timestamp']
+            )
+            processed_rows.append(output_row)
+
+        # Write all rows to CSV after validation passes.
+        print(f"\n✓ Validated: All {len(processed_rows)} output samples have unique URIs")
+        print(f"\nWriting to {output_path}...")
+
         with open(output_path, 'w', newline='', encoding='utf-8') as f:
             # Use same columns as detections.csv.
             fieldnames = ['Category', 'NodeName', 'Timestamp', 'URI', 'Description', 'Notes', 'Confidence']
             writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator='\n')
-
             writer.writeheader()
 
-            total_samples = len(sorted_samples)
-            print(f"\nProcessing {total_samples} samples...")
-
-            for idx, sample in enumerate(sorted_samples, start=1):
-                print(f"\n[{idx}/{total_samples}] Processing: {sample['Category']} - {sample['NodeName']} - {sample['Timestamp']}")
-
-                output_row = process_sample(
-                    sample, manual_timestamps, manual_confidences, model_inference, tmp_dir, segment_duration
-                )
-                writer.writerow(output_row)
+            for row in processed_rows:
+                writer.writerow(row)
 
 
 def write_testing_samples(samples: list[dict], output_path: Path):
@@ -917,6 +971,7 @@ def load_manual_samples(manual_samples_path: Path) -> list[dict]:
                         'Description': row.get('Description', '').strip(),
                         'Notes': row.get('Notes', '').strip(),
                         'Confidence': row.get('Confidence', '').strip(),
+                        '_from_manual_samples': True,  # Internal marker to skip timestamp offset
                     }
 
                     manual_samples.append(sample)
@@ -1034,7 +1089,7 @@ def main():
     print("\nSelecting training samples...")
     samples = select_training_samples(organized_data, manual_confidences)
 
-    # Load and merge manual samples.  # ADD THIS BLOCK
+    # Load and merge manual samples.
     manual_samples = load_manual_samples(manual_samples_path)
     samples = merge_manual_samples(samples, manual_samples)
 
@@ -1120,15 +1175,18 @@ def main():
         print(f"  Cannot proceed without model for tp_human_only timestamp correction.", file=sys.stderr)
         sys.exit(1)
 
-    # Merge in manual samples from manual_samples.csv
-    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'
-    manual_samples = load_manual_samples(manual_samples_path)
+    # Note: Manual samples were already loaded and merged earlier (after select_training_samples).
+    # The all_training_samples variable already contains both auto-selected and manual samples.
+    all_training_samples = samples  # samples already includes manual samples from earlier merge
 
-    # Combine manual samples with auto-selected samples.
-    all_training_samples = merge_manual_samples(samples, manual_samples)
-
+    # Validation of unique URIs happens inside write_training_samples after processing.
     print(f"\nWriting {len(all_training_samples)} training samples to {output_path}...")
-    write_training_samples(all_training_samples, output_path, manual_timestamps, manual_confidences, model_inference, args.duration)
+    try:
+        write_training_samples(all_training_samples, output_path, manual_timestamps, manual_confidences, model_inference, args.duration)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
     print(f"Writing testing samples to {testing_output_path}...")
     write_testing_samples(testing_samples, testing_output_path)
     print("Done!")

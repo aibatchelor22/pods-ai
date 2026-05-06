@@ -15,9 +15,6 @@ Usage:
         --timestamp 2025_01_15_12_30_00_PST \\
         --model-path /path/to/custom-model
 
-    # Use a custom URI for all segments:
-    python add_samples.py recording.wav --uri "https://live.orcasound.net/bouts/new/rpi_orcasound_lab?time=2025-01-15T12%3A30%3A00.000Z"
-
 Saves 3-second segments with a 2-second hop to the "new/" output directory
 (configurable with --output-dir) using the same filename convention as
 output/wav/humpback/ etc.: {node_name_with_hyphens}_{timestamp_pst}.wav.
@@ -31,8 +28,7 @@ Output is printed in manual_samples.csv format (can be copy-pasted directly):
 Category,NodeName,Timestamp,URI,Description,Notes,Confidence
 
 URI/Description/Notes Lookup:
-- If --uri is specified, all segments use that URI (with empty Description and Notes="manual")
-- Otherwise, the script looks up the detection in detections.csv (default: output/csv/detections.csv)
+- The script looks up the detection in detections.csv (default: output/csv/detections.csv)
   by matching NodeName and Timestamp, and uses the URI, Description, and Notes from that row
 - If not found in detections.csv, generates a URI from the timestamp (with empty Description and Notes="manual")
 
@@ -58,6 +54,7 @@ import ffmpeg
 from pytz import timezone
 
 from model_inference import get_model_inference
+from make_csv import get_orcasite_feeds, OrcasiteFeed
 
 SEGMENT_DURATION = 3  # Duration of each segment in seconds.
 HOP_DURATION = 2  # Hop size between segments in seconds.
@@ -73,6 +70,9 @@ _FILENAME_PATTERN = re.compile(
     r"^(?P<node>.+?)_(?P<ts>\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_PST)\.wav$",
     re.IGNORECASE,
 )
+
+# Cache for Orcasite feeds to avoid repeated API calls.
+_FEEDS_CACHE: Optional[list[OrcasiteFeed]] = None
 
 
 @dataclass
@@ -145,6 +145,41 @@ def format_timestamp_pst(dt: datetime) -> str:
     return dt.strftime("%Y_%m_%d_%H_%M_%S_PST")
 
 
+def get_node_slug(node_name: str) -> str:
+    """
+    Look up the slug for a node_name from Orcasite feeds.
+
+    Args:
+        node_name: Internal node name (e.g., "rpi_orcasound_lab").
+
+    Returns:
+        URL slug for the node (e.g., "orcasound-lab").
+
+    Raises:
+        ValueError: If the node_name is not found in the Orcasite feeds.
+    """
+    global _FEEDS_CACHE
+
+    # Load feeds from API if not already cached.
+    if _FEEDS_CACHE is None:
+        try:
+            _FEEDS_CACHE = get_orcasite_feeds()
+        except Exception as e:
+            raise ValueError(f"Failed to fetch Orcasite feeds: {e}") from e
+
+    # Look up the node_name in the feeds.
+    for feed in _FEEDS_CACHE:
+        if feed.node_name == node_name:
+            return feed.slug
+
+    # If not found, raise an error with available node names.
+    available = [f.node_name for f in _FEEDS_CACHE]
+    raise ValueError(
+        f"Node name '{node_name}' not found in Orcasite feeds. "
+        f"Available nodes: {', '.join(available)}"
+    )
+
+
 def generate_uri(node_name: str, timestamp_str: str) -> str:
     """
     Generate a URI for the Orcasound bouts interface from a node name and PST timestamp.
@@ -154,8 +189,15 @@ def generate_uri(node_name: str, timestamp_str: str) -> str:
         timestamp_str: PST timestamp string in format 'YYYY_MM_DD_HH_MM_SS_PST'.
 
     Returns:
-        URI in format "https://live.orcasound.net/bouts/new/{node}?time={utc_time}".
+        URI in format "https://live.orcasound.net/bouts/new/{slug}?time={utc_time}".
+
+    Raises:
+        ValueError: If the node_name is not found in Orcasite feeds.
     """
+    # Look up the slug for this node_name.
+    slug = get_node_slug(node_name)
+
+    # Parse timestamp and convert to UTC.
     dt = parse_timestamp_pst(timestamp_str)
     utc_dt = dt.astimezone(UTC_TZ)
 
@@ -165,7 +207,7 @@ def generate_uri(node_name: str, timestamp_str: str) -> str:
     # URL encode the time parameter.
     time_encoded = quote(time_str, safe='')
 
-    return f"https://live.orcasound.net/bouts/new/{node_name}?time={time_encoded}"
+    return f"https://live.orcasound.net/bouts/new/{slug}?time={time_encoded}"
 
 
 def lookup_detection_in_csv(node_name: str, timestamp_str: str, detections_csv: str) -> Optional[DetectionInfo]:
@@ -326,7 +368,6 @@ def add_samples(
     base_timestamp: Optional[str] = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
     model_path: str = DEFAULT_MODEL_PATH,
-    custom_uri: Optional[str] = None,
     detections_csv: str = DEFAULT_DETECTIONS_CSV,
 ) -> list[dict]:
     """
@@ -352,8 +393,6 @@ def add_samples(
         output_dir: Directory to save segments (default: "new").
         model_path: HuggingFace Hub model ID or path to a local model directory
             (default: "davethaler/whale-call-detector").
-        custom_uri: Optional custom URI to use for all segments.
-            If provided, all rows will use this URI with empty Description and Notes="manual".
         detections_csv: Path to detections.csv for detection lookup (default: "output/csv/detections.csv").
 
     Returns:
@@ -372,27 +411,15 @@ def add_samples(
             base_timestamp = inferred_ts
     out_dir = Path(output_dir)
 
-    # Determine URI, Description, and Notes to use for all segments
-    if custom_uri:
-        # Use explicitly provided URI with default description/notes
-        shared_uri = custom_uri
+    # Try to look up detection info in detections.csv.
+    detection_info = lookup_detection_in_csv(node_name, base_timestamp, detections_csv)
+    if detection_info:
+        # Use Description and Notes from detections.csv.
+        shared_description = detection_info.description
+        shared_notes = detection_info.notes
+    else:
         shared_description = ""
         shared_notes = "manual"
-        print(f"Using custom URI: {shared_uri}")
-    else:
-        # Try to look up detection info in detections.csv
-        detection_info = lookup_detection_in_csv(node_name, base_timestamp, detections_csv)
-        if detection_info:
-            # Use URI, Description, and Notes from detections.csv
-            shared_uri = detection_info.uri
-            shared_description = detection_info.description
-            shared_notes = detection_info.notes
-        else:
-            # Fall back to generating URI from timestamp with default description/notes
-            shared_uri = generate_uri(node_name, base_timestamp)
-            shared_description = ""
-            shared_notes = "manual"
-            print(f"Generated URI from timestamp: {shared_uri}")
 
     # Split the WAV and save segments.
     segments = split_wav_into_segments(wav_file, node_name, base_timestamp, out_dir)
@@ -413,12 +440,15 @@ def add_samples(
         # Convert confidence from 0.0-1.0 to 0.0-100.0.
         confidence_pct = confidence * 100
 
+        # Generate URI matching this segment's timestamp.
+        segment_uri = generate_uri(node_name, timestamp_str)
+
         # Create row dict matching manual_samples.csv format.
         row = {
             "Category": label,
             "NodeName": node_name,
             "Timestamp": timestamp_str,
-            "URI": shared_uri,
+            "URI": segment_uri,
             "Description": shared_description,
             "Notes": shared_notes,
             "Confidence": f"{confidence_pct:.1f}",
@@ -426,7 +456,7 @@ def add_samples(
         results.append(row)
 
         # Print in CSV format (ready to copy-paste).
-        print(f"{label},{node_name},{timestamp_str},{shared_uri},{shared_description},{shared_notes},{row['Confidence']}")
+        print(f"{label},{node_name},{timestamp_str},{segment_uri},{shared_description},{shared_notes},{row['Confidence']}")
 
     return results
 
@@ -483,21 +513,10 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--uri",
-        default=None,
-        help=(
-            "Optional custom URI to use for all segments. "
-            "If not provided, the script will look up the detection in detections.csv "
-            "by matching NodeName and Timestamp, and use the URI, Description, and Notes from that row. "
-            "If not found, it generates a URI from the timestamp."
-        ),
-    )
-    parser.add_argument(
         "--detections-csv",
         default=DEFAULT_DETECTIONS_CSV,
         help=(
-            f"Path to detections.csv for detection lookup (default: {DEFAULT_DETECTIONS_CSV!r}). "
-            "Used only if --uri is not specified."
+            f"Path to detections.csv for detection lookup (default: {DEFAULT_DETECTIONS_CSV!r})."
         ),
     )
 
@@ -514,7 +533,6 @@ def main() -> int:
             base_timestamp=args.timestamp,
             output_dir=args.output_dir,
             model_path=args.model_path,
-            custom_uri=args.uri,
             detections_csv=args.detections_csv,
         )
     except ValueError as e:

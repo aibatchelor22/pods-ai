@@ -1,13 +1,13 @@
 Category,NodeName,Timestamp,URI,Description,Notes,Confidence
 human,rpi_sunset_bay,2024_08_07_11_23_23_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-08-07T18%3A23%3A23.372Z,"Human voices on AM radio and contact noise from what Joel explained are mats: ""during the summer we have some floating mats clipped to the ladder which are probably making the contact noise""",fp_machine_only,62.3839
 human,rpi_sunset_bay,2024_08_19_10_57_30_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-08-19T17%3A57%3A30.508Z,Human voices and breaking wave noise,fp_machine_only,70.6037
+humpback,rpi_orcasound_lab,2023_10_28_07_33_52_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T14%3A33%3A52.000Z,Humpback vocalizing,tp_human_only,
 humpback,rpi_orcasound_lab,2023_10_28_07_43_52_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T14%3A43%3A52.000Z,Humpback,tp_human_only,
 humpback,rpi_orcasound_lab,2023_10_28_07_46_49_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T14%3A46%3A49.000Z,Loud ongoing humpback vocals !,tp_human_only,
 humpback,rpi_orcasound_lab,2023_10_28_08_09_59_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T15%3A09%3A59.000Z,humpback,tp_human_only,
 humpback,rpi_orcasound_lab,2023_10_28_09_43_41_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T16%3A43%3A41.000Z,Humpback,tp_human_only,
 humpback,rpi_orcasound_lab,2023_12_15_03_10_10_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-12-15T11%3A10%3A10.000Z,humpbacks,tp_human_only,
 humpback,rpi_orcasound_lab,2024_11_17_08_06_54_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-11-17T16%3A06%3A54.000Z,humpback rumbling,tp_human_only,
-humpback,rpi_orcasound_lab,2025_01_05_21_13_57_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-01-06T05%3A13%3A57.000Z,Orca and humpback sounds (per Val for last 10 mins),tp_human_only,
 humpback,rpi_orcasound_lab,2025_11_09_03_35_15_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-09T11%3A35%3A15.576Z,"Good humpback calls, quiet ambient",tp_machine_only,57.4149
 humpback,rpi_orcasound_lab,2025_11_14_01_41_25_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-14T09%3A41%3A25.000Z,Humpback Whales,tp_human_only,
 humpback,rpi_orcasound_lab,2025_12_19_04_57_41_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-12-19T12%3A57%3A41.474Z,"Humpback whale song, moderate ship noise",tp_machine_only,55.3205
@@ -21,6 +21,7 @@ jingle,rpi_orcasound_lab,2026_01_11_09_12_12_PST,https://live.orcasound.net/bout
 jingle,rpi_orcasound_lab,2026_01_11_09_14_18_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-11T17%3A14%3A18.000Z,Jingle,fp_machine_only,58.2597
 jingle,rpi_orcasound_lab,2026_01_11_09_16_06_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-11T17%3A16%3A06.915Z,Jingle,fp_machine_only,58.5821
 jingle,rpi_orcasound_lab,2026_01_11_09_16_17_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-11T17%3A16%3A17.000Z,Jingle,fp_machine_only,53.8842
+resident,rpi_andrews_bay,2026_02_16_23_09_06_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-02-17T07%3A09%3A06.000Z,Lots of J-Pod calls,tp_both,93.1313
 resident,rpi_mast_center,2023_11_05_10_02_28_PST,https://live.orcasound.net/bouts/new/mast-center?time=2023-11-05T18%3A02%3A28.000Z,J pod,tp_human_only,
 resident,rpi_mast_center,2023_11_05_10_14_51_PST,https://live.orcasound.net/bouts/new/mast-center?time=2023-11-05T18%3A14%3A51.000Z,J pod calls consistent and increasing in volume,tp_human_only,
 resident,rpi_mast_center,2023_11_05_10_27_44_PST,https://live.orcasound.net/bouts/new/mast-center?time=2023-11-05T18%3A27%3A44.000Z,"J pod calls masked by recreational, small vessels",tp_human_only,
@@ -38,7 +39,6 @@ resident,rpi_sunset_bay,2023_10_26_12_03_43_PST,https://live.orcasound.net/bouts
 resident,rpi_sunset_bay,2023_11_04_06_49_50_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2023-11-04T13%3A49%3A50.000Z,J pod calls,tp_human_only,
 resident,rpi_sunset_bay,2023_11_07_20_50_46_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2023-11-08T04%3A50%3A46.000Z,"clik clik clik clik clik clik clik i thank it is the l pod (SV: interesting knock sequence, but not KW clicks)",tp_human_only,
 resident,rpi_sunset_bay,2023_11_07_20_54_40_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2023-11-08T04%3A54%3A40.000Z,clik clik l pod is here,tp_human_only,
-resident,rpi_sunset_bay,2023_11_27_17_50_45_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2023-11-28T01%3A50%3A45.000Z,J pod calls,tp_human_only,
 resident,rpi_sunset_bay,2025_09_13_19_22_02_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-09-14T02%3A22%3A02.711Z,"Clear S01 and other calls, including an S10 excitement call near the end.",tp_machine_only,75.8136
 resident,rpi_sunset_bay,2025_11_01_04_05_21_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-11-01T11%3A05%3A21.000Z,"Moderate to strong calls, natural ambient",tp_machine_only,75.0795
 transient,rpi_orcasound_lab,2024_12_29_13_37_23_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-12-29T21%3A37%3A23.186Z,"Good transient calls, lots of water noise",tp_machine_only,66.1314
