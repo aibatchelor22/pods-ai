@@ -390,10 +390,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--podsai-model-path",
-        default="model/multiclass",
+        default="davethaler/whale-call-detector",
         help=(
-            "Path to PODS-AI model directory or Hub model ID. "
-            "Defaults to model/multiclass when not specified."
+            "Path to PODS-AI model directory or HuggingFace Hub ID. "
+            "Defaults to davethaler/whale-call-detector when not specified."
         ),
     )
     parser.add_argument(

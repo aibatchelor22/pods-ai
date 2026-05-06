@@ -377,7 +377,7 @@ usage: python compare_models.py [--testing-csv PATH] [--max-samples N]
 | `--models` | Comma-separated list of models to evaluate (default: `fastai,orcahello,podsai`) |
 | `--fastai-model-path` | Path to FastAI model directory. Defaults to `model` when not specified |
 | `--orcahello-model-path` | HuggingFace Hub ID or path for OrcaHello model. Defaults to `orcasound/orcahello-srkw-detector-v1` when not specified |
-| `--podsai-model-path` | Path or Hub ID for PODS-AI model. Defaults to `model/multiclass` when not specified |
+| `--podsai-model-path` | Path or Hub ID for PODS-AI model. Defaults to `davethaler/whale-call-detector` when not specified |
 | `--category` | Only evaluate samples from this category (e.g. `resident`, `humpback`, `water`). If not specified, all categories are evaluated |
 
 **Example — compare all three models**
@@ -395,8 +395,6 @@ Loaded 72 test samples from output\csv\testing_samples.csv
 WAV directory: output/testing-wav
 Models to evaluate: fastai, orcahello, podsai
 
-Evaluating model: fastai
-  [fastai] resident/rpi_orcasound_lab/2023_08_18_00_59_53_PST: predicted='resident' → correct (1.23s)
   ...
 
 ==========================================================================================
@@ -404,9 +402,9 @@ Model Comparison Summary
 ==========================================================================================
 Model           Evaluated   Correct  Accuracy     FP     FP%     FN     FN%   Avg Time
 ------------------------------------------------------------------------------------------
-fastai                 72        33     45.8%     30   41.7%      9   12.5%     12.05s
-orcahello              72        15     20.8%     49   68.1%      8   11.1%      4.27s
-podsai                 72        53     73.6%      3    4.2%     16   22.2%      5.39s
+fastai                 71        32     45.1%     30   42.3%      9   12.7%     11.00s
+orcahello              71        14     19.7%     49   69.0%      8   11.3%      4.24s
+podsai                 71        38     53.5%     20   28.2%     13   18.3%      4.58s
 ==========================================================================================
 
 Definitions:
@@ -420,7 +418,7 @@ Confusion Matrix for fastai (rows=actual, cols=predicted):
       human          1          1
    humpback          7          3
      jingle          8          2
-   resident          9         11
+   resident          9         10
   transient          2          8
      vessel          4          6
       water          0         10
@@ -430,7 +428,7 @@ Confusion Matrix for orcahello (rows=actual, cols=predicted):
       human          0          2
    humpback          3          7
      jingle          0         10
-   resident          8         12
+   resident          8         11
   transient          0         10
      vessel          0         10
       water          0         10
@@ -438,11 +436,11 @@ Confusion Matrix for orcahello (rows=actual, cols=predicted):
 Confusion Matrix for podsai (rows=actual, cols=predicted):
                  human   humpback     jingle   resident  transient     vessel      water
       human          1          1          0          0          0          0          0
-   humpback          0          6          0          2          2          0          0
-     jingle          0          0         10          0          0          0          0
-   resident          0          8          1          4          4          0          3
-  transient          0          6          1          0          3          0          0
-     vessel          0          4          0          1          1          4          0
+   humpback          0          4          0          5          1          0          0
+     jingle          0          1          6          3          0          0          0
+   resident          0          8          0          6          0          0          5
+  transient          0          0          0          9          1          0          0
+     vessel          0          1          0          3          0          6          0
       water          0          0          0          0          0          0         10
 ```
 
