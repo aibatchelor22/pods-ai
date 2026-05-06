@@ -253,7 +253,7 @@ class TestGetOrcasiteFeedsFailFast:
 
     def test_reraises_on_request_exception(self):
         """A network error must propagate rather than returning an empty list."""
-        with patch("make_csv.requests.get", side_effect=requests.exceptions.Timeout("timed out")):
+        with patch("orcasite_feeds.requests.get", side_effect=requests.exceptions.Timeout("timed out")):
             with pytest.raises(requests.exceptions.Timeout):
                 get_orcasite_feeds()
 
@@ -261,6 +261,6 @@ class TestGetOrcasiteFeedsFailFast:
         """An HTTP error (e.g. 503) must propagate rather than returning an empty list."""
         mock_response = MagicMock()
         mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("503")
-        with patch("make_csv.requests.get", return_value=mock_response):
+        with patch("orcasite_feeds.requests.get", return_value=mock_response):
             with pytest.raises(requests.exceptions.HTTPError):
                 get_orcasite_feeds()

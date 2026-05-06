@@ -54,7 +54,7 @@ import ffmpeg
 from pytz import timezone
 
 from model_inference import get_model_inference
-from make_csv import get_orcasite_feeds, OrcasiteFeed
+from orcasite_feeds import get_orcasite_feeds, OrcasiteFeed
 
 SEGMENT_DURATION = 3  # Duration of each segment in seconds.
 HOP_DURATION = 2  # Hop size between segments in seconds.
