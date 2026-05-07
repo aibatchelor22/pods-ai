@@ -68,7 +68,7 @@ jobs:
         run: bash patch_fastai_audio.sh
 
       - name: Make CSV
-        if: steps.skip_check.outputs.should_skip != 'true'
+        if: steps.skip_check.outputs.should_skip != 'true' && env.COSMOS_KEY != ''
         run: |
           python src/make_csv.py --end 2026_03_17_00_00_00_PST
 
@@ -137,7 +137,7 @@ jobs:
         run: patch_fastai_audio.bat
 
       - name: Make CSV
-        if: steps.skip_check.outputs.should_skip != 'true'
+        if: steps.skip_check.outputs.should_skip != 'true' && env.COSMOS_KEY != ''
         run: |
           python src/make_csv.py --end 2026_03_17_00_00_00_PST
 

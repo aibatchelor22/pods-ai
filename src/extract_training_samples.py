@@ -1150,7 +1150,7 @@ def merge_manual_samples(
         key = (sample['Category'], sample['NodeName'], output_ts)
         if key in manual_keys:
             replaced_count += 1
-            print(f"  Replacing auto-selected sample (URI: {sample['URI']}, timestamp: {sample['Timestamp']} → {output_ts}) with manual sample")
+            print(f"  Replacing auto-selected sample (URI: {sample['URI']}, timestamp: {sample['Timestamp']} -> {output_ts}) with manual sample")
             # Skip this auto-selected sample; it will be replaced by manual sample.
         else:
             filtered_selected.append(sample)
