@@ -62,16 +62,13 @@ jobs:
           sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
-        working-directory: ModelTraining
         run: pip install -r requirements.txt
 
       - name: Download WAV files
-        working-directory: ModelTraining
         run: |
           python src/download_wavs.py
 
       - name: Train model
-        working-directory: ModelTraining
         run: >
           python src/train_podsai_model.py
           --output_dir ${{ inputs.output_dir }}

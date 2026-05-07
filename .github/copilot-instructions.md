@@ -4,11 +4,6 @@
 
 PODS-AI (Programmatic Orca Detection System using Artificial Intelligence) is a Python project for detecting and classifying orca and other whale vocalizations from audio recordings provided by the [Orcasound](https://www.orcasound.net/) hydrophone network.
 
-The repository contains two sub-projects:
-
-- **ModelTraining** – Downloads and processes audio data from the Orcasound network, generates spectrograms, and prepares training datasets for an audio classification model.
-- **PictureRecognition** – A FastAI-based image classifier for marine mammals (orca, humpback, seal) used as a methodology reference while building the audio model.
-
 ## Repository Layout
 
 ```
@@ -19,19 +14,14 @@ pods-ai/
 │   └── workflows/
 │       ├── check_csv.yml         # CI: regenerates and validates detections.csv
 │       └── validate-yaml.yml     # CI: yamllint on all YAML files
-├── ModelTraining/
-│   ├── requirements.txt
-│   ├── output_segments/          # Generated output (detections.csv, wav files, spectrograms)
-│   └── src/
-│       ├── make_csv.py                  # Step 1: query APIs → detections.csv
-│       ├── extract_training_samples.py  # Step 2: detections.csv → training_samples.csv
-│       ├── download_wavs.py             # Step 3: download wav files
-│       ├── make_spectrograms.py         # Step 4: wav → PNG spectrograms
-│       └── spectrogram_visualizer.py    # Helper: visualize spectrograms
-└── PictureRecognition/
-    ├── requirements.txt
-    └── src/
-        └── picture_recognition.py       # FastAI image classifier
+├── requirements.txt
+├── output/                          # Generated output (detections.csv, wav files, spectrograms)
+└── src/
+    ├── make_csv.py                  # Step 1: query APIs → detections.csv
+    ├── extract_training_samples.py  # Step 2: detections.csv → training_samples.csv
+    ├── download_wavs.py             # Step 3: download wav files
+    ├── make_spectrograms.py         # Step 4: wav → PNG spectrograms
+    └── spectrogram_visualizer.py    # Helper: visualize spectrograms
 ```
 
 ## Data Sources
@@ -63,9 +53,9 @@ pods-ai/
 - **Constants**: Define module-level constants for magic values (e.g., `NEAR_MIN`, `MAX_DETECTION_PAGES`).
 - **Comments**: Comments should end in punctuation (typically a period).
 
-## ModelTraining Pipeline
+## pods-ai Pipeline
 
-The scripts in `ModelTraining/src/` are meant to be run in order:
+The scripts in `src/` are meant to be run in order:
 
 1. `make_csv.py` – Queries Orcasite and OrcaHello APIs; writes `output/csv/detections.csv`.
 2. `process_humpback_wavs.py` – Processes humpback signal files from `signals-humpback_*.wav`; extracts 2-second segments.
@@ -84,15 +74,10 @@ Classification kinds: `tp_human_only`, `tp_machine_only`, `fp_machine_only`, `tp
 
 ## Dependencies
 
-Install per-project requirements before running scripts:
+Install project requirements before running scripts:
 
 ```bash
-# ModelTraining
-pip install -r ModelTraining/requirements.txt
-
-# PictureRecognition
-pip install -r PictureRecognition/requirements.txt
+pip install -r requirements.txt
 ```
 
-Key ModelTraining packages: `azure-cosmos`, `boto3`, `librosa`, `ffmpeg-python`, `matplotlib`, `numpy`, `requests`, `pytz`.  
-Key PictureRecognition packages: `fastai`, `torch`, `torchvision`, `ddgs`.
+Key packages: `azure-cosmos`, `boto3`, `librosa`, `ffmpeg-python`, `matplotlib`, `numpy`, `requests`, `pytz`.  

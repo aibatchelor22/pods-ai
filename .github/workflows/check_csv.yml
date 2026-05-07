@@ -6,11 +6,11 @@ name: Check CSV
 on:
   pull_request:
     paths:
-      - 'ModelTraining/src/make_csv.py'
-      - 'ModelTraining/src/extract_training_samples.py'
-      - 'ModelTraining/src/process_humpback_wavs.py'
-      - 'ModelTraining/output/csv/**'
-      - 'ModelTraining/requirements.txt'
+      - 'src/make_csv.py'
+      - 'src/extract_training_samples.py'
+      - 'src/process_humpback_wavs.py'
+      - 'output/csv/**'
+      - 'requirements.txt'
       - '.github/workflows/check_csv.yml'
 
 concurrency:
@@ -61,17 +61,14 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: pip install -r requirements.txt
 
       - name: Patch fastai_audio for Python 3.11+ compatibility
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: bash patch_fastai_audio.sh
 
       - name: Make CSV
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python src/make_csv.py --end 2026_03_17_00_00_00_PST
 
@@ -82,13 +79,11 @@ jobs:
 
       - name: Process humpback wavs
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python src/process_humpback_wavs.py
 
       - name: Extract training samples
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python src/extract_training_samples.py
 
@@ -134,18 +129,15 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: pip install -r requirements.txt
 
       - name: Patch fastai_audio for Python 3.11+ compatibility
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         shell: cmd
         run: patch_fastai_audio.bat
 
       - name: Make CSV
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python src/make_csv.py --end 2026_03_17_00_00_00_PST
 
@@ -156,13 +148,11 @@ jobs:
 
       - name: Process humpback wavs
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python src/process_humpback_wavs.py
 
       - name: Extract training samples
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python src/extract_training_samples.py
 

@@ -48,8 +48,8 @@ from audio_utils import (
     load_m3u8_with_retry
 )
 
-# Get repository root (ModelTraining directory).
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# Get repository root.
+REPO_ROOT = Path(__file__).resolve().parent
 
 # Offset, in seconds, between the detection end time and the start of the downloaded audio.
 AUDIO_OFFSET_SECONDS: int = 2

@@ -30,7 +30,7 @@ from model_inference import ModelInference
 
 # Path to the orcahello submodule's model package.
 _ORCAHELLO_SRC = (
-    Path(__file__).parent.parent.parent / "external" / "orcahello" / "InferenceSystem" / "src"
+    Path(__file__).parent.parent / "external" / "orcahello" / "InferenceSystem" / "src"
 )
 
 # Cached tuple of (OrcaHelloSRKWDetectorV1, DetectorInferenceConfig) from submodule.

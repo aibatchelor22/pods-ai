@@ -1,9 +1,9 @@
 # Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
 """
-Pytest configuration for ModelTraining unit tests.
+Pytest configuration for pods-ai unit tests.
 
-Adds the src directory to sys.path so that modules under ModelTraining/src can
+Adds the src directory to sys.path so that modules under src can
 be imported directly, and mocks heavy dependencies (ML, audio) that are not
 needed for unit tests so the suite can run without a full GPU/fastai environment.
 """

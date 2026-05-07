@@ -42,12 +42,12 @@ try:
 except ImportError as e:
     print("Error: Missing required audio decoding libraries.")
     print("Please install the required dependencies:")
-    print("  pip install -r ModelTraining/requirements.txt")
+    print("  pip install -r requirements.txt")
     print(f"\nSpecific error: {e}")
     raise
 
-# Get repository root (ModelTraining directory).
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# Get repository root.
+REPO_ROOT = Path(__file__).resolve().parents
 
 # Label mappings (will be set based on num_classes).
 LABEL2ID = {}
@@ -88,7 +88,7 @@ def load_audio_dataset(data_dir: Path, num_classes: int) -> DatasetDict:
     Load audio files from the output/wav directory structure.
 
     Args:
-        data_dir: Path to ModelTraining/output/wav directory
+        data_dir: Path to output/wav directory
         num_classes: 2 for binary, 7 for multi-class
 
     Returns:

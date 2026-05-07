@@ -9,8 +9,8 @@
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
-    <Name>ModelTraining</Name>
-    <RootNamespace>ModelTraining</RootNamespace>
+    <Name>pods-ai</Name>
+    <RootNamespace>pods-ai</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
     <!-- Command line arguments are intentionally left blank.
          Developers may customize this locally. -->

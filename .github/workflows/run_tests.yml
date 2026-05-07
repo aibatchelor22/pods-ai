@@ -6,9 +6,9 @@ name: Run Tests
 on:
   pull_request:
     paths:
-      - 'ModelTraining/output/csv/**'
-      - 'ModelTraining/tests/**'
-      - 'ModelTraining/src/**'
+      - 'output/csv/**'
+      - 'tests/**'
+      - 'src/**'
       - '.github/workflows/run_tests.yml'
   workflow_dispatch:
 
@@ -58,17 +58,14 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: pip install -r requirements.txt
 
       - name: Patch fastai_audio for Python 3.11+ compatibility
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: bash patch_fastai_audio.sh
 
       - name: Download FastAI model
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           mkdir -p model
           curl -o model.zip https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-20.FastAI.R1-12.zip
@@ -76,7 +73,6 @@ jobs:
 
       - name: Run unit tests
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python -m pytest tests/ -v -s
 
@@ -115,18 +111,15 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: pip install -r requirements.txt
 
       - name: Patch fastai_audio for Python 3.11+ compatibility
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         shell: cmd
         run: patch_fastai_audio.bat
 
       - name: Download FastAI model
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           New-Item -ItemType Directory -Force -Path model
           Invoke-WebRequest -Uri https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-20.FastAI.R1-12.zip -OutFile model.zip
@@ -134,6 +127,5 @@ jobs:
 
       - name: Run unit tests
         if: steps.skip_check.outputs.should_skip != 'true'
-        working-directory: ModelTraining
         run: |
           python -m pytest tests/ -v -s
