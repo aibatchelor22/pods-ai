@@ -47,7 +47,7 @@ except ImportError as e:
     raise
 
 # Get repository root.
-REPO_ROOT = Path(__file__).resolve().parents
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Label mappings (will be set based on num_classes).
 LABEL2ID = {}

@@ -258,8 +258,6 @@ resident,rpi_sunset_bay,2024_11_23_12_10_58_PST,https://live.orcasound.net/bouts
 resident,rpi_sunset_bay,2024_11_23_12_27_59_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-11-23T20%3A27%3A59.000Z,Jpod calls again 12:28,tp_human_only,
 resident,rpi_sunset_bay,2024_11_23_13_07_48_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-11-23T21%3A07%3A48.000Z,J pod vocalizations,tp_human_only,
 resident,rpi_bush_point,2024_11_23_18_35_14_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-11-24T02%3A35%3A14.000Z,Jpod calls 6:36pm,tp_human_only,
-resident,rpi_bush_point,2024_11_23_18_35_14_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-11-24T02%3A35%3A14.000Z,Jpod calls 6:36pm,tp_human_only,
-resident,rpi_bush_point,2024_11_23_18_35_14_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-11-24T02%3A35%3A14.000Z,Jpod calls 6:36pm,tp_human_only,
 resident,rpi_port_townsend,2024_11_23_19_33_21_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2024-11-24T03%3A33%3A21.000Z,"J call (SV: interesting sound! I don't think it's a J pod call, but leaving in the Whale category for now.)",tp_human_only,
 vessel,rpi_sunset_bay,2024_11_26_01_04_05_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-11-26T09%3A04%3A05.084Z,Ship noise,fp_machine_only,60.7078
 resident,rpi_sunset_bay,2024_12_01_07_51_18_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-12-01T15%3A51%3A18.000Z,L pod calls and vessel noise,tp_human_only,
@@ -298,7 +296,6 @@ resident,rpi_sunset_bay,2024_12_23_10_42_12_PST,https://live.orcasound.net/bouts
 resident,rpi_sunset_bay,2024_12_23_11_28_11_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-12-23T19%3A28%3A11.000Z,"Faint calls through most of this candidate (many missed by the algorithm), but at similar amplitude of AM radio. Many slightly clearer calls in the 60Hz hum are responsible for most of the true positives.",tp_machine_only,65.6494
 resident,rpi_sunset_bay,2024_12_23_17_30_50_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-12-24T01%3A30%3A50.000Z,Jpod!,tp_human_only,
 resident,rpi_sunset_bay,2024_12_23_18_10_21_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-12-24T02%3A10%3A21.000Z,Faint J pod calls,tp_human_only,
-resident,rpi_sunset_bay,2024_12_23_18_10_21_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2024-12-24T02%3A10%3A21.000Z,Faint J pod calls,tp_human_only,
 resident,rpi_bush_point,2024_12_25_10_33_08_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-12-25T18%3A33%3A08.000Z,J pod,tp_human_only,
 transient,rpi_orcasound_lab,2024_12_29_13_37_23_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-12-29T21%3A37%3A23.186Z,"Good transient calls, lots of water noise",tp_machine_only,66.1314
 transient,rpi_orcasound_lab,2024_12_29_14_08_02_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2024-12-29T22%3A08%3A02.000Z,"Strong transient (Bigg's) calls, loud ship noise",tp_machine_only,65.2061
@@ -326,18 +323,12 @@ resident,rpi_sunset_bay,2025_01_03_07_00_01_PST,https://live.orcasound.net/bouts
 resident,rpi_sunset_bay,2025_01_03_07_09_48_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-03T15%3A09%3A48.000Z,Js pod s04 s continue,tp_human_only,
 resident,rpi_sunset_bay,2025_01_03_11_27_20_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-03T19%3A27%3A20.000Z,Jpod,tp_human_only,
 resident,rpi_sunset_bay,2025_01_03_16_28_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T00%3A28%3A54.000Z,Jpod,tp_human_only,
-resident,rpi_sunset_bay,2025_01_03_16_28_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T00%3A28%3A54.000Z,Jpod,tp_human_only,
-resident,rpi_sunset_bay,2025_01_03_16_28_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T00%3A28%3A54.000Z,Jpod,tp_human_only,
-resident,rpi_sunset_bay,2025_01_03_16_28_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T00%3A28%3A54.000Z,Jpod,tp_human_only,
-resident,rpi_sunset_bay,2025_01_03_16_28_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T00%3A28%3A54.000Z,Jpod,tp_human_only,
-resident,rpi_sunset_bay,2025_01_03_16_28_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T00%3A28%3A54.000Z,Jpod,tp_human_only,
 resident,rpi_sunset_bay,2025_01_03_17_07_43_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-04T01%3A07%3A43.000Z,I can hear the orcas as well wonder which pod,tp_human_only,
 resident,rpi_sunset_bay,2025_01_04_18_00_38_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-05T02%3A00%3A38.813Z,"Faint calls, some clicks, moderate ship noise",tp_machine_only,71.3821
 resident,rpi_sunset_bay,2025_01_04_18_00_46_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-05T02%3A00%3A46.000Z,Hearing k pod calls and echolocation,tp_both,71.3821
 resident,rpi_sunset_bay,2025_01_04_18_11_40_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-05T02%3A11%3A40.338Z,"Faint to moderate calls, moderate rain noise",tp_machine_only,61.6948
 resident,rpi_sunset_bay,2025_01_04_21_41_02_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-05T05%3A41%3A02.000Z,"Good calls and clicks, moderate noise",tp_machine_only,64.2263
 resident,rpi_sunset_bay,2025_01_05_08_15_52_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-01-05T16%3A15%3A52.000Z,Kpod,tp_human_only,
-humpback,rpi_orcasound_lab,2025_01_05_21_13_57_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-01-06T05%3A13%3A57.000Z,Orca and humpback sounds (per Val for last 10 mins),tp_human_only,
 humpback,rpi_orcasound_lab,2025_01_05_21_13_57_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-01-06T05%3A13%3A57.000Z,Orca and humpback sounds (per Val for last 10 mins),tp_human_only,
 humpback,rpi_orcasound_lab,2025_01_05_21_18_05_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-01-06T05%3A18%3A05.000Z,Humpback sounds,tp_both,56.4689
 humpback,rpi_orcasound_lab,2025_01_05_21_19_11_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-01-06T05%3A19%3A11.000Z,Humpback,tp_both,56.4689
@@ -364,9 +355,7 @@ human,rpi_sunset_bay,2025_02_17_15_40_30_PST,https://live.orcasound.net/bouts/ne
 human,rpi_sunset_bay,2025_02_17_15_52_44_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-02-17T23%3A52%3A44.000Z,Radio station,fp_machine_only,59.8893
 resident,rpi_orcasound_lab,2025_02_20_18_30_06_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-02-21T02%3A30%3A06.000Z,J pod calls,tp_human_only,
 resident,rpi_orcasound_lab,2025_02_20_18_55_04_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-02-21T02%3A55%3A04.000Z,J pod call,tp_human_only,
-resident,rpi_orcasound_lab,2025_02_20_18_55_04_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-02-21T02%3A55%3A04.000Z,J pod call,tp_human_only,
 vessel,rpi_sunset_bay,2025_02_21_18_09_38_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-02-22T02%3A09%3A38.474Z,Tonal noise from a ship. Likely shaft rub.,fp_machine_only,57.9989
-resident,rpi_sunset_bay,2025_03_03_10_45_58_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-03T18%3A45%3A58.000Z,Jpod calls,tp_human_only,
 resident,rpi_sunset_bay,2025_03_03_10_45_58_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-03T18%3A45%3A58.000Z,Jpod calls,tp_human_only,
 resident,rpi_sunset_bay,2025_03_03_10_59_38_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-03T18%3A59%3A38.000Z,I pod,tp_human_only,
 resident,rpi_sunset_bay,2025_03_04_12_46_56_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-04T20%3A46%3A56.000Z,"Faint calls, some radio and cable noise",tp_machine_only,65.6878
@@ -376,7 +365,6 @@ resident,rpi_sunset_bay,2025_03_04_13_27_36_PST,https://live.orcasound.net/bouts
 resident,rpi_sunset_bay,2025_03_04_13_30_11_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-04T21%3A30%3A11.000Z,"Lots of faint to moderate calls, some water and radio noise",tp_machine_only,74.5023
 resident,rpi_sunset_bay,2025_03_04_13_46_44_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-04T21%3A46%3A44.762Z,"Faint calls, moderate ship noise",tp_machine_only,58.2595
 resident,rpi_sunset_bay,2025_03_04_14_28_26_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-04T22%3A28%3A26.000Z,Faint j pod calls - donkey sounds,tp_human_only,
-resident,rpi_sunset_bay,2025_03_05_14_21_41_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-05T22%3A21%3A41.000Z,Faint jpod calls,tp_human_only,
 resident,rpi_sunset_bay,2025_03_05_14_21_41_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-05T22%3A21%3A41.000Z,Faint jpod calls,tp_human_only,
 resident,rpi_sunset_bay,2025_03_05_14_26_32_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-05T22%3A26%3A32.000Z,Jpod calls,tp_human_only,
 resident,rpi_sunset_bay,2025_03_05_14_28_27_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-03-05T22%3A28%3A27.000Z,Jpod calls amongst radio noise and lots of thumping,tp_human_only,
@@ -410,8 +398,6 @@ resident,rpi_orcasound_lab,2025_04_06_17_03_26_PST,https://live.orcasound.net/bo
 transient,rpi_orcasound_lab,2025_04_08_05_23_40_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-08T12%3A23%3A40.135Z,"Bigg's killer whale calls, nice an clear with rising tones in low ambient noise, repeated 4 times.",tp_machine_only,84.3431
 resident,rpi_north_sjc,2025_04_15_17_59_55_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-16T00%3A59%3A55.440Z,,tp_machine_only,78.5026
 resident,rpi_north_sjc,2025_04_15_19_49_02_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-16T02%3A49%3A02.000Z,J pod!!,tp_human_only,
-resident,rpi_north_sjc,2025_04_15_19_49_02_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-16T02%3A49%3A02.000Z,J pod!!,tp_human_only,
-resident,rpi_north_sjc,2025_04_15_19_49_02_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-16T02%3A49%3A02.000Z,J pod!!,tp_human_only,
 resident,rpi_orcasound_lab,2025_04_16_16_17_01_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-16T23%3A17%3A01.898Z,"Faint signals through vessel noise, including slow echolocation and whistles (one very clear at the end).",tp_machine_only,69.0426
 resident,rpi_orcasound_lab,2025_04_16_16_18_30_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-16T23%3A18%3A30.542Z,"Lots of whistles and a variety of click sequences, along with S04s and S10s.",tp_machine_only,78.2138
 resident,rpi_orcasound_lab,2025_04_16_16_18_56_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-16T23%3A18%3A56.000Z,"Nice extended S10s, slow clicks, S04s, whistles, buzzes",tp_machine_only,64.3048
@@ -422,7 +408,6 @@ resident,rpi_orcasound_lab,2025_04_16_16_23_56_PST,https://live.orcasound.net/bo
 resident,rpi_orcasound_lab,2025_04_16_16_25_55_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-16T23%3A25%3A55.000Z,"More S04s, then S10 and more squeals and whistles, some really long!",tp_machine_only,73.7897
 resident,rpi_orcasound_lab,2025_04_16_16_26_20_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-16T23%3A26%3A20.000Z,"Crazy whistle and squeal sequences along with many S04s in ""different voices.""",tp_machine_only,73.5866
 resident,rpi_orcasound_lab,2025_04_16_16_26_58_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-04-16T23%3A26%3A58.000Z,"A few calls in first third, before system buzz and some local snaps.",tp_machine_only,79.7903
-resident,rpi_north_sjc,2025_04_19_19_34_21_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-20T02%3A34%3A21.000Z,J pod continues,tp_human_only,
 resident,rpi_north_sjc,2025_04_19_19_34_21_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-20T02%3A34%3A21.000Z,J pod continues,tp_human_only,
 resident,rpi_north_sjc,2025_04_19_19_39_10_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-20T02%3A39%3A10.000Z,J pod calls as they stream south,tp_human_only,
 resident,rpi_north_sjc,2025_04_19_20_39_16_PST,https://live.orcasound.net/bouts/new/north-sjc?time=2025-04-20T03%3A39%3A16.000Z,J pod,tp_human_only,
@@ -523,7 +508,6 @@ water,rpi_bush_point,2025_07_13_21_33_57_PST,https://live.orcasound.net/bouts/ne
 resident,rpi_orcasound_lab,2025_07_14_12_08_58_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-07-14T19%3A08%3A58.000Z,"very faint J pod call, also heard on LK hydro",tp_human_only,
 resident,rpi_orcasound_lab,2025_07_14_16_05_44_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-07-14T23%3A05%3A44.000Z,J pod EL clicks,tp_human_only,
 resident,rpi_orcasound_lab,2025_07_14_16_08_22_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-07-14T23%3A08%3A22.000Z,J Pod calls,tp_human_only,
-resident,rpi_orcasound_lab,2025_07_14_16_08_22_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-07-14T23%3A08%3A22.000Z,J pod calls,tp_human_only,
 resident,rpi_orcasound_lab,2025_07_14_16_11_02_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-07-14T23%3A11%3A02.000Z,Loud J pod calls!,tp_human_only,
 water,rpi_bush_point,2025_07_14_17_39_50_PST,https://live.orcasound.net/bouts/new/bush-point?time=2025-07-15T00%3A39%3A50.000Z,Water slosh,fp_machine_only,73.8395
 vessel,rpi_bush_point,2025_07_14_17_55_40_PST,https://live.orcasound.net/bouts/new/bush-point?time=2025-07-15T00%3A55%3A40.000Z,Ship noise,fp_machine_only,61.5073
@@ -1819,7 +1803,6 @@ transient,rpi_orcasound_lab,2026_01_29_15_21_37_PST,https://live.orcasound.net/b
 transient,rpi_orcasound_lab,2026_01_29_15_22_56_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A22%3A56.932Z,"Transient calls, electrical noise",tp_machine_only,65.6875
 transient,rpi_orcasound_lab,2026_01_29_15_23_45_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A23%3A45.000Z,"Fair transient calls, electrical noise",tp_machine_only,62.1640
 transient,rpi_orcasound_lab,2026_01_29_15_46_54_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A46%3A54.000Z,Biggs call,tp_both,74.0267
-transient,rpi_orcasound_lab,2026_01_29_15_46_54_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A46%3A54.000Z,"Fair transient calls, moderate ambient noise, electrical noise",tp_machine_only,74.3779
 transient,rpi_orcasound_lab,2026_01_29_15_48_24_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A48%3A24.000Z,"Good transient calls, moderate ambient noise, electrical noise",tp_machine_only,73.6852
 transient,rpi_orcasound_lab,2026_01_29_15_49_33_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A49%3A33.542Z,"Good transient calls, moderate ambient noise, electrical noise",tp_machine_only,63.4727
 transient,rpi_orcasound_lab,2026_01_29_15_51_15_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2026-01-29T23%3A51%3A15.000Z,chatty transients,tp_both,74.0267

@@ -53,7 +53,7 @@ def parse_csv(csv_path: Path) -> List[CSVRow]:
         List[CSVRow]: List of parsed CSV rows.
     """
     rows = []
-    with open(csv_path, 'r', newline='') as csvfile:
+    with open(csv_path, 'r', newline='', encoding='utf-8') as csvfile:
         csv_reader = csv.reader(csvfile)
         # Skip header
         next(csv_reader)
@@ -336,7 +336,30 @@ def process_testing_csv(csv_path: Path, output_root: Path):
         print(f"Processing testing sample: {row.category} - {row.node_name} - {row.timestamp_pst} ({row.notes})")
         download_testing_sample(row, output_root)
 
+
+def print_usage():
+    """
+    Display usage information for this script.
+    """
+    print("Usage: python download_wavs.py")
+    print()
+    print("This script downloads wav files for training and testing samples.")
+    print("It reads from:")
+    print("  - output/csv/training_samples.csv")
+    print("  - output/csv/testing_samples.csv")
+    print()
+    print("And saves wav files to:")
+    print("  - output/wav/ (training samples)")
+    print("  - output/testing-wav/ (testing samples)")
+    print()
+    print("This script does not accept any command-line arguments.")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        print_usage()
+        sys.exit(0)
+
     training_csv_path = Path("output/csv/training_samples.csv")
     training_output_root = Path("output/wav")
     testing_csv_path = Path("output/csv/testing_samples.csv")

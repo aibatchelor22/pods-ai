@@ -47,11 +47,11 @@ def get_label(
 ) -> Optional[str]:
     """
     Derives a normalized label for an OrcasiteDetection based on its category, description, and an optional OrcaHelloDetection match.
-    
+
     Parameters:
         orcasite_det (OrcasiteDetection): The detection to label.
         orcahello_det (Optional[OrcaHelloDetection]): An optional id-matched OrcaHello detection used to upgrade some whale labels.
-    
+
     Returns:
         str | None: `'resident'`, `'transient'`, `'humpback'`, `'water'`, `'vessel'`, `'jingle'`, or `'human'` when a label can be determined; `None` when the label is unknown.
     """
@@ -156,12 +156,12 @@ def classify_detection(
 ) -> Classification:
     """
     Assigns a Classification to an OrcasiteDetection based on its label, source, category, and nearby detections.
-    
+
     Parameters:
         det (OrcasiteDetection): The detection to classify.
         label (str): The computed label for the detection (e.g., 'resident', 'transient', 'humpback', 'water', 'vessel', 'jingle', 'human', or None).
         all_detections (List[OrcasiteDetection]): All detections for the same feed used to determine temporal context.
-    
+
     Returns:
         Classification: An object with `kind` set to one of:
             - 'tp_human_only' for human-sourced whale detections with no nearby machine whale detections,
@@ -201,12 +201,12 @@ def classify_detection(
 def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
     """
     Fetch detections from the Orcasite API for the given feed.
-    
+
     Parses API response into a list of OrcasiteDetection objects filtered to the provided feed. Timestamps are parsed from ISO strings and will be None if parsing fails. On network or parsing errors the function prints an error and returns an empty list.
-    
+
     Parameters:
         feed (OrcasiteFeed): Feed whose detections should be retrieved and matched by feed.id.
-    
+
     Returns:
         List[OrcasiteDetection]: Detections associated with the specified feed (may be empty).
     """
@@ -231,19 +231,19 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
 
     dets = []
     page_count = 0
-    
+
     try:
         # Loop through all pages until no more data is returned
         while page_count < MAX_DETECTION_PAGES:
             params["page[offset]"] = offset
-            
+
             print(f"Fetching Orcasite page {page_count}...")
             r = requests.get(base_url, params=params, timeout=10)
             r.raise_for_status()
             data = r.json()
 
             items = data.get("data", [])
-            
+
             # If no data is returned, we've fetched all pages
             if not items:
                 print(f"Finished after page {page_count}")
@@ -284,7 +284,7 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
 def get_node_name_for_feed(feed: OrcasiteFeed) -> str:
     """
     Retrieve the node name associated with an OrcasiteFeed.
-    
+
     Returns:
         node_name (str): The feed's node_name.
     """
@@ -293,10 +293,10 @@ def get_node_name_for_feed(feed: OrcasiteFeed) -> str:
 def get_orcahello_detections(feed: OrcasiteFeed) -> List[OrcaHelloDetection]:
     """
     Retrieve OrcaHello detections and return those whose audio URI contains the given feed's node_name.
-    
+
     Parameters:
         feed (OrcasiteFeed): Feed whose node_name is used to filter OrcaHello detection audio URIs.
-    
+
     Returns:
         List[OrcaHelloDetection]: A list of detections associated with the feed. Each detection's `timestamp` is a `datetime` or `None` if parsing failed, and `status` is one of `"confirmed"`, `"rejected"`, or `"unreviewed"`.
     """
@@ -370,10 +370,10 @@ def get_orcahello_detections(feed: OrcasiteFeed) -> List[OrcaHelloDetection]:
 def format_timestamp_pst(dt: datetime) -> str:
     """
     Format a datetime object as PST timestamp string in the format YYYY_MM_DD_HH_MM_SS_PST.
-    
+
     Parameters:
         dt (datetime): The datetime to format (should be timezone-aware).
-    
+
     Returns:
         str: Formatted timestamp string (e.g., "2025_12_24_17_51_23_PST").
     """
@@ -403,11 +403,11 @@ def parse_pst_timestamp(ts_str: str) -> datetime:
 def generate_uri(node: str, dt: datetime) -> str:
     """
     Generate a URI for the Orcasound bouts interface.
-    
+
     Parameters:
         node (str): The node name (e.g., "andrews-bay").
         dt (datetime): The datetime in UTC.
-    
+
     Returns:
         str: URI in the format "https://live.orcasound.net/bouts/new/{node}?time={utc_time}".
     """
@@ -452,10 +452,10 @@ def process_all_feeds(
         if not feeds:
             print(f"No feed found with node_name '{feed_filter}'")
             return
-    
+
     # Collect all detections first before writing to CSV
     all_rows = []
-    
+
     for feed in feeds:
         print(f"Processing feed {feed.id} ({feed.node_name})")
         orcasite_dets = get_orcasite_detections(feed)
@@ -484,7 +484,7 @@ def process_all_feeds(
             classification = classify_detection(det, label, orcasite_dets)
             if not classification.include:
                 continue
-            
+
             # Collect row data with timestamp for sorting.
             category = label
             node_name = det.feed.node_name  # e.g., "rpi_sunset_bay"
@@ -508,21 +508,36 @@ def process_all_feeds(
                         confidence = f"{nearby_orcahello.confidence:.4f}"
 
             all_rows.append((det.timestamp, category, node_name, timestamp_pst, uri, det.description, classification.kind, confidence))
-    
+
     # Sort all rows by timestamp (first element of tuple) - oldest first, newest last.
     all_rows.sort(key=lambda row: row[0])
-    
-    # Create CSV file and write sorted rows.
+
+    # Deduplicate rows based on (Category, NodeName, Timestamp, URI).
+    # Keep the first occurrence of each unique detection.
+    seen = set()
+    unique_rows = []
+    for row in all_rows:
+        # Create a key from (category, node_name, timestamp, uri)
+        key = (row[1], row[2], row[3], row[4])  # Category, NodeName, Timestamp, URI
+        if key not in seen:
+            seen.add(key)
+            unique_rows.append(row)
+        else:
+            print(f"Skipping duplicate: {row[1]}, {row[2]}, {row[3]}")
+
+    print(f"\nTotal rows: {len(all_rows)}, Unique rows: {len(unique_rows)}, Duplicates removed: {len(all_rows) - len(unique_rows)}")
+
+    # Create CSV file and write sorted unique rows.
     csv_path = output_root / "detections.csv"
     output_root.mkdir(parents=True, exist_ok=True)
-    
+
     with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
         csv_writer = csv.writer(csvfile, lineterminator='\n')
         # Write header
         csv_writer.writerow(['Category', 'NodeName', 'Timestamp', 'URI', 'Description', 'Notes', 'Confidence'])
-        
-        # Write sorted rows (exclude the timestamp used for sorting)
-        for row in all_rows:
+
+        # Write sorted unique rows (exclude the timestamp used for sorting)
+        for row in unique_rows:
             csv_writer.writerow([row[1], row[2], row[3], row[4], row[5], row[6], row[7]])
 
 if __name__ == "__main__":

@@ -419,13 +419,14 @@ class TestTestingSamples:
         assert 'https://example.org/training-selected' not in selected_uris
 
     def test_select_testing_samples_limits_each_category_to_ten(self):
-        """select_testing_samples should cap each category at 10 rows."""
+        """select_testing_samples should cap standard categories at MAX_TESTING_SAMPLES_PER_CATEGORY."""
+        # Test with humpback (standard category) - should cap at MAX (30).
         detections = []
-        for i in range(12):
+        for i in range(35):
             detections.append({
                 'Category': 'humpback',
                 'NodeName': 'rpi_test',
-                'Timestamp': f'2025_01_01_00_00_{i:02d}_PST',
+                'Timestamp': f'2025_01_01_00_{i:02d}_00_PST',
                 'URI': f'https://example.org/humpback-{i}',
                 'Description': f'humpback {i}',
                 'Notes': 'tp_machine_only',
@@ -433,7 +434,25 @@ class TestTestingSamples:
             })
 
         selected = select_testing_samples(detections, [], {})
-        assert len(selected) == 10
+        humpback_selected = [s for s in selected if s['Category'] == 'humpback']
+        assert len(humpback_selected) == 30  # MAX_TESTING_SAMPLES_PER_CATEGORY
+
+        # Test with human (negative category) - should get at least MIN (10).
+        detections_negative = []
+        for i in range(15):
+            detections_negative.append({
+                'Category': 'human',
+                'NodeName': 'rpi_test',
+                'Timestamp': f'2025_01_01_01_{i:02d}_00_PST',
+                'URI': f'https://example.org/human-{i}',
+                'Description': f'human {i}',
+                'Notes': 'fp_machine_only',
+                'Confidence': '',
+            })
+
+        selected_negative = select_testing_samples(detections_negative, [], {})
+        human_selected = [s for s in selected_negative if s['Category'] == 'human']
+        assert len(human_selected) == 10  # MIN_TESTING_SAMPLES_PER_CATEGORY for negative categories
 
     def test_write_testing_samples_uses_detection_csv_schema(self):
         """write_testing_samples should emit rows with detections.csv columns."""

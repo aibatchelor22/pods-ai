@@ -2,10 +2,10 @@
 # Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
 """
-Split a WAV file into 3-second segments and run inference on each segment.
+Split a 60-second audio sample into 3-second segments and run inference on each segment.
 
 Usage:
-    # Node name and timestamp inferred from filename:
+    # Node name and timestamp inferred from filename of 60-second audio sample:
     python add_samples.py rpi-orcasound-lab_2025_01_15_12_30_00_PST.wav
 
     # Override node name and/or timestamp explicitly:
@@ -14,6 +14,9 @@ Usage:
     python add_samples.py recording.wav --node-name rpi_sunset_bay \\
         --timestamp 2025_01_15_12_30_00_PST \\
         --model-path /path/to/custom-model
+
+    # Download audio from URI:
+    python add_samples.py --uri "https://live.orcasound.net/bouts/new/sunset-bay?time=2024-07-04T18%3A05%3A59.000Z"
 
 Saves 3-second segments with a 2-second hop to the "new/" output directory
 (configurable with --output-dir) using the same filename convention as
@@ -47,14 +50,16 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse, parse_qs
 
 import ffmpeg
 from pytz import timezone
 
 from model_inference import get_model_inference
 from orcasite_feeds import get_orcasite_feeds, OrcasiteFeed
+from extract_training_samples import download_60s_audio
 
 SEGMENT_DURATION = 3  # Duration of each segment in seconds.
 HOP_DURATION = 2  # Hop size between segments in seconds.
@@ -180,6 +185,91 @@ def get_node_slug(node_name: str) -> str:
     )
 
 
+def get_node_name_from_slug(slug: str) -> str:
+    """
+    Look up the node_name for a slug from Orcasite feeds.
+
+    Args:
+        slug: URL slug (e.g., "orcasound-lab").
+
+    Returns:
+        Internal node name (e.g., "rpi_orcasound_lab").
+
+    Raises:
+        ValueError: If the slug is not found in the Orcasite feeds.
+    """
+    global _FEEDS_CACHE
+
+    # Load feeds from API if not already cached.
+    if _FEEDS_CACHE is None:
+        try:
+            _FEEDS_CACHE = get_orcasite_feeds()
+        except Exception as e:
+            raise ValueError(f"Failed to fetch Orcasite feeds: {e}") from e
+
+    # Look up the slug in the feeds.
+    for feed in _FEEDS_CACHE:
+        if feed.slug == slug:
+            return feed.node_name
+
+    # If not found, raise an error with available slugs.
+    available = [f.slug for f in _FEEDS_CACHE]
+    raise ValueError(
+        f"Slug '{slug}' not found in Orcasite feeds. "
+        f"Available slugs: {', '.join(available)}"
+    )
+
+
+def parse_uri(uri: str) -> tuple[str, str]:
+    """
+    Parse a detection URI to extract node name and timestamp.
+
+    Expects URIs in the format:
+    https://live.orcasound.net/bouts/new/{slug}?time={utc_time}
+
+    Args:
+        uri: Detection URI (e.g., "https://live.orcasound.net/bouts/new/sunset-bay?time=2024-07-04T18%3A05%3A59.000Z")
+
+    Returns:
+        Tuple of (node_name, timestamp_str) where timestamp is in PST format.
+
+    Raises:
+        ValueError: If the URI cannot be parsed.
+    """
+    parsed = urlparse(uri)
+
+    # Extract slug from path: /bouts/new/{slug}
+    path_parts = parsed.path.strip('/').split('/')
+    if len(path_parts) < 3 or path_parts[0] != 'bouts' or path_parts[1] != 'new':
+        raise ValueError(f"Invalid URI format: {uri}. Expected /bouts/new/{{slug}}?time=...")
+
+    slug = path_parts[2]
+
+    # Get node name from slug.
+    node_name = get_node_name_from_slug(slug)
+
+    # Extract time parameter.
+    query_params = parse_qs(parsed.query)
+    if 'time' not in query_params:
+        raise ValueError(f"URI missing 'time' query parameter: {uri}")
+
+    time_str = query_params['time'][0]
+
+    # Parse UTC time and convert to PST.
+    # Format: 2024-07-04T18:05:59.000Z
+    try:
+        utc_dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        # Try without milliseconds.
+        utc_dt = datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%SZ")
+
+    utc_dt = UTC_TZ.localize(utc_dt)
+    pst_dt = utc_dt.astimezone(PACIFIC_TZ)
+    timestamp_str = format_timestamp_pst(pst_dt)
+
+    return node_name, timestamp_str
+
+
 def generate_uri(node_name: str, timestamp_str: str) -> str:
     """
     Generate a URI for the Orcasound bouts interface from a node name and PST timestamp.
@@ -260,14 +350,14 @@ def split_wav_into_segments(
     hop_duration: int = HOP_DURATION,
 ) -> list[tuple[Path, str]]:
     """
-    Split a WAV file into fixed-duration segments with a hop and save to output_dir.
+    Split a 60-second audio sample into fixed-duration segments with a hop and save to output_dir.
 
     Uses the same filename convention as output/wav/humpback/ etc.:
     {node_name_with_hyphens}_{timestamp_pst}.wav, where the timestamp is the
     actual start time of each sample.
 
     Args:
-        wav_file: Path to the input WAV file.
+        wav_file: Path to the input 60-second WAV file.
         node_name: Hydrophone node name (e.g., "rpi_orcasound_lab").
         base_timestamp: PST timestamp of the start of the recording
             (e.g., "2025_01_15_12_30_00_PST").
@@ -363,7 +453,8 @@ def get_segment_prediction(model: object, segment_path: Path) -> tuple[str, floa
 
 
 def add_samples(
-    wav_file: str,
+    wav_file: Optional[str] = None,
+    uri: Optional[str] = None,
     node_name: Optional[str] = None,
     base_timestamp: Optional[str] = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
@@ -371,25 +462,30 @@ def add_samples(
     detections_csv: str = DEFAULT_DETECTIONS_CSV,
 ) -> list[dict]:
     """
-    Split a WAV file into 3-second segments, save them, and run inference on each.
+    Split a 60-second audio sample into 3-second segments, save them, and run inference on each.
 
     Saves segments to output_dir using the filename convention
     {node_name_with_hyphens}_{timestamp_pst}.wav and returns a list of
     dictionaries with manual_samples.csv fields.  Inference always uses the
     PODS-AI (podsai) model type.
 
+    Either wav_file or uri must be provided:
+    - If wav_file is provided, uses that local file
+    - If uri is provided, downloads the 60-second audio from Orcasound
+
     If node_name or base_timestamp are not provided they are inferred from the
-    wav_file filename, which must follow the convention used by download_wavs.py:
+    wav_file filename (or from the uri), which must follow the convention used by download_wavs.py:
     {node_name_with_hyphens}_{YYYY_MM_DD_HH_MM_SS_PST}.wav
     (e.g., rpi-orcasound-lab_2025_12_17_22_34_03_PST.wav).
 
     Args:
-        wav_file: Path to the input WAV file.
+        wav_file: Path to the input WAV file. Either wav_file or uri must be provided.
+        uri: Detection URI to download audio from. Either wav_file or uri must be provided.
         node_name: Hydrophone node name (e.g., "rpi_orcasound_lab").
-            Inferred from wav_file filename if not provided.
+            Inferred from wav_file filename or uri if not provided.
         base_timestamp: PST timestamp of the start of the recording
             (e.g., "2025_01_15_12_30_00_PST").
-            Inferred from wav_file filename if not provided.
+            Inferred from wav_file filename or uri if not provided.
         output_dir: Directory to save segments (default: "new").
         model_path: HuggingFace Hub model ID or path to a local model directory
             (default: "davethaler/whale-call-detector").
@@ -400,15 +496,49 @@ def add_samples(
         Category, NodeName, Timestamp, URI, Description, Notes, Confidence.
 
     Raises:
-        ValueError: If node_name or base_timestamp cannot be inferred and are
-            not provided.
+        ValueError: If neither wav_file nor uri is provided, or if node_name or
+            base_timestamp cannot be inferred and are not provided.
     """
+    if wav_file is None and uri is None:
+        raise ValueError("Either wav_file or uri must be provided")
+
+    if wav_file is not None and uri is not None:
+        raise ValueError("Cannot specify both wav_file and uri")
+
+    # Handle URI-based download.
+    temp_dir = None
+    if uri is not None:
+        # Parse node name and timestamp from URI.
+        if node_name is None or base_timestamp is None:
+            inferred_node, inferred_ts = parse_uri(uri)
+            if node_name is None:
+                node_name = inferred_node
+            if base_timestamp is None:
+                base_timestamp = inferred_ts
+
+        print(f"Downloading 60-second audio from URI...")
+        print(f"  Node: {node_name}")
+        print(f"  Timestamp: {base_timestamp}")
+
+        # Download the 60-second WAV file.
+        temp_dir = TemporaryDirectory()
+        wav_path = download_60s_audio(node_name, base_timestamp, temp_dir.name)
+
+        if wav_path is None:
+            temp_dir.cleanup()
+            raise ValueError(f"Failed to download audio for {node_name} at {base_timestamp}")
+
+        wav_file = wav_path
+        print(f"Downloaded to: {wav_file}")
+
+    # At this point wav_file is set (either user-provided or downloaded).
     if node_name is None or base_timestamp is None:
         inferred_node, inferred_ts = parse_node_and_timestamp_from_filename(wav_file)
         if node_name is None:
             node_name = inferred_node
         if base_timestamp is None:
             base_timestamp = inferred_ts
+
     out_dir = Path(output_dir)
 
     # Try to look up detection info in detections.csv.
@@ -423,6 +553,11 @@ def add_samples(
 
     # Split the WAV and save segments.
     segments = split_wav_into_segments(wav_file, node_name, base_timestamp, out_dir)
+
+    # Clean up temporary directory if we downloaded the file.
+    if temp_dir is not None:
+        temp_dir.cleanup()
+
     if not segments:
         return []
 
@@ -469,16 +604,27 @@ def main() -> int:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Split a WAV file into 3-second segments with 2-second hop, "
+            "Split a 60-second audio sample into 3-second segments with 2-second hop, "
             "save to the output directory using the standard filename convention "
             "({node_name_with_hyphens}_{timestamp_pst}.wav), "
             "and run inference on each segment. "
-            "Output is printed in manual_samples.csv format for easy copy-paste."
+            "Output is printed in manual_samples.csv format for easy copy-paste. "
+            "Either provide a local WAV file or a detection URI to download audio."
         )
     )
     parser.add_argument(
         "wav_file",
-        help="Path to the input WAV file to segment.",
+        nargs='?',
+        help="Path to the input WAV file to segment (optional if --uri is provided).",
+    )
+    parser.add_argument(
+        "--uri",
+        default=None,
+        help=(
+            "Detection URI to download audio from "
+            "(e.g., 'https://live.orcasound.net/bouts/new/sunset-bay?time=2024-07-04T18%%3A05%%3A59.000Z'). "
+            "If provided, downloads a 60-second WAV file instead of using a local file."
+        ),
     )
     parser.add_argument(
         "--node-name",
@@ -486,7 +632,7 @@ def main() -> int:
         help=(
             "Hydrophone node name (e.g., 'rpi_orcasound_lab'). "
             "Used in output filenames (underscores are replaced with hyphens). "
-            "Inferred from the input filename if not provided."
+            "Inferred from the input filename or URI if not provided."
         ),
     )
     parser.add_argument(
@@ -496,7 +642,7 @@ def main() -> int:
             "PST timestamp of the start of the recording "
             "(e.g., '2025_01_15_12_30_00_PST'). "
             "Each segment filename encodes the actual start time of that sample. "
-            "Inferred from the input filename if not provided."
+            "Inferred from the input filename or URI if not provided."
         ),
     )
     parser.add_argument(
@@ -522,13 +668,24 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if not Path(args.wav_file).exists():
+    # Validate arguments.
+    if args.wav_file is None and args.uri is None:
+        print("Error: Either wav_file or --uri must be provided", file=sys.stderr)
+        parser.print_help()
+        return 1
+
+    if args.wav_file is not None and args.uri is not None:
+        print("Error: Cannot specify both wav_file and --uri", file=sys.stderr)
+        return 1
+
+    if args.wav_file is not None and not Path(args.wav_file).exists():
         print(f"Error: WAV file not found: {args.wav_file}", file=sys.stderr)
         return 1
 
     try:
         results = add_samples(
             wav_file=args.wav_file,
+            uri=args.uri,
             node_name=args.node_name,
             base_timestamp=args.timestamp,
             output_dir=args.output_dir,

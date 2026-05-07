@@ -49,7 +49,7 @@ from audio_utils import (
 )
 
 # Get repository root.
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Offset, in seconds, between the detection end time and the start of the downloaded audio.
 AUDIO_OFFSET_SECONDS: int = 2
@@ -58,9 +58,13 @@ PACIFIC_TZ = timezone('US/Pacific')
 UTC_TZ = timezone('UTC')
 PREFERRED_NOTES = {'tp_machine_only', 'fp_machine_only'}
 QUALITY_FILTER_TERMS = {'faint', 'distant', 'quiet', 'noise'}
+# Maximum number of detections.csv rows to use per category for training (can supplement with unlimited manual_samples.csv).
+MAX_TRAINING_DETECTIONS_PER_CATEGORY = 30
 MIN_TRAINING_SAMPLES_PER_CATEGORY = 30
+# Minimum number of testing samples selected per category.
+MIN_TESTING_SAMPLES_PER_CATEGORY = 10
 # Maximum number of testing samples selected per category.
-MAX_TESTING_SAMPLES_PER_CATEGORY = 10
+MAX_TESTING_SAMPLES_PER_CATEGORY = 30
 # Categories where tp_human_only detections are excluded from testing samples.
 NEGATIVE_CATEGORIES = {'water', 'human', 'vessel', 'jingle'}
 
@@ -172,7 +176,72 @@ def sort_by_preference(detections: list[dict], manual_confidences: dict[str, str
     return sorted(detections, key=sort_key)
 
 
-def select_training_samples(organized_data: dict[str, dict[str, list[dict]]], manual_confidences: dict[str, str]) -> list[dict]:
+def validate_category_sample_counts(
+    organized_data: dict[str, dict[str, list[dict]]],
+    manual_sample_counts: dict[str, int]
+) -> dict[str, dict[str, int]]:
+    """
+    Validate that each category has enough detections for training and testing.
+
+    Args:
+        organized_data: Nested dictionary with structure {category: {node: [detections]}} from detections.csv only.
+        manual_sample_counts: Dictionary mapping category to count of manual samples.
+
+    Returns:
+        Dictionary mapping category to stats.
+    """
+    category_stats = {}
+
+    for category in sorted(organized_data.keys()):
+        # Count from detections.csv only.
+        detections_available = sum(len(nodes) for nodes in organized_data[category].values())
+
+        # Add manual samples to get total available.
+        manual_count = manual_sample_counts.get(category, 0)
+        total_available = detections_available + manual_count
+
+        # For humpback, account for existing signal files.
+        if category == 'humpback':
+            required_training = max(0, MIN_TRAINING_SAMPLES_PER_CATEGORY - OTHER_HUMPBACK_SAMPLES)
+        else:
+            required_training = MIN_TRAINING_SAMPLES_PER_CATEGORY
+
+        required_testing = MIN_TESTING_SAMPLES_PER_CATEGORY
+        required_total = required_training + required_testing
+
+        shortage = max(0, required_total - total_available)
+
+        # Calculate training target from detections.csv:
+        # Use at most MAX_TRAINING_DETECTIONS_PER_CATEGORY from detections.csv,
+        # but reserve MIN_TESTING_SAMPLES_PER_CATEGORY for testing.
+        # Formula: min(MAX_TRAINING, detections_available - MIN_TESTING)
+        if detections_available >= MIN_TESTING_SAMPLES_PER_CATEGORY:
+            # Reserve testing samples, take up to MAX for training.
+            available_for_training = detections_available - MIN_TESTING_SAMPLES_PER_CATEGORY
+            adjusted_training = min(MAX_TRAINING_DETECTIONS_PER_CATEGORY, available_for_training)
+        else:
+            # Not enough for testing minimum - take what we can.
+            adjusted_training = max(0, detections_available - MIN_TESTING_SAMPLES_PER_CATEGORY)
+
+        category_stats[category] = {
+            'available': total_available,
+            'detections_available': detections_available,
+            'manual_count': manual_count,
+            'required': required_total,
+            'required_training': required_training,
+            'required_testing': required_testing,
+            'shortage': shortage,
+            'adjusted_training_target': adjusted_training
+        }
+
+    return category_stats
+
+
+def select_training_samples(
+    organized_data: dict[str, dict[str, list[dict]]],
+    manual_confidences: dict[str, str],
+    category_stats: dict[str, dict[str, int]]
+) -> list[dict]:
     """
     Select training samples according to requirements:
     - At least 30 samples per category (or all if < 30)
@@ -186,6 +255,7 @@ def select_training_samples(organized_data: dict[str, dict[str, list[dict]]], ma
             Each detection is a dictionary with keys: Category, NodeName, Timestamp, URI, etc.
         manual_confidences: Dictionary mapping URIs to confidence strings (0.0-100.0).
             Used to prioritize detections with 100.0 confidence during sorting.
+        category_stats: Statistics about available vs required samples per category.
 
     Returns:
         List[Dict]: Selected training sample dictionaries, each containing:
@@ -208,14 +278,12 @@ def select_training_samples(organized_data: dict[str, dict[str, list[dict]]], ma
         for node in nodes_data.keys():
             node_detections[node] = sort_by_preference(nodes_data[node], manual_confidences)
 
-        # Calculate target count for this category.
-        total_available = sum(len(node_detections[node]) for node in node_detections)
-        target_count = min(MIN_TRAINING_SAMPLES_PER_CATEGORY, total_available)
+        # Get adjusted target count for this category.
+        stats = category_stats.get(category, {})
+        target_count = stats.get('adjusted_training_target', MIN_TRAINING_SAMPLES_PER_CATEGORY)
 
-        # For humpback category, subtract the number of existing signal files.
-        if category == 'humpback':
-            target_count = max(0, target_count - OTHER_HUMPBACK_SAMPLES)
-            print(f"  Adjusting humpback target: {target_count} (after subtracting {OTHER_HUMPBACK_SAMPLES} existing signal files)")
+        if stats.get('shortage', 0) > 0:
+            print(f"  {category}: Adjusting training target to {target_count} (shortage of {stats['shortage']} total samples)")
 
         # Track how many samples selected per node.
         node_counts = defaultdict(int)
@@ -274,8 +342,8 @@ def select_testing_samples(
     3. Select up to MAX_TESTING_SAMPLES_PER_CATEGORY per category from eligible samples.
     4. Additionally select up to MAX_TESTING_SAMPLES_PER_CATEGORY tp_machine_only samples
        in resident category.
-    5. Additionally select up to MAX_TESTING_SAMPLES_PER_CATEGORY tp_human_only samples
-       in negative categories.
+    5. Select up to MIN_TESTING_SAMPLES_PER_CATEGORY samples from negative categories
+       (any note type).
 
     Args:
         detections: List of detection dictionaries.
@@ -291,7 +359,7 @@ def select_testing_samples(
     # Separate detections into three groups.
     standard_eligible = []
     resident_tp_machine_only = []
-    negative_tp_human_only = []
+    negative_category_samples = []  # All samples from negative categories.
 
     for detection in detections:
         uri = detection.get('URI', '')
@@ -313,8 +381,9 @@ def select_testing_samples(
         # Categorize the detection.
         if notes == 'tp_machine_only' and category == 'resident':
             resident_tp_machine_only.append(detection)
-        elif notes == 'tp_human_only' and category in NEGATIVE_CATEGORIES:
-            negative_tp_human_only.append(detection)
+        elif category in NEGATIVE_CATEGORIES:
+            # Collect ALL negative category samples regardless of note type.
+            negative_category_samples.append(detection)
         else:
             standard_eligible.append(detection)
 
@@ -335,17 +404,19 @@ def select_testing_samples(
         sorted_resident_machine = sort_by_preference(resident_tp_machine_only, manual_confidences)
         selected_testing_samples.extend(sorted_resident_machine[:MAX_TESTING_SAMPLES_PER_CATEGORY])
 
-    # Add tp_human_only negative category samples.
-    if negative_tp_human_only:
+    # Add negative category samples (any note type).
+    if negative_category_samples:
         # Organize by category to respect per-category limit.
-        organized_negative = organize_by_category_node(negative_tp_human_only)
+        organized_negative = organize_by_category_node(negative_category_samples)
         for category in sorted(organized_negative.keys()):
             category_detections = []
             for node_detections in organized_negative[category].values():
                 category_detections.extend(node_detections)
 
             sorted_detections = sort_by_preference(category_detections, manual_confidences)
-            selected_testing_samples.extend(sorted_detections[:MAX_TESTING_SAMPLES_PER_CATEGORY])
+            # Use MIN_TESTING_SAMPLES_PER_CATEGORY for negative categories to ensure minimum coverage.
+            num_to_select = min(len(sorted_detections), MIN_TESTING_SAMPLES_PER_CATEGORY)
+            selected_testing_samples.extend(sorted_detections[:num_to_select])
 
     return selected_testing_samples
 
@@ -1121,7 +1192,7 @@ def main():
         input_path = REPO_ROOT / input_path
     output_path = REPO_ROOT / 'output' / 'csv' / 'training_samples.csv'
     testing_output_path = REPO_ROOT / 'output' / 'csv' / 'testing_samples.csv'
-    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'  # ADD THIS
+    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'
 
     # Load manual confidences for sorting.
     manual_corrections_path = REPO_ROOT / 'output' / 'csv' / 'manual_timestamps.csv'
@@ -1142,16 +1213,36 @@ def main():
         total = sum(len(nodes) for nodes in organized_data[category].values())
         print(f"  {category}: {total} detections across {len(organized_data[category])} nodes")
 
-    print("\nSelecting training samples...")
-    samples = select_training_samples(organized_data, manual_confidences)
-
-    # Load and merge manual samples.
+    # Load manual samples and count them by category.
     manual_samples = load_manual_samples(manual_samples_path)
-    samples = merge_manual_samples(samples, manual_samples, manual_timestamps, args.duration)
+    manual_sample_counts = defaultdict(int)
+    if manual_samples:
+        for sample in manual_samples:
+            manual_sample_counts[sample['Category']] += 1
 
+        print("\nManual samples by category:")
+        for category in sorted(manual_sample_counts.keys()):
+            print(f"  {category}: {manual_sample_counts[category]} samples")
+
+    # Validate category sample counts and adjust targets if needed.
+    print("\nValidating sample counts per category...")
+    category_stats = validate_category_sample_counts(organized_data, manual_sample_counts)
+
+    for category in sorted(category_stats.keys()):
+        stats = category_stats[category]
+        total_available = stats['detections_available'] + stats['manual_count']
+        print(f"  {category}: {stats['detections_available']} detections + {stats['manual_count']} manual = {total_available} total")
+
+    print("\nSelecting training samples...")
+    samples = select_training_samples(organized_data, manual_confidences, category_stats)
+
+    # Select testing samples BEFORE merging manual samples.
     testing_samples = select_testing_samples(detections, samples, manual_confidences)
 
-    print(f"\nSelected {len(samples)} training samples")  # This count now includes manual samples
+    # Now merge manual samples into training set.
+    samples = merge_manual_samples(samples, manual_samples, manual_timestamps, args.duration)
+
+    print(f"\nSelected {len(samples)} training samples")
 
     # Print breakdown by category.
     category_counts = defaultdict(int)
@@ -1193,6 +1284,24 @@ def main():
     print("Testing samples by notes:")
     for notes in sorted(testing_notes_counts.keys()):
         print(f"  {notes}: {testing_notes_counts[notes]} samples")
+
+    # Check for categories with sample shortages and print warnings.
+    print("\nSample shortage summary:")
+    has_shortage = False
+    for category in sorted(category_stats.keys()):
+        stats = category_stats[category]
+        if stats['shortage'] > 0:
+            has_shortage = True
+            actual_training = category_counts.get(category, 0)
+            actual_testing = testing_category_counts.get(category, 0)
+            print(f"  {category}:")
+            print(f"    Available: {stats['available']} samples ({stats['detections_available']} detections + {stats['manual_count']} manual)")
+            print(f"    Required: {stats['required']} ({stats['required_training']} training + {stats['required_testing']} testing)")
+            print(f"    Shortage: {stats['shortage']} more samples needed")
+            print(f"    Actual: {actual_training} training + {actual_testing} testing = {actual_training + actual_testing} total")
+
+    if not has_shortage:
+        print("  No shortages detected. All categories have sufficient samples.")
 
     # Initialize model inference for tp_human_only timestamp correction.
     print("\nInitializing model inference for tp_human_only timestamp correction...")
