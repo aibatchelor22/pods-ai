@@ -18,6 +18,7 @@ from add_samples import (
     add_samples,
     format_timestamp_pst,
     get_segment_prediction,
+    main as add_samples_main,
     parse_node_and_timestamp_from_filename,
     parse_timestamp_pst,
     split_wav_into_segments,
@@ -440,6 +441,32 @@ class TestAddSamples:
             model_type="podsai", model_path=DEFAULT_MODEL_PATH
         )
 
+    def test_corrected_class_suppresses_matching_printed_rows(self, tmp_path, capsys):
+        """Printed output should omit rows whose predicted class matches corrected_class."""
+        fake_segments = self._fake_split(tmp_path)
+        mock_model = MagicMock()
+        mock_model.predict.side_effect = [
+            {"global_prediction_label": "vessel", "global_confidence": 0.75},
+            {"global_prediction_label": "resident", "global_confidence": 0.80},
+        ]
+
+        with patch("add_samples.split_wav_into_segments", return_value=fake_segments), \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
+            results = add_samples(
+                wav_file="fake.wav",
+                node_name="rpi_orcasound_lab",
+                base_timestamp="2025_01_15_12_30_00_PST",
+                output_dir=str(tmp_path),
+                model=mock_model,
+                corrected_class="vessel",
+            )
+
+        assert [row["Category"] for row in results] == ["vessel", "resident"]
+        captured = capsys.readouterr()
+        assert "vessel,rpi_orcasound_lab,2025_01_15_12_30_00_PST" not in captured.out
+        assert "resident,rpi_orcasound_lab,2025_01_15_12_30_02_PST" in captured.out
+
     def test_returns_empty_when_no_segments(self, tmp_path):
         """add_samples should return [] if split_wav_into_segments yields nothing."""
         with patch("add_samples.split_wav_into_segments", return_value=[]):
@@ -475,6 +502,32 @@ class TestAddSamples:
             )
 
         assert mock_get_model.call_count == 1
+        assert mock_model.predict.call_count == 2
+
+    def test_uses_preloaded_model_without_loading_again(self, tmp_path):
+        """A supplied model should be reused instead of calling get_model_inference."""
+        fake_segments = self._fake_split(tmp_path)
+        mock_model = MagicMock()
+        mock_model.predict.return_value = {
+            "global_prediction_label": "water",
+            "global_confidence": 0.80
+        }
+
+        with patch("add_samples.split_wav_into_segments", return_value=fake_segments), \
+             patch("add_samples.get_model_inference") as mock_get_model, \
+             patch("add_samples.lookup_detection_in_csv", return_value=None), \
+             patch("add_samples.generate_uri", return_value="https://example.com/test"):
+
+            add_samples(
+                wav_file="fake.wav",
+                node_name="rpi_orcasound_lab",
+                base_timestamp="2025_01_15_12_30_00_PST",
+                output_dir=str(tmp_path),
+                model_path="/path/to/model",
+                model=mock_model,
+            )
+
+        mock_get_model.assert_not_called()
         assert mock_model.predict.call_count == 2
 
     def test_always_uses_podsai_model_type(self, tmp_path):
@@ -557,3 +610,23 @@ class TestAddSamples:
         """add_samples should raise ValueError when the filename cannot be parsed and no args given."""
         with pytest.raises(ValueError, match="Cannot infer"):
             add_samples(wav_file="recording.wav")
+
+
+class TestMain:
+    """Tests for the add_samples CLI."""
+
+    def test_passes_corrected_class_argument(self, tmp_path, monkeypatch):
+        """The CLI should pass --class through to add_samples()."""
+        wav_path = tmp_path / "input.wav"
+        wav_path.write_bytes(b"wav")
+
+        with patch("add_samples.add_samples", return_value=[{"Category": "resident"}]) as mock_add_samples:
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                ["add_samples.py", str(wav_path), "--class", "vessel"],
+            )
+
+            assert add_samples_main() == 0
+
+        assert mock_add_samples.call_args.kwargs["corrected_class"] == "vessel"

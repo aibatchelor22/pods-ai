@@ -34,9 +34,10 @@ class OrcasiteDetection:
 class OrcaHelloDetection:
     id: str
     feed: OrcasiteFeed
-    timestamp: datetime
+    timestamp: Optional[datetime]
     status: str                  # e.g., "confirmed", "rejected", etc.
     confidence: Optional[float] = None  # Confidence score from model inference
+    comments: str = ""
 
 # Terms in a detection description that indicate the label cannot be determined with confidence.
 SKIP_TERMS = {'?', 'not sure', 'unsure', 'possibl', 'sounds like', 'sounded like', 'ould be'}
@@ -361,6 +362,7 @@ def get_orcahello_detections(feed: OrcasiteFeed) -> List[OrcaHelloDetection]:
             timestamp=ts,
             status=status,
             confidence=confidence,
+            comments=(item.get("comments") or "").strip(),
         )
 
         results.append(det)

@@ -157,6 +157,9 @@ Key dependencies:
   segment to a `new/` directory using the standard filename convention, and prints the
   predicted class for each segment. Useful for labelling new recordings and adding them
   to the training set. See [add_samples.py](#add_samplespy) below.
+- **process_false_positives.py**: Re-checks rejected OrcaHello resident detections by
+  downloading the 60-second WAV, re-running PODS-AI, and appending resident
+  sub-segments with corrected classes to `output/csv/manual_samples.csv`.
 - **run_inference.py**: Runs a model on a wav file and prints the global prediction,
   confidence, and per-class probabilities.
 - **compare_models.py**: Evaluates and compares fastai, orcahello, and podsai models
