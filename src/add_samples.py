@@ -36,7 +36,8 @@ corrected class are omitted from the printed output.
 URI/Description/Notes Lookup:
 - The script looks up the detection in detections.csv (default: output/csv/detections.csv)
   by matching NodeName and Timestamp, and uses the URI, Description, and Notes from that row
-- If not found in detections.csv, generates a URI from the timestamp (with empty Description and Notes="manual")
+- If not found in detections.csv, generates a URI from the timestamp and uses
+  fallback_description when provided (otherwise empty Description), with Notes="manual"
 
 If --node-name and --timestamp are omitted the script parses them from the
 input filename.  The filename must follow the convention used by the
@@ -465,6 +466,8 @@ def add_samples(
     detections_csv: str = DEFAULT_DETECTIONS_CSV,
     model: Optional[object] = None,
     corrected_class: Optional[str] = None,
+    fallback_description: Optional[str] = None,
+    fallback_notes: Optional[str] = None,
 ) -> list[dict]:
     """
     Split a 60-second audio sample into 3-second segments, save them, and run inference on each.
@@ -499,6 +502,10 @@ def add_samples(
             loading from model_path.
         corrected_class: Optional corrected class. When provided, rows whose
             predicted class already matches this class are not printed.
+        fallback_description: Optional description to use when the detection
+            is not found in detections.csv.
+        fallback_notes: Optional notes to use when the detection is not found
+            in detections.csv. Defaults to "manual" when not provided.
 
     Returns:
         List of dictionaries with keys matching manual_samples.csv format:
@@ -557,8 +564,9 @@ def add_samples(
         shared_description = detection_info.description
         shared_notes = detection_info.notes
     else:
-        shared_description = ""
-        shared_notes = "manual"
+        shared_description = (fallback_description or "").strip()
+        candidate_notes = (fallback_notes or "").strip()
+        shared_notes = candidate_notes if candidate_notes else "manual"
 
     # Split the WAV and save segments.
     segments = split_wav_into_segments(wav_file, node_name, base_timestamp, out_dir)
@@ -577,7 +585,10 @@ def add_samples(
 
     results: list[dict] = []
     print("\nSegments in manual_samples.csv format:")
-    print("Category,NodeName,Timestamp,URI,Description,Notes,Confidence")
+    csv_writer = csv.writer(sys.stdout, lineterminator="\n")
+    csv_writer.writerow(
+        ["Category", "NodeName", "Timestamp", "URI", "Description", "Notes", "Confidence"]
+    )
 
     for seg_path, timestamp_str in segments:
         label, confidence = get_segment_prediction(model, seg_path)
@@ -602,9 +613,16 @@ def add_samples(
 
         if corrected_class is None or label != corrected_class:
             # Print in CSV format (ready to copy-paste) unless already corrected.
-            print(
-                f"{label},{node_name},{timestamp_str},{segment_uri},"
-                f"{shared_description},{shared_notes},{row['Confidence']}"
+            csv_writer.writerow(
+                [
+                    label,
+                    node_name,
+                    timestamp_str,
+                    segment_uri,
+                    shared_description,
+                    shared_notes,
+                    row["Confidence"],
+                ]
             )
 
     return results
