@@ -63,19 +63,19 @@ def get_label(
     if any(term in desc for term in SKIP_TERMS):
         return None
 
-    # 1. Resident
+    # 1. Resident.
     if cat == "whale":
         if ("resident" in desc) or ("pod" in desc):
             return "resident"
         if orcahello_det and orcahello_det.status.lower() == "confirmed":
             return "resident"
 
-    # 2. Transient
+    # 2. Transient.
     if cat == "whale":
         if ("bigg" in desc) or ("transient" in desc):
             return "transient"
 
-    # 3. Humpback
+    # 3. Humpback.
     if cat == "whale":
         if "humpback" in desc:
             return "humpback"
@@ -83,7 +83,7 @@ def get_label(
     if orcahello_det and orcahello_det.status.lower() == "unreviewed":
         return None
 
-    # 4. Other
+    # 4. Other.
     if orcasite_det.source == "machine" and not ("click" in desc or "call" in desc or "whistle" in desc):
         if "human" in desc or "radio" in desc:
             return "human"
@@ -94,7 +94,7 @@ def get_label(
         if "water" in desc:
             return "water"
 
-    # Unknown
+    # Unknown.
     return None
 
 NEAR_MIN = timedelta(minutes=10)
@@ -191,12 +191,12 @@ def classify_detection(
             # There is a nearby machine whale detection → not human-only
             return Classification(kind="tp_both", include=True)
 
-    # True positive, machine-only (maybe include)
+    # True positive, machine-only (maybe include).
     if cat == "whale" and src == "machine":
         # You can gate this on some flag if 'maybe include' is optional.
         return Classification(kind="tp_machine_only", include=True)
 
-    # False positive, human-only and true negative are effectively already skipped
+    # False positive, human-only and true negative are effectively already skipped.
     return Classification(kind="skip", include=False)
 
 def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
@@ -212,16 +212,16 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
         List[OrcasiteDetection]: Detections associated with the specified feed (may be empty).
     """
 
-    # Base endpoint
+    # Base endpoint.
     base_url = "https://live.orcasound.net/api/json/detections"
 
-    # Fields we want (already URL-encoded in your example)
+    # Fields we want (already URL-encoded in your example).
     fields = (
         "id,playlist_timestamp,player_offset,timestamp,description,"
         "source,category,feed_id,idempotency_key"
     )
 
-    # Build query parameters
+    # Build query parameters.
     limit = 250
     offset = 0
     params = {
@@ -234,7 +234,7 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
     page_count = 0
 
     try:
-        # Loop through all pages until no more data is returned
+        # Loop through all pages until no more data is returned.
         while page_count < MAX_DETECTION_PAGES:
             params["page[offset]"] = offset
 
@@ -245,7 +245,7 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
 
             items = data.get("data", [])
 
-            # If no data is returned, we've fetched all pages
+            # If no data is returned, we've fetched all pages.
             if not items:
                 print(f"Finished after page {page_count}")
                 break
@@ -253,7 +253,7 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
             for item in items:
                 attrs = item.get("attributes", {})
 
-                # Parse timestamp safely
+                # Parse timestamp safely.
                 ts_raw = attrs.get("timestamp")
                 try:
                     ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
@@ -272,7 +272,7 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
 
                 dets.append(det)
 
-            # Increment offset for next page
+            # Increment offset for next page.
             offset += limit
             page_count += 1
 
@@ -310,7 +310,7 @@ def get_orcahello_detections(feed: OrcasiteFeed) -> List[OrcaHelloDetection]:
     cosmos_database = cosmos_client.get_database_client(COSMOS_DB)
     container = cosmos_database.get_container_client(COSMOS_CONTAINER)
 
-    # Cosmos DB SQL query
+    # Cosmos DB SQL query.
     query = """
         SELECT * FROM c
         WHERE CONTAINS(c.audioUri, @node_name)
@@ -321,7 +321,7 @@ def get_orcahello_detections(feed: OrcasiteFeed) -> List[OrcaHelloDetection]:
         {"name": "@node_name", "value": node_name}
     ]
 
-    # Cosmos DB returns an iterator that handles pagination internally
+    # Cosmos DB returns an iterator that handles pagination internally.
     items = container.query_items(
         query=query,
         parameters=params,
@@ -413,11 +413,11 @@ def generate_uri(node: str, dt: datetime) -> str:
     Returns:
         str: URI in the format "https://live.orcasound.net/bouts/new/{node}?time={utc_time}".
     """
-    # Ensure the datetime is in UTC
+    # Ensure the datetime is in UTC.
     utc_dt = dt.astimezone(UTC_TZ)
-    # Format as ISO 8601 with milliseconds and Z suffix
+    # Format as ISO 8601 with milliseconds and Z suffix.
     time_str = utc_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    # URL encode the time parameter
+    # URL encode the time parameter.
     time_encoded = quote(time_str, safe='')
     return f"https://live.orcasound.net/bouts/new/{node}?time={time_encoded}"
 
@@ -455,7 +455,7 @@ def process_all_feeds(
             print(f"No feed found with node_name '{feed_filter}'")
             return
 
-    # Collect all detections first before writing to CSV
+    # Collect all detections first before writing to CSV.
     all_rows = []
 
     for feed in feeds:
@@ -480,7 +480,7 @@ def process_all_feeds(
 
             label = get_label(det, orcahello_match)
             if label is None:
-                # label unknown ⇒ skip
+                # label unknown -> skip.
                 continue
 
             classification = classify_detection(det, label, orcasite_dets)
@@ -519,7 +519,7 @@ def process_all_feeds(
     seen = set()
     unique_rows = []
     for row in all_rows:
-        # Create a key from (category, node_name, timestamp, uri)
+        # Create a key from (category, node_name, timestamp, uri).
         key = (row[1], row[2], row[3], row[4])  # Category, NodeName, Timestamp, URI
         if key not in seen:
             seen.add(key)
@@ -535,10 +535,10 @@ def process_all_feeds(
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
         csv_writer = csv.writer(csvfile, lineterminator='\n')
-        # Write header
+        # Write header.
         csv_writer.writerow(['Category', 'NodeName', 'Timestamp', 'URI', 'Description', 'Notes', 'Confidence'])
 
-        # Write sorted unique rows (exclude the timestamp used for sorting)
+        # Write sorted unique rows (exclude the timestamp used for sorting).
         for row in unique_rows:
             csv_writer.writerow([row[1], row[2], row[3], row[4], row[5], row[6], row[7]])
 
