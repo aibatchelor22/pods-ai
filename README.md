@@ -398,7 +398,7 @@ python src/compare_models.py \
 
 Output:
 ```
-Loaded 72 test samples from output\csv\testing_samples.csv
+Loaded 160 test samples from output\csv\testing_samples.csv
 WAV directory: output/testing-wav
 Models to evaluate: fastai, orcahello, podsai
 
@@ -409,9 +409,9 @@ Model Comparison Summary
 ==========================================================================================
 Model           Evaluated   Correct  Accuracy     FP     FP%     FN     FN%   Avg Time
 ------------------------------------------------------------------------------------------
-fastai                 71        32     45.1%     30   42.3%      9   12.7%     11.00s
-orcahello              71        14     19.7%     49   69.0%      8   11.3%      4.24s
-podsai                 71        38     53.5%     20   28.2%     13   18.3%      4.58s
+fastai                160        68     42.5%     61   38.1%     31   19.4%     11.62s
+orcahello             160        42     26.2%     95   59.4%     23   14.4%      4.06s
+podsai                160        96     60.0%     18   11.2%     46   28.7%      4.21s
 ==========================================================================================
 
 Definitions:
@@ -422,48 +422,48 @@ Definitions:
 
 Confusion Matrix for fastai (rows=actual, cols=predicted):
                  other   resident
-      human          1          1
-   humpback          7          3
+      human          6          4
+   humpback         17         13
      jingle          8          2
-   resident          9         10
-  transient          2          8
+   resident         31         29
+  transient          4         26
      vessel          4          6
       water          0         10
 
 Confusion Matrix for orcahello (rows=actual, cols=predicted):
                  other   resident
-      human          0          2
-   humpback          3          7
+      human          0         10
+   humpback          5         25
      jingle          0         10
-   resident          8         11
-  transient          0         10
+   resident         23         37
+  transient          0         30
      vessel          0         10
       water          0         10
 
 Confusion Matrix for podsai (rows=actual, cols=predicted):
                  human   humpback     jingle   resident  transient     vessel      water
-      human          1          1          0          0          0          0          0
-   humpback          0          4          0          5          1          0          0
-     jingle          0          1          6          3          0          0          0
-   resident          0          8          0          6          0          0          5
-  transient          0          0          0          9          1          0          0
-     vessel          0          1          0          3          0          6          0
+      human          7          1          0          0          2          0          0
+   humpback          1         14          2         10          3          0          0
+     jingle          0          0         10          0          0          0          0
+   resident          8         10          0         14         10         10          8
+  transient          0         12          4          7          6          1          0
+     vessel          0          0          0          1          0          9          0
       water          0          0          0          0          0          0         10
 ```
 
-**Example — compare only fastai and orcahello**
+**Example - compare only fastai and orcahello**
 
 ```bash
 python src/compare_models.py --models fastai,orcahello --fastai-model-path model
 ```
 
-**Example — limit to 10 test samples**
+**Example - limit to 10 test samples**
 
 ```bash
 python src/compare_models.py --max-samples 10 --fastai-model-path model
 ```
 
-**Example — evaluate only resident samples**
+**Example - evaluate only resident samples**
 
 ```bash
 python src/compare_models.py --category resident --fastai-model-path model
