@@ -10,7 +10,7 @@ For each rejected OrcaHello detection in the selected timeframe, this script:
 3. Infers the corrected class from the OrcaHello comments.
 4. Runs add_samples.py on the WAV file.
 5. Appends whale-predicted segments that do not already match the corrected class
-   to manual_samples.csv with the corrected class, avoiding duplicates.
+   to new_manual_samples.csv with the corrected class, avoiding duplicates.
 """
 
 import argparse
@@ -31,7 +31,7 @@ from make_csv import (
 from model_inference import get_model_inference
 from orcasite_feeds import get_orcasite_feeds
 
-DEFAULT_MANUAL_SAMPLES_CSV = "output/csv/manual_samples.csv"
+DEFAULT_MANUAL_SAMPLES_CSV = "output/csv/new_manual_samples.csv"
 RESIDENT_TERMS = ("resident", "pod")
 TRANSIENT_TERMS = ("bigg", "transient")
 HUMAN_TERMS = ("human", "radio")
@@ -192,7 +192,7 @@ def main() -> int:
         description=(
             "Process rejected OrcaHello resident detections, re-run PODS-AI on the "
             "60-second WAV, and append mismatched whale-class sub-segments to "
-            "manual_samples.csv with a corrected class."
+            "new_manual_samples.csv with a corrected class."
         )
     )
     parser.add_argument(
@@ -220,7 +220,7 @@ def main() -> int:
     parser.add_argument(
         "--manual-samples-csv",
         default=DEFAULT_MANUAL_SAMPLES_CSV,
-        help="Path to manual_samples.csv.",
+        help="Path to new_manual_samples.csv.",
     )
     parser.add_argument(
         "--output-dir",

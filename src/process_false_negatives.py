@@ -11,7 +11,7 @@ For each confirmed OrcaHello detection in the selected timeframe, this script:
 4. Splits the WAV into segments and runs PODS-AI segment inference.
 5. Runs OrcaHello inference on each segment.
 6. Appends segments where OrcaHello predicts resident but PODS-AI does not to
-   manual_samples.csv with corrected class "resident", avoiding duplicates.
+   new_manual_samples.csv with corrected class "resident", avoiding duplicates.
 """
 
 import argparse
@@ -27,7 +27,7 @@ from make_csv import format_timestamp_pst, get_orcahello_detections, parse_pst_t
 from model_inference import get_model_inference
 from orcasite_feeds import get_orcasite_feeds
 
-DEFAULT_MANUAL_SAMPLES_CSV = "output/csv/manual_samples.csv"
+DEFAULT_MANUAL_SAMPLES_CSV = "output/csv/new_manual_samples.csv"
 DEFAULT_ORCAHELLO_MODEL_PATH = "orcasound/orcahello-srkw-detector-v1"
 WHALE_CLASSES = {"resident", "transient", "humpback"}
 
@@ -181,7 +181,7 @@ def main() -> int:
         description=(
             "Process confirmed OrcaHello detections, find 60-second false negatives "
             "where PODS-AI misses resident calls, and append corrected resident "
-            "sub-segments to manual_samples.csv."
+            "sub-segments to new_manual_samples.csv."
         )
     )
     parser.add_argument(
@@ -209,7 +209,7 @@ def main() -> int:
     parser.add_argument(
         "--manual-samples-csv",
         default=DEFAULT_MANUAL_SAMPLES_CSV,
-        help="Path to manual_samples.csv.",
+        help="Path to new_manual_samples.csv.",
     )
     parser.add_argument(
         "--output-dir",
