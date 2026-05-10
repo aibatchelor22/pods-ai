@@ -409,9 +409,9 @@ Model Comparison Summary
 ==========================================================================================
 Model           Evaluated   Correct  Accuracy     FP     FP%     FN     FN%   Avg Time
 ------------------------------------------------------------------------------------------
-fastai                160        68     42.5%     61   38.1%     31   19.4%     11.62s
-orcahello             160        42     26.2%     95   59.4%     23   14.4%      4.06s
-podsai                160        96     60.0%     18   11.2%     46   28.7%      4.21s
+fastai                160        68     42.5%     61   38.1%     31   19.4%     12.00s
+orcahello             160        42     26.2%     95   59.4%     23   14.4%      5.06s
+podsai                160       104     65.0%     16   10.0%     40   25.0%      4.64s
 ==========================================================================================
 
 Definitions:
@@ -442,11 +442,11 @@ Confusion Matrix for orcahello (rows=actual, cols=predicted):
 
 Confusion Matrix for podsai (rows=actual, cols=predicted):
                  human   humpback     jingle   resident  transient     vessel      water
-      human          7          1          0          0          2          0          0
-   humpback          1         14          2         10          3          0          0
+      human          9          0          0          0          1          0          0
+   humpback          1          8         11          6          4          0          0
      jingle          0          0         10          0          0          0          0
-   resident          8         10          0         14         10         10          8
-  transient          0         12          4          7          6          1          0
+   resident          2          5          3         20         13          2         15
+  transient          0          4          2          9         14          0          1
      vessel          0          0          0          1          0          9          0
       water          0          0          0          0          0          0         10
 ```
