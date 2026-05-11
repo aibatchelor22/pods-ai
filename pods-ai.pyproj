@@ -39,6 +39,7 @@ MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-2
     <Compile Include="src\download_wavs.py" />
     <Compile Include="src\extract_training_samples.py" />
     <Compile Include="src\get_best_timestamp.py" />
+    <Compile Include="src\LiveInferenceOrchestrator.py" />
     <Compile Include="src\make_csv.py" />
     <Compile Include="src\make_spectrograms.py" />
     <Compile Include="src\manual_samples_utils.py" />
