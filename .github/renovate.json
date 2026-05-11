@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "dependencyDashboard": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^tests/test_run_inference\\.py$"
+      ],
+      "matchStrings": [
+        "PODSAI_TEST_MODEL_REVISION = \"(?<currentValue>[a-f0-9]{7,64})\""
+      ],
+      "depNameTemplate": "https://huggingface.co/davethaler/whale-call-detector",
+      "datasourceTemplate": "git-refs",
+      "versioningTemplate": "git"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Track pinned PODS-AI test model updates in the dependency dashboard issue.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "https://huggingface.co/davethaler/whale-call-detector"
+      ],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

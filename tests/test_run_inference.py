@@ -23,6 +23,11 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+# Pinned PODS-AI model revision for integration-test stability.
+PODSAI_TEST_MODEL_ID = "davethaler/whale-call-detector"
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+PODSAI_TEST_MODEL_REVISION = "adb2da7fd0e67b9075b699648f578ff880f45c2c"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -100,7 +105,7 @@ def _make_podsai_model_mock(num_local: int = 10) -> MagicMock:
 
 
 def _make_orcahello_model_mock(global_prediction: int = 1, global_confidence: float = 0.75,
-                               num_local: int = 5) -> MagicMock:
+                                num_local: int = 5) -> MagicMock:
     """Return a mock OrcaHello model whose predict() returns a binary result."""
     mock_model = MagicMock()
     local_confidences = [0.8] * num_local
@@ -114,6 +119,35 @@ def _make_orcahello_model_mock(global_prediction: int = 1, global_confidence: fl
         "segment_duration": 2.0,
     }
     return mock_model
+
+
+def _resolve_podsai_test_model_path() -> str:
+    """Return local PODS-AI model path or a pinned Hub snapshot for integration tests."""
+    local_path = Path("model/multiclass")
+    if local_path.exists():
+        return str(local_path)
+
+    try:
+        from huggingface_hub import file_exists as hf_file_exists
+        from huggingface_hub import snapshot_download as hf_snapshot_download
+        if not hf_file_exists(
+            PODSAI_TEST_MODEL_ID,
+            "preprocessor_config.json",
+            revision=PODSAI_TEST_MODEL_REVISION,
+        ):
+            pytest.skip(
+                f"Hub model '{PODSAI_TEST_MODEL_ID}' revision "
+                f"'{PODSAI_TEST_MODEL_REVISION}' is missing preprocessor_config.json."
+            )
+        return hf_snapshot_download(
+            repo_id=PODSAI_TEST_MODEL_ID,
+            revision=PODSAI_TEST_MODEL_REVISION,
+        )
+    except Exception:
+        pytest.skip(
+            f"HuggingFace Hub is not reachable; cannot load model "
+            f"'{PODSAI_TEST_MODEL_ID}' revision '{PODSAI_TEST_MODEL_REVISION}'"
+        )
 
 
 
@@ -606,6 +640,37 @@ class TestMainCLI:
         assert "0.7000" in captured.out
 
 
+class TestPinnedPodsAIModelPath:
+    """Tests for pinned PODS-AI model resolution used by integration tests."""
+
+    def test_prefers_local_multiclass_directory(self, tmp_path, monkeypatch):
+        """When model/multiclass exists locally, no Hub download is needed."""
+        monkeypatch.chdir(tmp_path)
+        local_dir = Path("model/multiclass")
+        local_dir.mkdir(parents=True)
+
+        assert _resolve_podsai_test_model_path() == str(local_dir)
+
+    def test_downloads_pinned_hub_revision(self, tmp_path, monkeypatch):
+        """When local model is absent, a pinned Hub revision is downloaded."""
+        monkeypatch.chdir(tmp_path)
+        with (
+            patch("huggingface_hub.file_exists", return_value=True) as mock_file_exists,
+            patch("huggingface_hub.snapshot_download", return_value="/tmp/pinned-model") as mock_snapshot,
+        ):
+            assert _resolve_podsai_test_model_path() == "/tmp/pinned-model"
+
+        mock_file_exists.assert_called_once_with(
+            PODSAI_TEST_MODEL_ID,
+            "preprocessor_config.json",
+            revision=PODSAI_TEST_MODEL_REVISION,
+        )
+        mock_snapshot.assert_called_once_with(
+            repo_id=PODSAI_TEST_MODEL_ID,
+            revision=PODSAI_TEST_MODEL_REVISION,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Integration tests with real models (if available)
 # ---------------------------------------------------------------------------
@@ -636,29 +701,8 @@ class TestIntegrationWithRealModels:
 
     @pytest.fixture
     def podsai_model_path(self) -> str:
-        """Path to the PODS-AI multiclass model directory, or Hub model ID as fallback."""
-        local_path = Path("model/multiclass")
-        if local_path.exists():
-            return str(local_path)
-        # Fall back to HuggingFace Hub model ID.  Use a lightweight HEAD request via
-        # huggingface_hub.file_exists() to verify that preprocessor_config.json is
-        # present before returning the Hub ID.  If it is absent (e.g. because the model
-        # was published without running feature_extractor.push_to_hub()), the test is
-        # skipped with a clear message rather than failing with a RuntimeError inside
-        # PodsAIInference.__init__().  Re-run the Train Model workflow (which now
-        # calls feature_extractor.push_to_hub()) to upload the missing file and allow
-        # these tests to run in CI.
-        hub_id = "davethaler/whale-call-detector"
-        try:
-            from huggingface_hub import file_exists as hf_file_exists
-            if not hf_file_exists(hub_id, "preprocessor_config.json"):
-                pytest.skip(
-                    f"Hub model '{hub_id}' is missing preprocessor_config.json. "
-                    f"Re-run the Train Model workflow to push the feature extractor to Hub."
-                )
-        except Exception:
-            pytest.skip(f"HuggingFace Hub is not reachable; cannot load model '{hub_id}'")
-        return hub_id
+        """Path to local PODS-AI model or a pinned Hub snapshot fallback."""
+        return _resolve_podsai_test_model_path()
 
     # Fixtures for test wav files (one per audio type).
     def _get_testing_wav_path(self, category: str) -> str:
@@ -896,4 +940,3 @@ class TestIntegrationWithRealModels:
         _verify_fastai_result_structure(result)
         _verify_fastai_prediction(result, label)
         _print_fastai_result(result, f"orcahello-{label}")
-
