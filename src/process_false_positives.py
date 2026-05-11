@@ -29,7 +29,7 @@ from make_csv import (
     parse_pst_timestamp,
 )
 from model_inference import get_model_inference
-from orcasite_feeds import get_orcasite_feeds
+from orcasite_feeds import get_orcasite_feeds_with_retry
 
 DEFAULT_MANUAL_SAMPLES_CSV = "output/csv/new_manual_samples.csv"
 RESIDENT_TERMS = ("resident", "pod")
@@ -73,24 +73,6 @@ def process_false_positives(
     end_time: Optional[datetime] = None,
 ) -> dict[str, int]:
     """Process rejected OrcaHello resident detections in the selected timeframe."""
-    feeds = get_orcasite_feeds()
-    if feed_filter:
-        feeds = [feed for feed in feeds if feed.node_name == feed_filter]
-        if not feeds:
-            print(f"No feed found with node_name '{feed_filter}'")
-            return {
-                "rejected": 0,
-                "download_failed": 0,
-                "not_false_positive": 0,
-                "processing_failed": 0,
-                "unknown_class": 0,
-                "whale_mismatch_segments": 0,
-                "appended": 0,
-                "duplicates": 0,
-            }
-
-    existing_uris = load_existing_uris(manual_samples_path)
-
     summary = {
         "rejected": 0,
         "download_failed": 0,
@@ -101,6 +83,17 @@ def process_false_positives(
         "appended": 0,
         "duplicates": 0,
     }
+    feeds = get_orcasite_feeds_with_retry()
+    if not feeds:
+        print("No Orcasite feeds available; nothing to process.")
+        return summary
+    if feed_filter:
+        feeds = [feed for feed in feeds if feed.node_name == feed_filter]
+        if not feeds:
+            print(f"No feed found with node_name '{feed_filter}'")
+            return summary
+
+    existing_uris = load_existing_uris(manual_samples_path)
     print(f"Loading podsai model from {model_path}...")
     model = get_model_inference(model_type="podsai", model_path=model_path)
 

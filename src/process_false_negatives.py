@@ -25,7 +25,7 @@ from extract_training_samples import download_60s_audio
 from manual_samples_utils import append_manual_samples, load_existing_uris
 from make_csv import format_timestamp_pst, get_orcahello_detections, parse_pst_timestamp
 from model_inference import get_model_inference
-from orcasite_feeds import get_orcasite_feeds
+from orcasite_feeds import get_orcasite_feeds_with_retry
 
 DEFAULT_MANUAL_SAMPLES_CSV = "output/csv/new_manual_samples.csv"
 DEFAULT_ORCAHELLO_MODEL_PATH = "orcasound/orcahello-srkw-detector-v1"
@@ -49,7 +49,6 @@ def process_false_negatives(
     end_time: Optional[datetime] = None,
 ) -> dict[str, int]:
     """Process confirmed OrcaHello SRKW detections in the selected timeframe."""
-    feeds = get_orcasite_feeds()
     summary = {
         "confirmed": 0,
         "download_failed": 0,
@@ -60,6 +59,10 @@ def process_false_negatives(
         "appended": 0,
         "duplicates": 0,
     }
+    feeds = get_orcasite_feeds_with_retry()
+    if not feeds:
+        print("No Orcasite feeds available; nothing to process.")
+        return summary
 
     if feed_filter:
         feeds = [feed for feed in feeds if feed.node_name == feed_filter]

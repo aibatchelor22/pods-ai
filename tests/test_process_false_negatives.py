@@ -85,6 +85,24 @@ class TestAppendManualSamples:
 class TestProcessFalseNegatives:
     """Integration-style tests for process_false_negatives."""
 
+    def test_uses_retrying_feed_fetcher(self, tmp_path):
+        """Processing should use the shared retrying feed-fetch helper."""
+        feed = _make_feed()
+        with patch(
+            "process_false_negatives.get_orcasite_feeds_with_retry",
+            return_value=[feed],
+        ) as mock_get_feeds, patch(
+            "process_false_negatives.get_model_inference",
+            return_value=Mock(),
+        ), patch("process_false_negatives.get_orcahello_detections", return_value=[]):
+            summary = process_false_negatives(
+                manual_samples_path=tmp_path / "manual_samples.csv",
+                output_dir=tmp_path / "segments",
+            )
+
+        assert summary["confirmed"] == 0
+        mock_get_feeds.assert_called_once_with()
+
     def test_appends_orcahello_resident_segments_missed_by_podsai(self, tmp_path):
         """Segments predicted resident by OrcaHello and non-resident by PODS-AI are appended."""
         feed = _make_feed()
@@ -158,7 +176,7 @@ class TestProcessFalseNegatives:
             return podsai_model if kwargs.get("model_type") == "podsai" else orcahello_model
 
         with patch("process_false_negatives.get_model_inference", side_effect=_get_model), \
-             patch("process_false_negatives.get_orcasite_feeds", return_value=[feed]), \
+             patch("process_false_negatives.get_orcasite_feeds_with_retry", return_value=[feed]), \
              patch("process_false_negatives.get_orcahello_detections", return_value=[detection]), \
              patch("process_false_negatives.download_60s_audio", return_value=str(wav_path)), \
              patch("process_false_negatives.add_samples", return_value=segment_rows) as mock_add_samples:
@@ -212,7 +230,7 @@ class TestProcessFalseNegatives:
             return podsai_model if kwargs.get("model_type") == "podsai" else orcahello_model
 
         with patch("process_false_negatives.get_model_inference", side_effect=_get_model), \
-             patch("process_false_negatives.get_orcasite_feeds", return_value=[feed]), \
+             patch("process_false_negatives.get_orcasite_feeds_with_retry", return_value=[feed]), \
              patch("process_false_negatives.get_orcahello_detections", return_value=[detection]), \
              patch("process_false_negatives.download_60s_audio", return_value=str(wav_path)), \
              patch("process_false_negatives.add_samples") as mock_add_samples:

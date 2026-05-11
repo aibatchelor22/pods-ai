@@ -20,7 +20,7 @@ from make_csv import (
     parse_pst_timestamp,
     process_all_feeds,
 )
-from orcasite_feeds import OrcasiteFeed
+from orcasite_feeds import OrcasiteFeed, get_orcasite_feeds_with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +271,46 @@ class TestGetOrcasiteFeedsFailFast:
         with patch("orcasite_feeds.requests.get", return_value=mock_response):
             with pytest.raises(requests.exceptions.HTTPError):
                 get_orcasite_feeds()
+
+
+class TestGetOrcasiteFeedsWithRetry:
+    """get_orcasite_feeds_with_retry() should retry on ReadTimeout."""
+
+    def test_retries_after_read_timeout(self):
+        """A read timeout should trigger a retry and eventually return feeds."""
+        expected_feeds = [
+            OrcasiteFeed(
+                id="feed_1",
+                name="Test Feed",
+                node_name="rpi_test",
+                slug="test",
+                bucket="audio-orcasound-net",
+                bucket_region="us-west-2",
+                visible=True,
+                location=(47.0, -122.0),
+            )
+        ]
+        with patch(
+            "orcasite_feeds.get_orcasite_feeds",
+            side_effect=[requests.exceptions.ReadTimeout("timed out"), expected_feeds],
+        ) as mock_get_feeds, patch("orcasite_feeds.time.sleep") as mock_sleep:
+            feeds = get_orcasite_feeds_with_retry(max_attempts=2, retry_delay_seconds=1)
+
+        assert feeds == expected_feeds
+        assert mock_get_feeds.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    def test_returns_empty_list_after_retry_exhausted(self):
+        """Repeated read timeouts should return an empty list instead of raising."""
+        with patch(
+            "orcasite_feeds.get_orcasite_feeds",
+            side_effect=requests.exceptions.ReadTimeout("timed out"),
+        ) as mock_get_feeds, patch("orcasite_feeds.time.sleep") as mock_sleep:
+            feeds = get_orcasite_feeds_with_retry(max_attempts=2, retry_delay_seconds=1)
+
+        assert feeds == []
+        assert mock_get_feeds.call_count == 2
+        mock_sleep.assert_called_once_with(1)
 
 
 class TestGetOrcahelloDetections:
