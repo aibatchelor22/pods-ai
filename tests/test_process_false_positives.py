@@ -400,3 +400,63 @@ class TestProcessFalsePositives:
         assert len(rows) == 1
         assert rows[0]["Category"] == "vessel"
         assert rows[0]["URI"] == "https://example.com/new"
+
+    def test_filters_by_actual_category_before_model_inference(self, tmp_path):
+        """A category filter should skip non-matching detections before inference."""
+        feed = _make_feed()
+        matching_detection = OrcaHelloDetection(
+            id="det_1",
+            feed=feed,
+            timestamp=datetime(2025, 1, 1, 12, 5, 0, tzinfo=timezone.utc),
+            status="rejected",
+            comments="Boat noise from a nearby vessel.",
+        )
+        non_matching_detection = OrcaHelloDetection(
+            id="det_2",
+            feed=feed,
+            timestamp=datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            status="rejected",
+            comments="Likely transient calls from Bigg's whales.",
+        )
+        wav_path = tmp_path / "input.wav"
+        wav_path.write_bytes(b"wav")
+        manual_samples_path = tmp_path / "manual_samples.csv"
+
+        with patch("process_false_positives.get_model_inference") as mock_get_model, \
+             patch("process_false_positives.get_orcasite_feeds_with_retry", return_value=[feed]), \
+             patch(
+                 "process_false_positives.get_orcahello_detections",
+                 return_value=[matching_detection, non_matching_detection],
+             ), \
+             patch("process_false_positives.download_60s_audio", return_value=str(wav_path)), \
+             patch(
+                 "process_false_positives.add_samples",
+                 return_value=[
+                     {
+                         "Category": "resident",
+                         "NodeName": "rpi_test",
+                         "Timestamp": "2025_01_01_04_05_02_PST",
+                         "URI": "https://example.com/new",
+                         "Description": "desc",
+                         "Notes": "manual",
+                         "Confidence": "91.0",
+                     },
+                 ],
+             ) as mock_add_samples:
+            mock_model = mock_get_model.return_value
+            mock_model.predict.return_value = {
+                "global_prediction_label": "resident",
+                "global_confidence": 0.91,
+            }
+            summary = process_false_positives(
+                manual_samples_path=manual_samples_path,
+                output_dir=tmp_path / "segments",
+                actual_category_filter="VESSEL",
+            )
+
+        assert summary["rejected"] == 2
+        assert summary["whale_mismatch_segments"] == 1
+        assert summary["appended"] == 1
+        assert mock_model.predict.call_count == 1
+        assert mock_add_samples.call_count == 1
+        assert mock_add_samples.call_args.kwargs["corrected_class"] == "vessel"

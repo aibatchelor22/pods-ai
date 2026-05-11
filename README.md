@@ -160,6 +160,8 @@ Key dependencies:
 - **process_false_positives.py**: Re-checks rejected OrcaHello resident detections by
   downloading the 60-second WAV, re-running PODS-AI, and appending resident
   sub-segments with corrected classes to `output/csv/manual_samples.csv`.
+  Supports `--category CATEGORY` to process only detections whose inferred
+  actual category matches the provided value.
 - **process_false_negatives.py**: Re-checks confirmed OrcaHello detections by
   downloading the 60-second WAV, re-running PODS-AI and OrcaHello segment inference,
   and appending segments where OrcaHello predicts resident but PODS-AI does not to

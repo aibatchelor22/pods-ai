@@ -69,6 +69,7 @@ def process_false_positives(
     model_path: str = DEFAULT_MODEL_PATH,
     detections_csv: str = DEFAULT_DETECTIONS_CSV,
     feed_filter: Optional[str] = None,
+    actual_category_filter: Optional[str] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
 ) -> dict[str, int]:
@@ -83,6 +84,9 @@ def process_false_positives(
         "appended": 0,
         "duplicates": 0,
     }
+    normalized_category_filter = (
+        actual_category_filter.strip().lower() if actual_category_filter else None
+    )
     feeds = get_orcasite_feeds_with_retry()
     if not feeds:
         print("No Orcasite feeds available; nothing to process.")
@@ -110,8 +114,16 @@ def process_false_positives(
             if end_time is not None and detection.timestamp > end_time:
                 continue
 
-            summary["rejected"] += 1
             timestamp_str = format_timestamp_pst(detection.timestamp)
+            summary["rejected"] += 1
+            corrected_class = get_corrected_class(detection.comments)
+            if corrected_class is None:
+                print(f"Skipping {feed.node_name} {timestamp_str}: could not determine corrected class from comments.")
+                summary["unknown_class"] += 1
+                continue
+            if normalized_category_filter and corrected_class != normalized_category_filter:
+                continue
+
             print(f"Checking rejected OrcaHello detection at {timestamp_str}")
 
             with TemporaryDirectory() as temp_dir:
@@ -129,12 +141,6 @@ def process_false_positives(
                             "PODS-AI global prediction is not resident."
                         )
                         summary["not_false_positive"] += 1
-
-                    corrected_class = get_corrected_class(detection.comments)
-                    if corrected_class is None:
-                        print(f"Skipping {feed.node_name} {timestamp_str}: could not determine corrected class from comments.")
-                        summary["unknown_class"] += 1
-                        continue
 
                     print(
                         f"Running add_samples.py for {feed.node_name} {timestamp_str} "
@@ -230,6 +236,13 @@ def main() -> int:
         default=DEFAULT_DETECTIONS_CSV,
         help="Path to detections.csv for add_samples.py metadata lookups.",
     )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        metavar="CATEGORY",
+        help="Process only detections whose inferred actual category matches this value.",
+    )
     args = parser.parse_args()
 
     start_time = parse_pst_timestamp(args.start) if args.start else None
@@ -241,6 +254,7 @@ def main() -> int:
         model_path=args.model_path,
         detections_csv=args.detections_csv,
         feed_filter=args.feed,
+        actual_category_filter=args.category,
         start_time=start_time,
         end_time=end_time,
     )
