@@ -61,6 +61,7 @@ MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-2
     <Compile Include="tests\test_make_csv.py" />
     <Compile Include="tests\test_podsai_inference.py" />
     <Compile Include="tests\test_run_inference.py" />
+    <Compile Include="tests\test_train_podsai_model.py" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="tests\" />

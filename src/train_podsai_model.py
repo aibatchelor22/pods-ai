@@ -59,6 +59,9 @@ PRECISION_METRIC = evaluate.load("precision")
 RECALL_METRIC = evaluate.load("recall")
 F1_METRIC = evaluate.load("f1")
 
+# Whale classes for optimization in multi-class mode.
+WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
+
 
 def setup_label_mappings(num_classes: int) -> None:
     """
@@ -278,12 +281,26 @@ def compute_metrics(eval_pred: EvalPrediction) -> dict:
 
     print("="*60 + "\n")
 
+    # Optimize model selection for whale classes by using macro F1 over
+    # humpback, resident, and transient when those labels are present.
+    whale_class_ids = sorted(class_id for class_id, class_name in ID2LABEL.items() if class_name in WHALE_CLASS_NAMES)
+    if whale_class_ids:
+        f1_whale = F1_METRIC.compute(
+            predictions=predictions,
+            references=labels,
+            average="macro",
+            labels=whale_class_ids,
+        )
+        f1_for_training = f1_whale["f1"]
+    else:
+        f1_for_training = f1["f1"]
+
     # Return metrics for training logs.
     metrics = {
         "accuracy": accuracy["accuracy"],
         "precision": precision["precision"],
         "recall": recall["recall"],
-        "f1": f1["f1"],
+        "f1": f1_for_training,
     }
 
     # Add per-class F1 to tracking.
