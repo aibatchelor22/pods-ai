@@ -10,18 +10,41 @@ PODS-AI (Programmatic Orca Detection System using Artificial Intelligence) is a 
 pods-ai/
 ├── .github/
 │   ├── copilot-instructions.md   # This file
-│   ├── dependabot.yml
+│   ├── dependabot.yml            # Dependabot updates for GitHub Actions
+│   ├── renovate.json             # Renovate configuration
 │   └── workflows/
 │       ├── check_csv.yml         # CI: regenerates and validates detections.csv
 │       └── validate-yaml.yml     # CI: yamllint on all YAML files
+├── external/                     # Git submodules such as OrcaHello
+├── output/                       # Generated CSV, WAV, PNG, and model artifacts
+├── tests/                        # Pytest test suite
+├── LICENSE
+├── README.md                     # User and contributor documentation
+├── patch_fastai_audio.bat        # Windows helper for fastai_audio compatibility
+├── patch_fastai_audio.sh         # Shell helper for fastai_audio compatibility
+├── pods-ai.pyproj                # Visual Studio Python project metadata
+├── pods-ai.sln                   # Visual Studio solution
 ├── requirements.txt
-├── output/                          # Generated output (detections.csv, wav files, spectrograms)
 └── src/
-    ├── make_csv.py                  # Step 1: query APIs → detections.csv
-    ├── extract_training_samples.py  # Step 2: detections.csv → training_samples.csv
-    ├── download_wavs.py             # Step 3: download wav files
-    ├── make_spectrograms.py         # Step 4: wav → PNG spectrograms
-    └── spectrogram_visualizer.py    # Helper: visualize spectrograms
+    ├── add_samples.py              # Segment and label new samples
+    ├── audio_utils.py              # Shared audio helpers
+    ├── compare_models.py           # Compare model performance on testing data
+    ├── download_wavs.py            # Step 4: download wav files
+    ├── extract_training_samples.py # Step 3: detections.csv → training/testing samples
+    ├── get_best_timestamp.py       # Timestamp correction helper
+    ├── make_csv.py                 # Step 1: query APIs → detections.csv
+    ├── make_spectrograms.py        # Step 5: wav → PNG spectrograms
+    ├── manual_samples_utils.py     # Shared manual-sample CSV helpers
+    ├── model_inference.py          # Common inference interface
+    ├── orcahello_inference.py      # OrcaHello inference adapter
+    ├── orcasite_feeds.py           # Orcasite feed helpers
+    ├── podsai_inference.py         # PODS-AI inference adapter
+    ├── process_false_negatives.py  # Helper to review false negatives
+    ├── process_false_positives.py  # Helper to review false positives
+    ├── process_humpback_wavs.py    # Step 2: process humpback source files
+    ├── run_inference.py            # Run model inference on a WAV file
+    ├── spectrogram_visualizer.py   # Spectrogram helper
+    └── train_podsai_model.py       # Train a PODS-AI model
 ```
 
 ## Data Sources
@@ -52,6 +75,9 @@ pods-ai/
 - **Error handling**: Catch exceptions at I/O boundaries (network, file), print a descriptive error message, and return an empty list or `None` as appropriate—do not let exceptions propagate silently.
 - **Constants**: Define module-level constants for magic values (e.g., `NEAR_MIN`, `MAX_DETECTION_PAGES`).
 - **Comments**: Comments should end in punctuation (typically a period).
+- **Project metadata**: Keep `pods-ai.pyproj` updated so every `.py` file in the repository is listed there.
+- **Documentation**: Update `README.md` when behavior or usage changes, especially when adding a new script.
+- **Copilot instructions**: Update `.github/copilot-instructions.md` when repository structure, workflows, or contributor guidance changes.
 
 ## pods-ai Pipeline
 
@@ -71,6 +97,7 @@ Classification kinds: `tp_human_only`, `tp_machine_only`, `fp_machine_only`, `tp
 - **check_csv.yml** – Runs on every PR; re-executes `make_csv.py` and `extract_training_samples.py` and asserts no diff in the committed CSV files (requires `COSMOS_KEY` secret).
 - **validate-yaml.yml** – Runs `yamllint` against all YAML files using the rules in `.yamllint.yml` (line-length disabled, truthy check-keys disabled).
 - **dependabot.yml** – Weekly updates for GitHub Actions dependencies.
+- **renovate.json** – Tracks additional dependency updates, including the pinned PODS-AI test model revision.
 
 ## Dependencies
 
