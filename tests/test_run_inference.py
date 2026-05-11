@@ -735,12 +735,10 @@ class TestIntegrationWithRealModels:
 
     # Parametrized tests for FastAI model on different audio types.
     @pytest.mark.parametrize("wav_fixture,label,xfail_reason", [
-        ("resident_wav_path", "resident",
-         "FastAI binary model may predict other on resident clips"),
+        ("resident_wav_path", "resident", None),
         ("transient_wav_path", "transient",
          "FastAI binary model may predict resident on transient clips"),
-        ("humpback_wav_path", "humpback",
-         "FastAI binary model may predict resident on humpback clips"),
+        ("humpback_wav_path", "humpback", None),
         ("vessel_wav_path", "vessel", None),
         ("water_wav_path", "water",
          "FastAI binary model may predict resident on ambient water clips"),
@@ -773,17 +771,14 @@ class TestIntegrationWithRealModels:
 
     # Parametrized tests for PODS-AI model on different audio types.
     @pytest.mark.parametrize("wav_fixture,label,xfail_reason", [
-        ("resident_wav_path", "resident",
-         "PODS-AI model may misclassify resident orca as another whale class"),
-        ("transient_wav_path", "transient",
-         "PODS-AI model may misclassify transient orca as another whale class"),
-        ("humpback_wav_path", "humpback", None),
-        ("vessel_wav_path", "vessel",
-         "PODS-AI model may misclassify vessel as another non-whale class"),
+        ("resident_wav_path", "resident", None),
+        ("transient_wav_path", "transient", None),
+        ("humpback_wav_path", "humpback",
+         "PODS-AI model may misclassify humpback as another whale class"),
+        ("vessel_wav_path", "vessel", None),
         ("water_wav_path", "water", None),
         ("human_wav_path", "human", None),
-        ("jingle_wav_path", "jingle",
-         "PODS-AI model may misclassify jingle as another class"),
+        ("jingle_wav_path", "jingle", None),
     ])
     def test_podsai_model_inference(
         self,
