@@ -26,6 +26,42 @@ The `src` directory has the following scripts for different steps meant to be ru
 5. **make_spectrograms.py**: Create a png file for each wav file in a subdirectory of `output/png`
 6. **train_podsai_model.py**: A script to train a PODS-AI model on the generated training samples.
 
+```mermaid
+flowchart TD;
+    orcaHello[(OrcaHello CosmosDB)];
+    huggingFace[(HuggingFace davethaler/whale-call-detetor)];
+    manualSamples@{ shape: doc, label: "manual_samples.csv" };
+    detections@{ shape: doc, label: "detections.csv" };
+    trainingSamples@{ shape: doc, label: "training_samples.csv" };
+    testingSamples@{ shape: doc, label: "testing_samples.csv" };
+    signalsHumpback@{ shape: doc, label: "signals-humpback" };
+    humpbackSignals@{ shape: docs, label: "wav/signals-humpback_*" };
+    manualTimestamps@{ shape: doc, label: "manual_timestamps.csv" };
+    wav@{ shape: docs, label: "wav/*" };
+    testingWav@{ shape: docs, label: "testing-wav/*" };
+
+    processHumpbackWavs@{ shape: rect, label: "processHumpbackWavs.py" };
+    makeCsv@{ shape: rect, label: "make_csv.py" };
+    extractTrainingSamples@{ shape: rect, label: "extract_training_samples.py" };
+    downloadWavs@{ shape: rect, label: "download_wavs.py" };
+    trainPodsaiModel@{ shape: rect, label: "train_podsai_model.py" };
+
+    orcaHello-->makeCsv-->detections;
+
+    signalsHumpback-->processHumpbackWavs-->humpbackSignals;
+
+    detections-->extractTrainingSamples-->trainingSamples;
+    humpbackSignals-->extractTrainingSamples;
+    manualTimestamps-->extractTrainingSamples;
+    manualSamples-->extractTrainingSamples;
+    extractTrainingSamples-->testingSamples;
+
+    trainingSamples-->downloadWavs-->wav;
+    testingSamples-->downloadWavs-->testingWav;
+
+    wav-->trainPodsaiModel-->huggingFace;
+```
+
 ## Model-Based Timestamp Correction for tp_human_only
 
 The `extract_training_samples.py` script now implements intelligent timestamp correction for `tp_human_only` detections:
