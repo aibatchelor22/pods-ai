@@ -31,7 +31,8 @@ The `src` directory has the following scripts for different steps meant to be ru
 ```mermaid
 flowchart TD;
     orcaHello[(OrcaHello CosmosDB)];
-    huggingFace[(HuggingFace davethaler/whale-call-detetor)];
+    podsaiModel[(HuggingFace davethaler/whale-call-detector)];
+    orcaHelloModel[(HuggingFace orcasound/orcahello-srkw-detector-v1)];
     manualSamples@{ shape: doc, label: "manual_samples.csv" };
     detections@{ shape: doc, label: "detections.csv" };
     initialTrainingSamples@{ shape: doc, label: "initial_training_samples.csv" };
@@ -49,6 +50,7 @@ flowchart TD;
     mergeTrainingSamples@{ shape: rect, label: "merge_training_samples.py" };
     downloadWavs@{ shape: rect, label: "download_wavs.py" };
     trainPodsaiModel@{ shape: rect, label: "train_podsai_model.py" };
+    compareModels@{ shape: rect, label: "compare_models.py" };
 
     orcaHello-->makeCsv-->detections;
 
@@ -65,7 +67,12 @@ flowchart TD;
     trainingSamples-->downloadWavs-->wav;
     testingSamples-->downloadWavs-->testingWav;
 
-    wav-->trainPodsaiModel-->huggingFace;
+    wav-->trainPodsaiModel-->podsaiModel;
+
+    podsaiModel-->compareModels;
+    testingSamples-->compareModels;
+    testingWav-->compareModels;
+    orcaHelloModel-->compareModels;
 ```
 
 ## Model-Based Timestamp Correction for tp_human_only
