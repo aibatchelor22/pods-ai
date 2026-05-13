@@ -43,6 +43,7 @@ MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-2
     <Compile Include="src\make_csv.py" />
     <Compile Include="src\make_spectrograms.py" />
     <Compile Include="src\manual_samples_utils.py" />
+    <Compile Include="src\merge_training_samples.py" />
     <Compile Include="src\model_inference.py" />
     <Compile Include="src\orcahello_inference.py" />
     <Compile Include="src\orcasite_feeds.py" />

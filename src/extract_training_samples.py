@@ -2,23 +2,14 @@
 # Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
 """
-Extract training samples from detections.csv with the following constraints:
+Extract initial training and testing samples from detections.csv with the following constraints:
 - At least 30 samples per category (or all available if < 30)
 - At least one sample per category-node combination
 - Prefer tp_machine_only or fp_machine_only notes
 - Spread samples evenly across nodes per category
 - Minimize total rows while meeting constraints
-- For tp_human_only detections: Run model on preceding 60 seconds to find correct timestamp
-- For other detections: Subtract SEGMENT_DURATION_SECONDS from timestamps
 
-For tp_human_only detections, we download 60 seconds of audio preceding the detection
-timestamp, run model inference to score each segment, and use the highest
-scoring segment to determine the correct timestamp offset.
-
-This matches the behavior of aifororcas-livesystem's LiveInferenceOrchestratorV1.py
-which uses DateRangeHLSStream to download audio and returns local_confidences for
-each 3-second sample. See:
-https://github.com/orcasound/aifororcas-livesystem/blob/main/InferenceSystem/src/LiveInferenceOrchestratorV1.py
+Timestamp correction and manual-sample merging now happen in merge_training_samples.py.
 """
 
 import argparse
@@ -38,8 +29,6 @@ import glob
 
 import ffmpeg
 import m3u8
-
-from model_inference import get_model_inference
 from audio_utils import (
     get_cached_folders,
     get_folders_between_timestamp,
@@ -806,7 +795,7 @@ def write_training_samples(
     segment_duration: int = SEGMENT_DURATION_SECONDS
 ):
     """
-    Write selected samples to CSV with timestamps adjusted.
+    Write selected samples to training CSV with timestamps adjusted.
 
     Args:
         samples: List of sample dictionaries
@@ -992,185 +981,22 @@ def load_manual_corrections(corrections_path: Path) -> tuple[dict[str, str], dic
     return manual_timestamps, manual_confidences
 
 
-def load_manual_samples(manual_samples_path: Path) -> list[dict]:
+def write_initial_training_samples(samples: list[dict], output_path: Path):
     """
-    Load manually-specified training samples from CSV file.
-
-    These samples are added to training_samples.csv in addition to the automatically
-    selected samples, without displacing any existing selections. Multiple rows with
-    the same URI but different timestamps are supported (e.g., multiple 3-second
-    segments from the same detection).
+    Write auto-selected training samples using detections.csv schema.
 
     Args:
-        manual_samples_path: Path to manual_samples.csv file
-
-    Returns:
-        List of sample dictionaries with same format as training_samples.csv.
-        Returns empty list if file doesn't exist or has errors.
+        samples: List of selected initial training sample dictionaries.
+        output_path: Path to output CSV file.
     """
-    manual_samples = []
-
-    if not manual_samples_path.exists():
-        return manual_samples
-
-    try:
-        print(f"\nLoading manual training samples from {manual_samples_path}...")
-        with open(manual_samples_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-
-            # Validate required columns (same as training_samples.csv format).
-            required_fields = {'Category', 'NodeName', 'Timestamp', 'URI'}
-            if not required_fields.issubset(set(reader.fieldnames or [])):
-                missing = required_fields - set(reader.fieldnames or [])
-                print(f"  Warning: Required columns missing in {manual_samples_path}: {missing}")
-                print(f"  Skipping manual samples.")
-                return []
-
-            for row_num, row in enumerate(reader, start=2):  # start=2 accounts for header.
-                try:
-                    # Validate that required fields are not empty.
-                    if not all(row.get(field, '').strip() for field in required_fields):
-                        print(f"  Warning: Skipping row {row_num} - required fields are empty")
-                        continue
-
-                    # Create sample dict with all fields from training_samples.csv format.
-                    sample = {
-                        'Category': row.get('Category', '').strip(),
-                        'NodeName': row.get('NodeName', '').strip(),
-                        'Timestamp': row.get('Timestamp', '').strip(),
-                        'URI': row.get('URI', '').strip(),
-                        'Description': row.get('Description', '').strip(),
-                        'Notes': row.get('Notes', '').strip(),
-                        'Confidence': row.get('Confidence', '').strip(),
-                        '_from_manual_samples': True,  # Internal marker to skip timestamp offset
-                    }
-
-                    manual_samples.append(sample)
-
-                except Exception as e:
-                    print(f"  Warning: Skipping row {row_num} due to error: {e}")
-                    continue
-
-        if manual_samples:
-            print(f"  Loaded {len(manual_samples)} manual training samples")
-
-    except Exception as e:
-        print(f"  Warning: Failed to load manual samples from {manual_samples_path}: {e}")
-        return []
-
-    return manual_samples
-
-
-def predict_output_timestamp(
-    sample: dict,
-    manual_timestamps: dict[str, str],
-    segment_duration: int = SEGMENT_DURATION_SECONDS
-) -> str:
-    """
-    Predict what timestamp a sample will have after process_sample() runs.
-
-    This mirrors the logic in process_sample() to determine the corrected timestamp
-    without actually running model inference or doing I/O.
-
-    Args:
-        sample: Detection sample dictionary.
-        manual_timestamps: Dictionary mapping URIs to corrected timestamp strings.
-        segment_duration: Duration of each audio segment in seconds.
-
-    Returns:
-        Predicted output timestamp string.
-    """
-    # Check if sample came from manual_samples.csv.
-    is_from_manual_samples = sample.get('_from_manual_samples', False)
-
-    # Strategy 1: Manual correction via manual_timestamps.csv.
-    if sample['URI'] in manual_timestamps:
-        return manual_timestamps[sample['URI']]
-
-    # Strategy 2: tp_human_only - we can't predict this without running the model,
-    # so we return the original timestamp. This means tp_human_only samples won't
-    # be caught as duplicates at merge time, but they're rare and unlikely to collide.
-    elif sample['Notes'] == 'tp_human_only':
-        # Can't predict model-based correction; assume no collision.
-        return sample['Timestamp']
-
-    # Strategy 3: Manual samples keep their timestamp as-is.
-    elif is_from_manual_samples:
-        return sample['Timestamp']
-
-    # Strategy 4: Fixed offset - subtract segment_duration.
-    else:
-        return subtract_segment_duration(sample['Timestamp'], segment_duration)
-
-
-def merge_manual_samples(
-    selected_samples: list[dict],
-    manual_samples: list[dict],
-    manual_timestamps: dict[str, str],
-    segment_duration: int = SEGMENT_DURATION_SECONDS
-) -> list[dict]:
-    """
-    Merge manual samples with automatically selected samples.
-
-    Manual samples replace any automatically selected samples that would have the same
-    output (Category, NodeName, Timestamp) after process_sample() runs. This handles
-    cases where:
-    1. An auto-selected sample's timestamp will be corrected (via manual_timestamps,
-       fixed offset, or model-based correction)
-    2. That corrected timestamp matches a manual_samples.csv entry
-    3. We want the manual sample's metadata (Description, Notes) instead
-
-    Args:
-        selected_samples: Automatically selected training samples.
-        manual_samples: Manually-specified training samples from manual_samples.csv.
-        manual_timestamps: Dictionary mapping URIs to corrected timestamp strings.
-        segment_duration: Duration of each audio segment in seconds (for fixed offset).
-
-    Returns:
-        Combined list of samples with manual samples replacing duplicates.
-    """
-    if not manual_samples:
-        return selected_samples
-
-    # Build a set of (Category, NodeName, output_Timestamp) from manual samples.
-    manual_keys = set()
-    for s in manual_samples:
-        # Manual samples keep their timestamp as-is (they have _from_manual_samples marker).
-        output_ts = predict_output_timestamp(s, manual_timestamps, segment_duration)
-        manual_keys.add((s['Category'], s['NodeName'], output_ts))
-
-    # Filter out auto-selected samples that would conflict after timestamp correction.
-    filtered_selected = []
-    replaced_count = 0
-
-    for sample in selected_samples:
-        # Predict what the output timestamp will be after process_sample().
-        output_ts = predict_output_timestamp(sample, manual_timestamps, segment_duration)
-
-        key = (sample['Category'], sample['NodeName'], output_ts)
-        if key in manual_keys:
-            replaced_count += 1
-            print(f"  Replacing auto-selected sample (URI: {sample['URI']}, timestamp: {sample['Timestamp']} -> {output_ts}) with manual sample")
-            # Skip this auto-selected sample; it will be replaced by manual sample.
-        else:
-            filtered_selected.append(sample)
-
-    # Add all manual samples.
-    merged = filtered_selected + list(manual_samples)
-
-    if manual_samples:
-        print(f"\n  Added {len(manual_samples)} manual samples to training set")
-    if replaced_count > 0:
-        print(f"  Replaced {replaced_count} auto-selected samples with manual samples")
-
-    return merged
+    write_testing_samples(samples, output_path)
 
 
 def main():
     """Main function to extract training samples."""
     # Parse command line arguments.
     parser = argparse.ArgumentParser(
-        description="Extract training samples from detections CSV with intelligent selection criteria"
+        description="Extract initial training and testing samples from detections CSV"
     )
     parser.add_argument(
         '--input',
@@ -1190,9 +1016,8 @@ def main():
     input_path = Path(args.input)
     if not input_path.is_absolute():
         input_path = REPO_ROOT / input_path
-    output_path = REPO_ROOT / 'output' / 'csv' / 'training_samples.csv'
+    initial_training_output_path = REPO_ROOT / 'output' / 'csv' / 'initial_training_samples.csv'
     testing_output_path = REPO_ROOT / 'output' / 'csv' / 'testing_samples.csv'
-    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'
 
     # Load manual confidences for sorting.
     manual_corrections_path = REPO_ROOT / 'output' / 'csv' / 'manual_timestamps.csv'
@@ -1213,144 +1038,26 @@ def main():
         total = sum(len(nodes) for nodes in organized_data[category].values())
         print(f"  {category}: {total} detections across {len(organized_data[category])} nodes")
 
-    # Load manual samples and count them by category.
-    manual_samples = load_manual_samples(manual_samples_path)
-    manual_sample_counts = defaultdict(int)
-    if manual_samples:
-        for sample in manual_samples:
-            manual_sample_counts[sample['Category']] += 1
-
-        print("\nManual samples by category:")
-        for category in sorted(manual_sample_counts.keys()):
-            print(f"  {category}: {manual_sample_counts[category]} samples")
-
     # Validate category sample counts and adjust targets if needed.
     print("\nValidating sample counts per category...")
-    category_stats = validate_category_sample_counts(organized_data, manual_sample_counts)
+    category_stats = validate_category_sample_counts(organized_data, {})
 
     for category in sorted(category_stats.keys()):
         stats = category_stats[category]
-        total_available = stats['detections_available'] + stats['manual_count']
-        print(f"  {category}: {stats['detections_available']} detections + {stats['manual_count']} manual = {total_available} total")
+        print(f"  {category}: {stats['detections_available']} detections available")
 
     print("\nSelecting training samples...")
     samples = select_training_samples(organized_data, manual_confidences, category_stats)
 
-    # Select testing samples BEFORE merging manual samples.
+    # Select testing samples from detections not already chosen for the initial training set.
     testing_samples = select_testing_samples(detections, samples, manual_confidences)
 
-    # Now merge manual samples into training set.
-    samples = merge_manual_samples(samples, manual_samples, manual_timestamps, args.duration)
-
-    print(f"\nSelected {len(samples)} training samples")
-
-    # Print breakdown by category.
-    category_counts = defaultdict(int)
-    category_node_counts = defaultdict(lambda: defaultdict(int))
-    for sample in samples:
-        category_counts[sample['Category']] += 1
-        category_node_counts[sample['Category']][sample['NodeName']] += 1
-
-    for category in sorted(category_counts.keys()):
-        print(f"  {category}: {category_counts[category]} samples")
-        for node in sorted(category_node_counts[category].keys()):
-            print(f"    {node}: {category_node_counts[category][node]}")
-
-    # Print breakdown by type.
-    type_counts = defaultdict(int)
-    type_node_counts = defaultdict(lambda: defaultdict(int))
-    for sample in samples:
-        type_counts[sample['Notes']] += 1
-        type_node_counts[sample['Notes']][sample['NodeName']] += 1
-
-    for type in sorted(type_counts.keys()):
-        print(f"  {type}: {type_counts[type]} samples")
-        for node in sorted(type_node_counts[type].keys()):
-            print(f"    {node}: {type_node_counts[type][node]}")
+    print(f"\nSelected {len(samples)} initial training samples")
 
     print(f"\nSelected {len(testing_samples)} testing samples")
 
-    # Print breakdown by category for testing samples.
-    testing_category_counts = defaultdict(int)
-    testing_notes_counts = defaultdict(int)
-    for sample in testing_samples:
-        testing_category_counts[sample['Category']] += 1
-        testing_notes_counts[sample['Notes']] += 1
-
-    print("Testing samples by category:")
-    for category in sorted(testing_category_counts.keys()):
-        print(f"  {category}: {testing_category_counts[category]} samples")
-
-    print("Testing samples by notes:")
-    for notes in sorted(testing_notes_counts.keys()):
-        print(f"  {notes}: {testing_notes_counts[notes]} samples")
-
-    # Check for categories with sample shortages and print warnings.
-    print("\nSample shortage summary:")
-    has_shortage = False
-    for category in sorted(category_stats.keys()):
-        stats = category_stats[category]
-        if stats['shortage'] > 0:
-            has_shortage = True
-            actual_training = category_counts.get(category, 0)
-            actual_testing = testing_category_counts.get(category, 0)
-            print(f"  {category}:")
-            print(f"    Available: {stats['available']} samples ({stats['detections_available']} detections + {stats['manual_count']} manual)")
-            print(f"    Required: {stats['required']} ({stats['required_training']} training + {stats['required_testing']} testing)")
-            print(f"    Shortage: {stats['shortage']} more samples needed")
-            print(f"    Actual: {actual_training} training + {actual_testing} testing = {actual_training + actual_testing} total")
-
-    if not has_shortage:
-        print("  No shortages detected. All categories have sufficient samples.")
-
-    # Initialize model inference for tp_human_only timestamp correction.
-    print("\nInitializing model inference for tp_human_only timestamp correction...")
-
-    # Check for model configuration from environment variables.
-    model_type = os.environ.get("MODEL_TYPE", "fastai")
-    model_path = os.environ.get("MODEL_PATH", "./model")
-    model_url = os.environ.get("MODEL_URL", None)
-
-    # Default to auto-download for fastai, false for dummy.
-    auto_download_default = "true" if model_type == "fastai" else "false"
-    auto_download = os.environ.get("MODEL_AUTO_DOWNLOAD", auto_download_default).lower() == "true"
-
-    print(f"  Model type: {model_type}")
-    if model_type == "fastai":
-        print(f"  Model path: {model_path}")
-        print(f"  Auto download: {auto_download}")
-        if model_url:
-            print(f"  Model URL: {model_url}")
-        print(f"  Note: FastAI is the default model type.")
-        print(f"  To customize, set environment variables:")
-        print(f"    MODEL_TYPE=fastai (default)")
-        print(f"    MODEL_PATH=./model (default)")
-        print(f"    MODEL_AUTO_DOWNLOAD=true (default for fastai)")
-        print(f"    MODEL_URL=<custom-url> (optional, to use a specific model version)")
-
-    try:
-        model_inference = get_model_inference(
-            model_path=model_path if model_type == "fastai" else None,
-            model_type=model_type,
-            auto_download=auto_download,
-            model_url=model_url
-        )
-    except Exception as e:
-        print(f"  Error: Failed to initialize model inference: {e}", file=sys.stderr)
-        print(f"  Cannot proceed without model for tp_human_only timestamp correction.", file=sys.stderr)
-        sys.exit(1)
-
-    # Note: Manual samples were already loaded and merged earlier (after select_training_samples).
-    # The all_training_samples variable already contains both auto-selected and manual samples.
-    all_training_samples = samples  # samples already includes manual samples from earlier merge
-
-    # Validation of unique URIs happens inside write_training_samples after processing.
-    print(f"\nWriting {len(all_training_samples)} training samples to {output_path}...")
-    try:
-        write_training_samples(all_training_samples, output_path, manual_timestamps, manual_confidences, model_inference, args.duration)
-    except ValueError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(1)
+    print(f"\nWriting {len(samples)} initial training samples to {initial_training_output_path}...")
+    write_initial_training_samples(samples, initial_training_output_path)
 
     print(f"Writing testing samples to {testing_output_path}...")
     write_testing_samples(testing_samples, testing_output_path)

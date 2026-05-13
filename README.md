@@ -11,20 +11,22 @@ The `src` directory has the following scripts for different steps meant to be ru
 2. **process_humpback_wavs.py**: Process files from the humpback submodule into the humpback subdirectory under `output/wav`.
    A custom segment duration can be specified with `--duration _seconds_` (default: 3 seconds).
 3. **extract_training_samples.py**: Use an input CSV file (`output/csv/detections.csv` by default)
-   to create `output/csv/training_samples.csv` and `output/csv/testing_samples.csv`. An alternate input filename can be specified with
+   to create `output/csv/initial_training_samples.csv` and `output/csv/testing_samples.csv`. An alternate input filename can be specified with
    `--input _filename_`. A custom segment duration can be specified with `--duration _seconds_` (default: 3 seconds).
-   - For `tp_human_only` detections, runs model inference on preceding 60 seconds to find correct timestamp
-   - For other detections, subtracts the segment duration from the timestamp
+   - `initial_training_samples.csv` uses detections-format rows for the auto-selected starting set
    - `testing_samples.csv` uses detections-format rows, excludes training rows, and includes eligible samples per category:
      - Up to 10 standard eligible samples per category (excludes samples with confidence 0.0)
      - Additionally up to 10 `tp_machine_only` samples in the `resident` category
      - Additionally up to 10 `tp_human_only` samples per negative category (water, human, vessel, jingle)
-4. **download_wavs.py**: Use `output/csv/training_samples.csv` and `output/csv/testing_samples.csv` to download wav files
+4. **merge_training_samples.py**: Merge `output/csv/initial_training_samples.csv` with `output/csv/manual_samples.csv`
+   to create `output/csv/training_samples.csv`. For `tp_human_only` detections, it runs model inference on preceding
+   60 seconds to find the correct timestamp; for other detections, it subtracts the segment duration from the timestamp.
+5. **download_wavs.py**: Use `output/csv/training_samples.csv` and `output/csv/testing_samples.csv` to download wav files
    - Training samples are written to subdirectories under `output/wav`
    - Testing samples are written to subdirectories under `output/testing-wav`
    - For testing samples, all rows download 60-second wav files (`tp_human_only` uses the row timestamp; others are centered on the row timestamp)
-5. **make_spectrograms.py**: Create a png file for each wav file in a subdirectory of `output/png`
-6. **train_podsai_model.py**: A script to train a PODS-AI model on the generated training samples.
+6. **make_spectrograms.py**: Create a png file for each wav file in a subdirectory of `output/png`
+7. **train_podsai_model.py**: A script to train a PODS-AI model on the generated training samples.
 
 ```mermaid
 flowchart TD;
@@ -32,6 +34,7 @@ flowchart TD;
     huggingFace[(HuggingFace davethaler/whale-call-detetor)];
     manualSamples@{ shape: doc, label: "manual_samples.csv" };
     detections@{ shape: doc, label: "detections.csv" };
+    initialTrainingSamples@{ shape: doc, label: "initial_training_samples.csv" };
     trainingSamples@{ shape: doc, label: "training_samples.csv" };
     testingSamples@{ shape: doc, label: "testing_samples.csv" };
     signalsHumpback@{ shape: doc, label: "signals-humpback" };
@@ -43,6 +46,7 @@ flowchart TD;
     processHumpbackWavs@{ shape: rect, label: "processHumpbackWavs.py" };
     makeCsv@{ shape: rect, label: "make_csv.py" };
     extractTrainingSamples@{ shape: rect, label: "extract_training_samples.py" };
+    mergeTrainingSamples@{ shape: rect, label: "merge_training_samples.py" };
     downloadWavs@{ shape: rect, label: "download_wavs.py" };
     trainPodsaiModel@{ shape: rect, label: "train_podsai_model.py" };
 
@@ -50,11 +54,13 @@ flowchart TD;
 
     signalsHumpback-->processHumpbackWavs-->humpbackSignals;
 
-    detections-->extractTrainingSamples-->trainingSamples;
+    detections-->extractTrainingSamples-->initialTrainingSamples;
     humpbackSignals-->extractTrainingSamples;
     manualTimestamps-->extractTrainingSamples;
-    manualSamples-->extractTrainingSamples;
     extractTrainingSamples-->testingSamples;
+    initialTrainingSamples-->mergeTrainingSamples-->trainingSamples;
+    manualSamples-->mergeTrainingSamples;
+    manualTimestamps-->mergeTrainingSamples;
 
     trainingSamples-->downloadWavs-->wav;
     testingSamples-->downloadWavs-->testingWav;
@@ -64,7 +70,7 @@ flowchart TD;
 
 ## Model-Based Timestamp Correction for tp_human_only
 
-The `extract_training_samples.py` script now implements intelligent timestamp correction for `tp_human_only` detections:
+The `merge_training_samples.py` script implements intelligent timestamp correction for `tp_human_only` detections:
 
 ### How it Works
 
@@ -78,7 +84,7 @@ This matches the behavior described in the issue and follows the approach used i
 
 ### Using the FastAI Model
 
-By default, `extract_training_samples.py` uses the FastAI model with automatic download enabled.
+By default, `merge_training_samples.py` uses the FastAI model with automatic download enabled.
 
 #### Option 1: Default behavior (recommended)
 
@@ -92,6 +98,7 @@ bash patch_fastai_audio.sh
 
 cd src
 python extract_training_samples.py
+python merge_training_samples.py
 ```
 
 This will automatically download the default model from:
@@ -111,6 +118,7 @@ bash patch_fastai_audio.sh  # For Python 3.11+
 export MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/YOUR-MODEL-VERSION.zip
 cd src
 python extract_training_samples.py
+python merge_training_samples.py
 ```
 
 #### Option 3: Use pre-downloaded model
@@ -130,12 +138,7 @@ unzip model.zip -d .
 cd src
 export MODEL_AUTO_DOWNLOAD=false
 export MODEL_PATH=../model
-python extract_training_samples.py
-```
-
-#### Option 4: Use dummy model (for testing)
-
-python extract_training_samples.py
+python merge_training_samples.py
 ```
 
 #### Option 4: Use dummy model (for testing)
@@ -145,7 +148,7 @@ For testing without FastAI dependencies or model download:
 ```bash
 cd src
 export MODEL_TYPE=dummy
-python extract_training_samples.py
+python merge_training_samples.py
 ```
 
 The dummy model will generate mock predictions suitable for testing the timestamp correction logic.

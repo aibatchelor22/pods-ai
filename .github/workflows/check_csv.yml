@@ -8,6 +8,7 @@ on:
     paths:
       - 'src/make_csv.py'
       - 'src/extract_training_samples.py'
+      - 'src/merge_training_samples.py'
       - 'src/process_humpback_wavs.py'
       - 'output/csv/**'
       - 'requirements.txt'
@@ -23,8 +24,83 @@ permissions:
   contents: read
 
 jobs:
-  make_csv_ubuntu:
+  detect_merge_inputs:
     if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      should_run_base_csv: ${{ steps.detect.outputs.should_run_base_csv }}
+      should_run_make_csv: ${{ steps.detect.outputs.should_run_make_csv }}
+      should_run_merge: ${{ steps.detect.outputs.should_run_merge }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        name: Detect CSV workflow changes
+        run: |
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" > changed_files.txt
+          cat changed_files.txt
+          base_csv_inputs=(
+            '^src/make_csv.py$'
+            '^src/extract_training_samples.py$'
+            '^src/process_humpback_wavs.py$'
+            '^output/csv/detections.csv$'
+            '^output/csv/manual_timestamps.csv$'
+            '^output/csv/initial_training_samples.csv$'
+            '^output/csv/testing_samples.csv$'
+            '^requirements.txt$'
+            '^\.github/workflows/check_csv.yml$'
+          )
+          make_csv_inputs=(
+            '^src/make_csv.py$'
+            '^output/csv/detections.csv$'
+            '^requirements.txt$'
+            '^\.github/workflows/check_csv.yml$'
+          )
+          merge_inputs=(
+            '^src/extract_training_samples.py$'
+            '^src/merge_training_samples.py$'
+            '^output/csv/initial_training_samples.csv$'
+            '^output/csv/manual_samples.csv$'
+            '^output/csv/manual_timestamps.csv$'
+            '^output/csv/training_samples.csv$'
+            '^requirements.txt$'
+            '^\.github/workflows/check_csv.yml$'
+          )
+          should_run_base_csv=false
+          for pattern in "${base_csv_inputs[@]}"; do
+            if grep -Eq "$pattern" changed_files.txt; then
+              should_run_base_csv=true
+              break
+            fi
+          done
+          should_run_make_csv=false
+          for pattern in "${make_csv_inputs[@]}"; do
+            if grep -Eq "$pattern" changed_files.txt; then
+              should_run_make_csv=true
+              break
+            fi
+          done
+          should_run_merge=false
+          for pattern in "${merge_inputs[@]}"; do
+            if grep -Eq "$pattern" changed_files.txt; then
+              should_run_merge=true
+              break
+            fi
+          done
+          echo "should_run_base_csv=$should_run_base_csv" >> "$GITHUB_OUTPUT"
+          echo "should_run_make_csv=$should_run_make_csv" >> "$GITHUB_OUTPUT"
+          echo "should_run_merge=$should_run_merge" >> "$GITHUB_OUTPUT"
+
+  make_csv_ubuntu:
+    needs: detect_merge_inputs
+    if: github.actor != 'dependabot[bot]' && needs.detect_merge_inputs.outputs.should_run_base_csv == 'true'
     permissions:
       actions: write  # for fkirc/skip-duplicate-actions to skip or stop workflow runs
       contents: read  # for actions/checkout to fetch code
@@ -68,12 +144,12 @@ jobs:
         run: bash patch_fastai_audio.sh
 
       - name: Make CSV
-        if: steps.skip_check.outputs.should_skip != 'true' && env.COSMOS_KEY != ''
+        if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true' && env.COSMOS_KEY != ''
         run: |
           python src/make_csv.py --end 2026_03_17_00_00_00_PST
 
       - name: Verify there are no changes in detections.csv
-        if: steps.skip_check.outputs.should_skip != 'true'
+        if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true'
         run: |
           git diff --exit-code
 
@@ -87,14 +163,15 @@ jobs:
         run: |
           python src/extract_training_samples.py
 
-      - name: Verify there are no changes in training_samples.csv
+      - name: Verify there are no changes in initial_training_samples.csv or testing_samples.csv
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
           git diff --exit-code
 
 
   make_csv_windows:
-    if: github.actor != 'dependabot[bot]'
+    needs: detect_merge_inputs
+    if: github.actor != 'dependabot[bot]' && needs.detect_merge_inputs.outputs.should_run_base_csv == 'true'
     permissions:
       actions: write  # for fkirc/skip-duplicate-actions to skip or stop workflow runs
       contents: read  # for actions/checkout to fetch code
@@ -137,12 +214,12 @@ jobs:
         run: patch_fastai_audio.bat
 
       - name: Make CSV
-        if: steps.skip_check.outputs.should_skip != 'true' && env.COSMOS_KEY != ''
+        if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true' && env.COSMOS_KEY != ''
         run: |
           python src/make_csv.py --end 2026_03_17_00_00_00_PST
 
       - name: Verify there are no changes in detections.csv
-        if: steps.skip_check.outputs.should_skip != 'true'
+        if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true'
         run: |
           git diff --exit-code
 
@@ -156,7 +233,114 @@ jobs:
         run: |
           python src/extract_training_samples.py
 
-      - name: Verify there are no changes in training_samples.csv or testing_samples.csv
+      - name: Verify there are no changes in initial_training_samples.csv or testing_samples.csv
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: |
+          git diff --exit-code
+
+
+  merge_training_ubuntu:
+    needs: detect_merge_inputs
+    if: github.actor != 'dependabot[bot]' && needs.detect_merge_inputs.outputs.should_run_merge == 'true'
+    permissions:
+      actions: write  # for fkirc/skip-duplicate-actions to skip or stop workflow runs
+      contents: read  # for actions/checkout to fetch code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
+        with:
+          cancel_others: 'false'
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: steps.skip_check.outputs.should_skip != 'true'
+        with:
+          submodules: 'recursive'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        if: steps.skip_check.outputs.should_skip != 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Patch fastai_audio for Python 3.11+ compatibility
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: bash patch_fastai_audio.sh
+
+      - name: Merge training samples
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: |
+          python src/merge_training_samples.py
+
+      - name: Verify there are no changes in training_samples.csv
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: |
+          git diff --exit-code
+
+
+  merge_training_windows:
+    needs: detect_merge_inputs
+    if: github.actor != 'dependabot[bot]' && needs.detect_merge_inputs.outputs.should_run_merge == 'true'
+    permissions:
+      actions: write  # for fkirc/skip-duplicate-actions to skip or stop workflow runs
+      contents: read  # for actions/checkout to fetch code
+    runs-on: windows-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
+        with:
+          cancel_others: 'false'
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        if: steps.skip_check.outputs.should_skip != 'true'
+        with:
+          submodules: 'recursive'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        if: steps.skip_check.outputs.should_skip != 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: choco install ffmpeg -y
+
+      - name: Install Python dependencies
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Patch fastai_audio for Python 3.11+ compatibility
+        if: steps.skip_check.outputs.should_skip != 'true'
+        shell: cmd
+        run: patch_fastai_audio.bat
+
+      - name: Merge training samples
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: |
+          python src/merge_training_samples.py
+
+      - name: Verify there are no changes in training_samples.csv
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
           git diff --exit-code

@@ -30,10 +30,11 @@ pods-ai/
     ├── audio_utils.py              # Shared audio helpers
     ├── compare_models.py           # Compare model performance on testing data
     ├── download_wavs.py            # Step 4: download wav files
-    ├── extract_training_samples.py # Step 3: detections.csv → training/testing samples
+    ├── extract_training_samples.py # Step 3: detections.csv → initial training/testing samples
     ├── get_best_timestamp.py       # Timestamp correction helper
+    ├── merge_training_samples.py   # Step 4: initial/manual samples → training samples
     ├── make_csv.py                 # Step 1: query APIs → detections.csv
-    ├── make_spectrograms.py        # Step 5: wav → PNG spectrograms
+    ├── make_spectrograms.py        # Step 6: wav → PNG spectrograms
     ├── manual_samples_utils.py     # Shared manual-sample CSV helpers
     ├── model_inference.py          # Common inference interface
     ├── orcahello_inference.py      # OrcaHello inference adapter
@@ -85,16 +86,17 @@ The scripts in `src/` are meant to be run in order:
 
 1. `make_csv.py` – Queries Orcasite and OrcaHello APIs; writes `output/csv/detections.csv`.
 2. `process_humpback_wavs.py` – Processes humpback signal files from `signals-humpback_*.wav`; extracts 2-second segments.
-3. `extract_training_samples.py` – Reads `detections.csv`; writes `output/csv/training_samples.csv` (adjusts humpback count based on existing signal files).
-4. `download_wavs.py` – Reads `training_samples.csv`; downloads wav files into subdirectories under `output/wav/`.
-5. `make_spectrograms.py` – Generates a PNG spectrogram alongside each wav file.
+3. `extract_training_samples.py` – Reads `detections.csv`; writes `output/csv/initial_training_samples.csv` and `output/csv/testing_samples.csv` (adjusts humpback count based on existing signal files).
+4. `merge_training_samples.py` – Reads `initial_training_samples.csv` and `manual_samples.csv`; writes `output/csv/training_samples.csv`.
+5. `download_wavs.py` – Reads `training_samples.csv`; downloads wav files into subdirectories under `output/wav/`.
+6. `make_spectrograms.py` – Generates a PNG spectrogram alongside each wav file.
 
 Detection labels: `resident`, `transient`, `humpback`, `other`.  
 Classification kinds: `tp_human_only`, `tp_machine_only`, `fp_machine_only`, `tp_both`, `skip`.
 
 ## CI / CD
 
-- **check_csv.yml** – Runs on every PR; re-executes `make_csv.py` and `extract_training_samples.py` and asserts no diff in the committed CSV files (requires `COSMOS_KEY` secret).
+- **check_csv.yml** – Runs on every PR; re-executes `make_csv.py`, `extract_training_samples.py`, and, when relevant files changed, `merge_training_samples.py`, then asserts no diff in the committed CSV files (requires `COSMOS_KEY` secret for `make_csv.py`).
 - **validate-yaml.yml** – Runs `yamllint` against all YAML files using the rules in `.yamllint.yml` (line-length disabled, truthy check-keys disabled).
 - **dependabot.yml** – Weekly updates for GitHub Actions dependencies.
 - **renovate.json** – Tracks additional dependency updates, including the pinned PODS-AI test model revision.

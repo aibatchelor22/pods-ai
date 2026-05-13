@@ -18,9 +18,11 @@ from extract_training_samples import (
     remove_zero_confidence_detections,
     select_testing_samples,
     sort_by_preference,
+    write_initial_training_samples,
     write_testing_samples,
     write_training_samples,
 )
+from merge_training_samples import merge_manual_samples
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +323,46 @@ class TestWriteTrainingSamples:
                 rows = _read_csv(output_path)
         assert len(rows) == 1
         assert rows[0] == TP_HUMAN_ONLY_EXPECTED
+
+    def test_initial_training_rows_are_written_without_timestamp_correction(self):
+        """write_initial_training_samples should preserve detections-format rows."""
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / 'initial_training_samples.csv'
+            write_initial_training_samples([TP_HUMAN_ONLY_INPUT], output_path)
+            rows = _read_csv(output_path)
+
+        assert len(rows) == 1
+        assert rows[0] == TP_HUMAN_ONLY_INPUT
+
+
+class TestMergeManualSamples:
+    """Tests for merging checked-in manual samples with initial training samples."""
+
+    def test_manual_sample_replaces_auto_sample_with_same_output_timestamp(self):
+        """A manual sample should replace an auto-selected sample that lands on the same output timestamp."""
+        auto_selected = [{
+            'Category': 'resident',
+            'NodeName': 'rpi_test',
+            'Timestamp': '2025_01_01_00_00_05_PST',
+            'URI': 'https://example.org/auto',
+            'Description': 'auto selection',
+            'Notes': 'tp_machine_only',
+            'Confidence': '81.0',
+        }]
+        manual_samples = [{
+            'Category': 'resident',
+            'NodeName': 'rpi_test',
+            'Timestamp': '2025_01_01_00_00_02_PST',
+            'URI': 'https://example.org/manual',
+            'Description': 'manual replacement',
+            'Notes': 'manual',
+            'Confidence': '100.0',
+            '_from_manual_samples': True,
+        }]
+
+        merged = merge_manual_samples(auto_selected, manual_samples, {})
+
+        assert merged == manual_samples
 
 
 # ---------------------------------------------------------------------------

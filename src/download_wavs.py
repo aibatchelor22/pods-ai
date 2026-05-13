@@ -367,7 +367,7 @@ if __name__ == "__main__":
 
     if not training_csv_path.exists():
         print(f"Error: CSV file not found at {training_csv_path}")
-        print("Please run extract_training_samples.py first to generate the training_samples.csv file.")
+        print("Please run merge_training_samples.py first to generate the training_samples.csv file.")
         sys.exit(1)
 
     process_csv(training_csv_path, training_output_root)
