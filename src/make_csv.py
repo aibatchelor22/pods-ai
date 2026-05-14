@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
 import csv
+import time
 from urllib.parse import quote
 
 from pytz import timezone
@@ -101,6 +102,8 @@ NEAR_MIN = timedelta(minutes=10)
 PACIFIC_TZ = timezone('US/Pacific')
 UTC_TZ = timezone('UTC')
 MAX_DETECTION_PAGES = 1000  # Safety limit to prevent infinite loops (500k detections max)
+DETECTION_FETCH_MAX_ATTEMPTS = 3
+DETECTION_FETCH_RETRY_DELAY_SECONDS = 2
 
 def is_isolated_human_whale(
     det: OrcasiteDetection,
@@ -199,7 +202,11 @@ def classify_detection(
     # False positive, human-only and true negative are effectively already skipped.
     return Classification(kind="skip", include=False)
 
-def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
+def get_orcasite_detections(
+    feed: OrcasiteFeed,
+    max_attempts: int = DETECTION_FETCH_MAX_ATTEMPTS,
+    retry_delay_seconds: int = DETECTION_FETCH_RETRY_DELAY_SECONDS,
+) -> List[OrcasiteDetection]:
     """
     Fetch detections from the Orcasite API for the given feed.
 
@@ -209,8 +216,17 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
         feed (OrcasiteFeed): Feed whose detections should be retrieved and matched by feed.id.
 
     Returns:
-        List[OrcasiteDetection]: Detections associated with the specified feed (may be empty).
+        List[OrcasiteDetection]: Detections associated with the specified feed.
+
+    Raises:
+        ValueError: If ``max_attempts`` is less than 1.
+        requests.exceptions.ReadTimeout: If the Orcasite API read times out on every retry attempt.
+        Exception: Re-raises non-timeout request/parsing errors immediately.
     """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    if retry_delay_seconds < 0:
+        raise ValueError("retry_delay_seconds must be >= 0")
 
     # Base endpoint.
     base_url = "https://live.orcasound.net/api/json/detections"
@@ -223,64 +239,74 @@ def get_orcasite_detections(feed: OrcasiteFeed) -> List[OrcasiteDetection]:
 
     # Build query parameters.
     limit = 250
-    offset = 0
     params = {
         "page[limit]": limit,
         "fields[detection]": fields,
         "filter[feed_id]": feed.id,
     }
 
-    dets = []
-    page_count = 0
+    for attempt in range(1, max_attempts + 1):
+        dets = []
+        page_count = 0
+        offset = 0
 
-    try:
-        # Loop through all pages until no more data is returned.
-        while page_count < MAX_DETECTION_PAGES:
-            params["page[offset]"] = offset
+        try:
+            # Loop through all pages until no more data is returned.
+            while page_count < MAX_DETECTION_PAGES:
+                params["page[offset]"] = offset
 
-            print(f"Fetching Orcasite page {page_count}...")
-            r = requests.get(base_url, params=params, timeout=10)
-            r.raise_for_status()
-            data = r.json()
+                print(f"Fetching Orcasite page {page_count}...")
+                r = requests.get(base_url, params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json()
 
-            items = data.get("data", [])
+                items = data.get("data", [])
 
-            # If no data is returned, we've fetched all pages.
-            if not items:
-                print(f"Finished after page {page_count}")
-                break
+                # If no data is returned, we've fetched all pages.
+                if not items:
+                    print(f"Finished after page {page_count}")
+                    break
 
-            for item in items:
-                attrs = item.get("attributes", {})
+                for item in items:
+                    attrs = item.get("attributes", {})
 
-                # Parse timestamp safely.
-                ts_raw = attrs.get("timestamp")
-                try:
-                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                except Exception:
-                    ts = None
+                    # Parse timestamp safely.
+                    ts_raw = attrs.get("timestamp")
+                    try:
+                        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    except Exception:
+                        ts = None
 
-                det = OrcasiteDetection(
-                    id=item.get("id"),
-                    feed=feed,
-                    timestamp=ts,
-                    source=attrs.get("source"),
-                    category=attrs.get("category"),
-                    description=attrs.get("description") or "",
-                    idempotency_key=attrs.get("idempotency_key") or "",
-                )
+                    det = OrcasiteDetection(
+                        id=item.get("id"),
+                        feed=feed,
+                        timestamp=ts,
+                        source=attrs.get("source"),
+                        category=attrs.get("category"),
+                        description=attrs.get("description") or "",
+                        idempotency_key=attrs.get("idempotency_key") or "",
+                    )
 
-                dets.append(det)
+                    dets.append(det)
 
-            # Increment offset for next page.
-            offset += limit
-            page_count += 1
+                # Increment offset for next page.
+                offset += limit
+                page_count += 1
 
-        return dets
+            return dets
 
-    except Exception as e:
-        print(f"Error fetching detections for feed {feed.id}: {e}")
-        return []
+        except requests.exceptions.ReadTimeout as exc:
+            if attempt == max_attempts:
+                print(f"Error fetching detections for feed {feed.id} after {max_attempts} attempts: {exc}")
+                raise
+            print(
+                f"Read timeout fetching detections for feed {feed.id} "
+                f"(attempt {attempt}/{max_attempts}); retrying in {retry_delay_seconds} seconds."
+            )
+            time.sleep(retry_delay_seconds)
+        except Exception as e:
+            print(f"Error fetching detections for feed {feed.id}: {e}")
+            raise
 
 def get_node_name_for_feed(feed: OrcasiteFeed) -> str:
     """

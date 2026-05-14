@@ -15,6 +15,7 @@ from pytz import timezone as pytz_timezone
 
 from make_csv import (
     PACIFIC_TZ,
+    get_orcasite_detections,
     get_orcahello_detections,
     get_orcasite_feeds,
     parse_pst_timestamp,
@@ -311,6 +312,87 @@ class TestGetOrcasiteFeedsWithRetry:
         assert feeds == []
         assert mock_get_feeds.call_count == 2
         mock_sleep.assert_called_once_with(1)
+
+
+class TestGetOrcasiteDetectionsWithRetry:
+    """get_orcasite_detections() should retry on ReadTimeout and fail after retries."""
+
+    @staticmethod
+    def _feed() -> OrcasiteFeed:
+        """Create a minimal feed object for testing."""
+        return OrcasiteFeed(
+            id="feed_1",
+            name="Test Feed",
+            node_name="rpi_test",
+            slug="test",
+            bucket="audio-orcasound-net",
+            bucket_region="us-west-2",
+            visible=True,
+            location=(47.0, -122.0),
+        )
+
+    def test_retries_after_read_timeout(self):
+        """A read timeout should retry and then succeed when a later attempt works."""
+        response_with_data = MagicMock()
+        response_with_data.raise_for_status.return_value = None
+        response_with_data.json.return_value = {
+            "data": [
+                {
+                    "id": "det_1",
+                    "attributes": {
+                        "timestamp": "2025-01-01T12:00:00Z",
+                        "source": "human",
+                        "category": "whale",
+                        "description": "resident",
+                        "idempotency_key": "",
+                    },
+                }
+            ]
+        }
+        response_empty_page = MagicMock()
+        response_empty_page.raise_for_status.return_value = None
+        response_empty_page.json.return_value = {"data": []}
+
+        with patch(
+            "make_csv.requests.get",
+            side_effect=[
+                requests.exceptions.ReadTimeout("timed out"),
+                response_with_data,
+                response_empty_page,
+            ],
+        ) as mock_get, patch("make_csv.time.sleep") as mock_sleep:
+            detections = get_orcasite_detections(self._feed(), max_attempts=2, retry_delay_seconds=1)
+
+        assert len(detections) == 1
+        assert detections[0].id == "det_1"
+        assert detections[0].source == "human"
+        assert detections[0].category == "whale"
+        assert mock_get.call_count == 3
+        mock_sleep.assert_called_once_with(1)
+
+    def test_raises_after_read_timeout_retry_exhausted(self):
+        """Repeated read timeouts should raise after the configured retry attempts."""
+        with patch(
+            "make_csv.requests.get",
+            side_effect=requests.exceptions.ReadTimeout("timed out"),
+        ) as mock_get, patch("make_csv.time.sleep") as mock_sleep:
+            with pytest.raises(requests.exceptions.ReadTimeout):
+                get_orcasite_detections(self._feed(), max_attempts=2, retry_delay_seconds=1)
+
+        assert mock_get.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    def test_non_timeout_errors_fail_fast_without_retry(self):
+        """Non-timeout errors should fail immediately without retries."""
+        with patch(
+            "make_csv.requests.get",
+            side_effect=requests.exceptions.HTTPError("boom"),
+        ) as mock_get, patch("make_csv.time.sleep") as mock_sleep:
+            with pytest.raises(requests.exceptions.HTTPError):
+                get_orcasite_detections(self._feed(), max_attempts=3, retry_delay_seconds=1)
+
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
 
 
 class TestGetOrcahelloDetections:
