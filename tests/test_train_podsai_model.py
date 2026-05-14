@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
-"""Unit tests for train_podsai_model.py metric selection."""
+"""Unit tests for train_podsai_model.py metric selection and Hub settings."""
 
 import importlib
 import sys
@@ -119,6 +119,89 @@ def _patch_metrics(module):
     module.PRECISION_METRIC = _FakeMetric("precision")
     module.RECALL_METRIC = _FakeMetric("recall")
     module.F1_METRIC = _FakeMetric("f1")
+
+
+def test_push_to_hub_uses_last_six_checkpoints(monkeypatch, tmp_path):
+    """Hub uploads should retain and publish the last 6 epoch checkpoints."""
+    module = _import_stubbed_train_module(monkeypatch)
+
+    captured_training_args = {}
+
+    class _FakeFeatureExtractor:
+        @classmethod
+        def from_pretrained(cls, _model_name):
+            return cls()
+
+        def save_pretrained(self, _output_dir):
+            return None
+
+        def push_to_hub(self, _hub_model_id):
+            return None
+
+        def __call__(self, processed_audio, **_kwargs):
+            return {"input_values": processed_audio}
+
+    class _FakeModel:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class _FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            captured_training_args.update(kwargs)
+
+    class _FakeTrainer:
+        def __init__(self, model, args, train_dataset, eval_dataset, compute_metrics):
+            self.model = model
+            self.args = args
+            self.train_dataset = train_dataset
+            self.eval_dataset = eval_dataset
+            self.compute_metrics = compute_metrics
+
+        def train(self, resume_from_checkpoint=None):
+            return resume_from_checkpoint
+
+        def evaluate(self):
+            return {"f1": 1.0}
+
+        def save_model(self, _output_dir):
+            return None
+
+    class _FakeDatasetDict(dict):
+        def map(self, _func, batched, remove_columns):
+            assert batched is True
+            assert remove_columns == ["audio"]
+            return self
+
+    fake_dataset = _FakeDatasetDict(train=[{"label": 0}], test=[{"label": 0}])
+
+    monkeypatch.setattr(module, "setup_label_mappings", lambda _num_classes: None)
+    monkeypatch.setattr(module, "load_audio_dataset", lambda _data_dir, _num_classes: fake_dataset)
+    monkeypatch.setattr(module, "analyze_dataset", lambda _dataset: None)
+    monkeypatch.setattr(module, "Wav2Vec2FeatureExtractor", _FakeFeatureExtractor)
+    monkeypatch.setattr(module, "Wav2Vec2ForSequenceClassification", _FakeModel)
+    monkeypatch.setattr(module, "TrainingArguments", _FakeTrainingArguments)
+    monkeypatch.setattr(module, "Trainer", _FakeTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_podsai_model.py",
+            "--output_dir",
+            str(tmp_path / "model"),
+            "--push_to_hub",
+            "--hub_model_id",
+            "davethaler/whale-call-detector",
+        ],
+    )
+
+    module.main()
+
+    assert captured_training_args["save_strategy"] == "epoch"
+    assert captured_training_args["save_total_limit"] == 6
+    assert captured_training_args["hub_strategy"] == "all_checkpoints"
+    assert captured_training_args["push_to_hub"] is True
+    assert captured_training_args["hub_model_id"] == "davethaler/whale-call-detector"
 
 
 def test_whale_f1_computed_from_whale_classes_only(monkeypatch):

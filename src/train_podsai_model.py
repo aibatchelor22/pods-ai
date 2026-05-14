@@ -61,6 +61,7 @@ F1_METRIC = evaluate.load("f1")
 
 # Whale classes for optimization in multi-class mode.
 WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
+CHECKPOINT_SAVE_LIMIT = 6
 
 
 def setup_label_mappings(num_classes: int) -> None:
@@ -466,6 +467,7 @@ def main() -> None:
         output_dir=str(output_dir),
         eval_strategy="epoch",
         save_strategy="epoch",
+        save_total_limit=CHECKPOINT_SAVE_LIMIT,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -475,6 +477,7 @@ def main() -> None:
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         push_to_hub=args.push_to_hub,
+        hub_strategy="all_checkpoints" if args.push_to_hub else "end",
         hub_model_id=args.hub_model_id if args.push_to_hub else None,
     )
 
