@@ -29,6 +29,10 @@ ORCASOUND_S3_BUCKET = "audio-orcasound-net"
 
 NEGATIVE_LABELS = {"other", "water", "vessel", "jingle", "human"}
 
+PODSAI_MODEL_ID = "davethaler/whale-call-detector"
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+PODSAI_MODEL_REVISION = "adb2da7fd0e67b9075b699648f578ff880f45c2c"
+
 
 # TODO: get this data from https://live.orcasound.net/api/json/feeds.
 source_guid_to_location = {
@@ -248,7 +252,8 @@ def setup_logger(connection_string: Optional[str], log_level: str = "DEBUG") -> 
 
 def load_model(orch_config: dict[str, Any], logger: logging.Logger) -> Any:
     """Load PODS-AI model using the model_inference factory."""
-    model_path = orch_config.get("model_hf_repo_id", "davethaler/whale-call-detector")
+    model_path = orch_config.get("model_hf_repo_id", PODSAI_MODEL_ID)
+    model_revision = orch_config.get("model_hf_repo_revision", PODSAI_MODEL_REVISION)
     threshold = float(orch_config.get("threshold", 0.5))
     min_num_positive_calls_threshold = int(
         orch_config.get("min_num_positive_calls_threshold", 3)
@@ -258,6 +263,7 @@ def load_model(orch_config: dict[str, Any], logger: logging.Logger) -> Any:
     kwargs: dict[str, Any] = {
         "threshold": threshold,
         "min_num_positive_calls_threshold": min_num_positive_calls_threshold,
+        "model_revision": model_revision,
     }
     if device:
         kwargs["device"] = device
@@ -572,7 +578,7 @@ def main() -> int:
     )
     logger = setup_logger(app_insights_connection_string, log_level=args.log_level)
 
-    model_id = orch_config.get("model_id", orch_config.get("model_hf_repo_id", "davethaler/whale-call-detector"))
+    model_id = orch_config.get("model_id", orch_config.get("model_hf_repo_id", PODSAI_MODEL_ID))
     model = load_model(orch_config, logger)
 
     blob_service_client, cosmos_client = setup_azure_clients(orch_config)

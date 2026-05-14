@@ -34,7 +34,8 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
     """
 
     def __init__(self, model_path: str, device: Optional[str] = None,
-                 threshold: float = 0.5, min_num_positive_calls_threshold: int = 3) -> None:
+                 threshold: float = 0.5, min_num_positive_calls_threshold: int = 3,
+                 model_revision: Optional[str] = None) -> None:
         """
         Initialize the inference model.
 
@@ -48,6 +49,8 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
                                              is capped at min_num_positive_calls_threshold. Formula:
                                              min(ceil(segments/10), min_num_positive_calls_threshold).
                                              Default: use instance value (typically 3).
+            model_revision: Git commit hash or tag to pin the HuggingFace Hub model revision.
+                           Ignored when model_path is a local directory. (default: None)
         """
         super().__init__(model_path)  # Call parent constructor
         self.threshold = threshold
@@ -59,19 +62,29 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         else:
             self.device = device
 
-        print(f"Loading PODS-AI model from {model_path}...")
+        revision_info = f" @ {model_revision}" if model_revision else ""
+        print(f"Loading PODS-AI model from {model_path}{revision_info}...")
         print(f"Using device: {self.device}")
+
+        # Build kwargs for from_pretrained; only pass revision for Hub IDs (not local paths).
+        pretrained_kwargs: dict = {}
+        if model_revision and not Path(model_path).exists():
+            pretrained_kwargs["revision"] = model_revision
 
         # Load feature extractor and model.
         try:
-            self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
+            self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+                model_path, **pretrained_kwargs
+            )
         except Exception as e:
             error_msg = f"Error loading feature extractor from {model_path}: {type(e).__name__}: {e}"
             print(error_msg)
             raise RuntimeError(error_msg) from e
 
         try:
-            self.model = Wav2Vec2ForSequenceClassification.from_pretrained(model_path)
+            self.model = Wav2Vec2ForSequenceClassification.from_pretrained(
+                model_path, **pretrained_kwargs
+            )
             self.model.to(self.device)
             self.model.eval()
         except Exception as e:
@@ -463,7 +476,8 @@ def get_podsai_inference(model_path: str, **kwargs) -> PodsAIInference:
 
     Args:
         model_path: Path to model directory or HuggingFace Hub model ID
-        **kwargs: Additional arguments passed to PodsAIInference
+        **kwargs: Additional arguments passed to PodsAIInference, e.g.
+                  model_revision (str): pinned git commit hash for Hub models.
 
     Returns:
         PodsAIInference instance

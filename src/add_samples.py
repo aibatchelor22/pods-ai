@@ -69,6 +69,8 @@ SEGMENT_DURATION = 3  # Duration of each segment in seconds.
 HOP_DURATION = 2  # Hop size between segments in seconds.
 DEFAULT_OUTPUT_DIR = "new"  # Default output directory for segments.
 DEFAULT_MODEL_PATH = "davethaler/whale-call-detector"  # Default HuggingFace model ID.
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+DEFAULT_MODEL_REVISION = "adb2da7fd0e67b9075b699648f578ff880f45c2c"  # Pinned Hub model revision.
 DEFAULT_DETECTIONS_CSV = "output/csv/detections.csv"  # Default path to detections.csv
 PACIFIC_TZ = timezone("US/Pacific")  # Pacific timezone for timestamp formatting.
 UTC_TZ = timezone("UTC")  # UTC timezone for URI generation.
@@ -463,6 +465,7 @@ def add_samples(
     base_timestamp: Optional[str] = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
     model_path: str = DEFAULT_MODEL_PATH,
+    model_revision: Optional[str] = DEFAULT_MODEL_REVISION,
     detections_csv: str = DEFAULT_DETECTIONS_CSV,
     model: Optional[object] = None,
     corrected_class: Optional[str] = None,
@@ -496,7 +499,9 @@ def add_samples(
             Inferred from wav_file filename or uri if not provided.
         output_dir: Directory to save segments (default: "new").
         model_path: HuggingFace Hub model ID or path to a local model directory
-            (default: "davethaler/whale-call-detector").
+            (default: DEFAULT_MODEL_PATH).
+        model_revision: Git commit hash to pin the HuggingFace Hub model revision.
+            Ignored when model_path is a local directory (default: DEFAULT_MODEL_REVISION).
         detections_csv: Path to detections.csv for detection lookup (default: "output/csv/detections.csv").
         model: Optional preloaded PODS-AI inference model to reuse instead of
             loading from model_path.
@@ -581,7 +586,8 @@ def add_samples(
     # Load the model once and run inference on each segment.
     if model is None:
         print(f"\nLoading podsai model from {model_path}...")
-        model = get_model_inference(model_type="podsai", model_path=model_path)
+        model = get_model_inference(model_type="podsai", model_path=model_path,
+                                    model_revision=model_revision)
 
     results: list[dict] = []
     print("\nSegments in manual_samples.csv format:")
@@ -691,6 +697,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--model-revision",
+        default=DEFAULT_MODEL_REVISION,
+        help=(
+            "Git commit hash to pin the HuggingFace Hub model revision. "
+            "Only used when --model-path is a Hub model ID. "
+            f"Defaults to the pinned revision ({DEFAULT_MODEL_REVISION})."
+        ),
+    )
+    parser.add_argument(
         "--detections-csv",
         default=DEFAULT_DETECTIONS_CSV,
         help=(
@@ -731,6 +746,7 @@ def main() -> int:
             base_timestamp=args.timestamp,
             output_dir=args.output_dir,
             model_path=args.model_path,
+            model_revision=args.model_revision,
             detections_csv=args.detections_csv,
             corrected_class=args.corrected_class,
         )

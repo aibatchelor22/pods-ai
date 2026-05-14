@@ -374,7 +374,7 @@ class TestRunInferencePodsAI:
         try:
             mock_model = _make_podsai_model_mock()
             with patch("run_inference.get_model_inference", return_value=mock_model) as mock_factory:
-                from run_inference import run_inference
+                from run_inference import run_inference, PODSAI_MODEL_ID, PODSAI_MODEL_REVISION
                 run_inference(wav_path, model_type="podsai", model_path=None)
 
             mock_factory.assert_called_once()
@@ -382,7 +382,8 @@ class TestRunInferencePodsAI:
             model_path_arg = call_kwargs.kwargs.get("model_path") or (
                 call_kwargs.args[0] if call_kwargs.args else None
             )
-            assert model_path_arg == "davethaler/whale-call-detector"
+            assert model_path_arg == PODSAI_MODEL_ID
+            assert call_kwargs.kwargs.get("model_revision") == PODSAI_MODEL_REVISION
         finally:
             Path(wav_path).unlink(missing_ok=True)
 

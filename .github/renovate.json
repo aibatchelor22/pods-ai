@@ -16,11 +16,27 @@
       "depNameTemplate": "https://huggingface.co/davethaler/whale-call-detector",
       "datasourceTemplate": "git-refs",
       "versioningTemplate": "git"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^src/run_inference\\.py$",
+        "^src/compare_models\\.py$",
+        "^src/add_samples\\.py$",
+        "^src/LiveInferenceOrchestrator\\.py$"
+      ],
+      "matchStrings": [
+        "PODSAI_MODEL_REVISION = \"(?<currentValue>[a-f0-9]{7,64})\"",
+        "DEFAULT_MODEL_REVISION = \"(?<currentValue>[a-f0-9]{7,64})\""
+      ],
+      "depNameTemplate": "https://huggingface.co/davethaler/whale-call-detector",
+      "datasourceTemplate": "git-refs",
+      "versioningTemplate": "git"
     }
   ],
   "packageRules": [
     {
-      "description": "Track pinned PODS-AI test model updates in the dependency dashboard issue.",
+      "description": "Track pinned PODS-AI model updates in the dependency dashboard issue.",
       "matchManagers": [
         "custom.regex"
       ],

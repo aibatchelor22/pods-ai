@@ -18,9 +18,14 @@ from typing import Optional
 
 from model_inference import get_model_inference
 
+PODSAI_MODEL_ID = "davethaler/whale-call-detector"
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+PODSAI_MODEL_REVISION = "adb2da7fd0e67b9075b699648f578ff880f45c2c"
+
 
 def run_inference(wav_path: str, model_type: str = "podsai",
-                  model_path: Optional[str] = None) -> dict:
+                  model_path: Optional[str] = None,
+                  model_revision: Optional[str] = None) -> dict:
     """
     Run inference on a wav file and return per-class probabilities.
 
@@ -30,7 +35,11 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         model_path: Path to the model directory or HuggingFace Hub model ID.
                     Required for podsai. Defaults to './model' for fastai,
                     'orcasound/orcahello-srkw-detector-v1' for orcahello,
-                    and 'davethaler/whale-call-detector' for podsai.
+                    and PODSAI_MODEL_ID for podsai.
+        model_revision: Git commit hash to pin the HuggingFace Hub model revision.
+                        Only used when model_path is a Hub model ID (not a local path).
+                        Defaults to PODSAI_MODEL_REVISION when model_path is the default
+                        PODS-AI Hub model.
 
     Returns:
         Dictionary with:
@@ -85,9 +94,12 @@ def run_inference(wav_path: str, model_type: str = "podsai",
 
     elif model_type == "podsai":
         if model_path is None:
-            model_path = "davethaler/whale-call-detector"
+            model_path = PODSAI_MODEL_ID
+            if model_revision is None:
+                model_revision = PODSAI_MODEL_REVISION
 
-        model = get_model_inference(model_type="podsai", model_path=model_path)
+        model = get_model_inference(model_type="podsai", model_path=model_path,
+                                    model_revision=model_revision)
 
         start_time = time.perf_counter()
         result = model.predict(wav_path)
@@ -161,8 +173,18 @@ def main() -> int:
             "Path to model directory or HuggingFace Hub model ID. "
             "Required for --model podsai. "
             "Defaults to ./model for --model fastai. "
-            "Defaults to orcasound/orcahello-srkw-detector-v1 for --model orcahello."
-            "Defaults to davethaler/whale-call-detector for --model podsai."
+            "Defaults to orcasound/orcahello-srkw-detector-v1 for --model orcahello. "
+            f"Defaults to {PODSAI_MODEL_ID!r} for --model podsai."
+        ),
+    )
+    parser.add_argument(
+        "--model-revision",
+        default=None,
+        help=(
+            "Git commit hash to pin the HuggingFace Hub model revision. "
+            "Only used when --model-path is a Hub model ID. "
+            f"Defaults to the pinned revision ({PODSAI_MODEL_REVISION}) when using "
+            f"the default PODS-AI model ({PODSAI_MODEL_ID!r})."
         ),
     )
 
@@ -173,7 +195,8 @@ def main() -> int:
         return 1
 
     try:
-        results = run_inference(wav_path, model_type=args.model, model_path=args.model_path)
+        results = run_inference(wav_path, model_type=args.model, model_path=args.model_path,
+                                model_revision=args.model_revision)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

@@ -941,7 +941,7 @@ class TestConfusionMatrix:
             wav.parent.mkdir(parents=True, exist_ok=True)
             wav.touch()
 
-        def fake_infer(wav_path, model_type, model_path):
+        def fake_infer(wav_path, model_type, model_path, model_revision=None):
             if "humpback" in str(wav_path):
                 return {"global_prediction_label": "water", "global_confidence": 0.7, "predict_time": 1.0}
             return {"global_prediction_label": "resident", "global_confidence": 0.9, "predict_time": 1.0}

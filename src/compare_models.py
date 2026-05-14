@@ -30,6 +30,9 @@ from run_inference import run_inference
 
 RESIDENT_LABEL = "resident"
 MATRIX_CELL_PADDING = 2
+PODSAI_MODEL_ID = "davethaler/whale-call-detector"
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+PODSAI_MODEL_REVISION = "adb2da7fd0e67b9075b699648f578ff880f45c2c"
 
 
 @dataclass
@@ -179,6 +182,7 @@ def evaluate_model(
     model_path: Optional[str],
     samples: list[TestSample],
     wav_dir: Path,
+    model_revision: Optional[str] = None,
 ) -> ModelResult:
     """
     Run a model against all test samples and accumulate results.
@@ -188,6 +192,8 @@ def evaluate_model(
         model_path: Path to the model (or HuggingFace Hub model ID).
         samples: List of testing samples.
         wav_dir: Root directory containing testing WAV files.
+        model_revision: Git commit hash to pin the HuggingFace Hub model revision.
+                        Only used when model_path is a Hub model ID (not a local path).
 
     Returns:
         ModelResult with counts of correct, false positive, and false negative predictions,
@@ -208,7 +214,9 @@ def evaluate_model(
         expected_resident = (sample.category == RESIDENT_LABEL)
 
         try:
-            inference_result = run_inference(str(wav_path), model_type=model_type, model_path=model_path)
+            inference_result = run_inference(str(wav_path), model_type=model_type,
+                                             model_path=model_path,
+                                             model_revision=model_revision)
             predict_time = inference_result.get("predict_time", 0.0)
             result.predict_times.append(predict_time)
         except Exception as e:
@@ -390,10 +398,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--podsai-model-path",
-        default="davethaler/whale-call-detector",
+        default=PODSAI_MODEL_ID,
         help=(
             "Path to PODS-AI model directory or HuggingFace Hub ID. "
-            "Defaults to davethaler/whale-call-detector when not specified."
+            f"Defaults to {PODSAI_MODEL_ID!r} when not specified."
+        ),
+    )
+    parser.add_argument(
+        "--podsai-model-revision",
+        default=PODSAI_MODEL_REVISION,
+        help=(
+            "Git commit hash to pin the PODS-AI HuggingFace Hub model revision. "
+            "Only used when --podsai-model-path is a Hub model ID. "
+            f"Defaults to the pinned revision ({PODSAI_MODEL_REVISION})."
         ),
     )
     parser.add_argument(
@@ -450,6 +467,11 @@ def main() -> int:
         "orcahello": args.orcahello_model_path,
         "podsai": args.podsai_model_path,
     }
+    model_revisions: dict[str, Optional[str]] = {
+        "fastai": None,
+        "orcahello": None,
+        "podsai": args.podsai_model_revision,
+    }
 
     # Validate max_samples if specified.
     if args.max_samples is not None and args.max_samples <= 0:
@@ -482,6 +504,7 @@ def main() -> int:
             model_path=model_paths[model_type],
             samples=samples,
             wav_dir=wav_dir,
+            model_revision=model_revisions[model_type],
         )
         results.append(model_result)
         print()

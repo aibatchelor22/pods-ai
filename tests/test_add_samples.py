@@ -14,6 +14,7 @@ import pytest
 
 from add_samples import (
     DEFAULT_MODEL_PATH,
+    DEFAULT_MODEL_REVISION,
     DEFAULT_OUTPUT_DIR,
     HOP_DURATION,
     SEGMENT_DURATION,
@@ -440,7 +441,8 @@ class TestAddSamples:
             )
 
         mock_get_model.assert_called_once_with(
-            model_type="podsai", model_path=DEFAULT_MODEL_PATH
+            model_type="podsai", model_path=DEFAULT_MODEL_PATH,
+            model_revision=DEFAULT_MODEL_REVISION
         )
 
     def test_uses_fallback_description_when_detection_missing(self, tmp_path):
