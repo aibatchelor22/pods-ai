@@ -45,6 +45,7 @@ def process_false_negatives(
     detections_csv: str = DEFAULT_DETECTIONS_CSV,
     orcahello_model_path: str = DEFAULT_ORCAHELLO_MODEL_PATH,
     feed_filter: Optional[str] = None,
+    predicted_category_filter: Optional[str] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
 ) -> dict[str, int]:
@@ -59,6 +60,9 @@ def process_false_negatives(
         "appended": 0,
         "duplicates": 0,
     }
+    normalized_category_filter = (
+        predicted_category_filter.strip().lower() if predicted_category_filter else None
+    )
     feeds = get_orcasite_feeds_with_retry()
     if not feeds:
         print("No Orcasite feeds available; nothing to process.")
@@ -102,7 +106,12 @@ def process_false_negatives(
 
                 try:
                     full_inference = podsai_model.predict(wav_path)
-                    if full_inference.get("global_prediction_label") == "resident":
+                    full_prediction_label = str(
+                        full_inference.get("global_prediction_label", "")
+                    ).strip().lower()
+                    if normalized_category_filter and full_prediction_label != normalized_category_filter:
+                        continue
+                    if full_prediction_label == "resident":
                         print(
                             f"Skipping {feed.node_name} {timestamp_str}: "
                             "PODS-AI global prediction is resident."
@@ -234,6 +243,13 @@ def main() -> int:
         default=DEFAULT_DETECTIONS_CSV,
         help="Path to detections.csv for add_samples.py metadata lookups.",
     )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        metavar="CATEGORY",
+        help="Process only detections whose PODS-AI predicted category matches this value.",
+    )
     args = parser.parse_args()
 
     start_time = parse_pst_timestamp(args.start) if args.start else None
@@ -246,6 +262,7 @@ def main() -> int:
         detections_csv=args.detections_csv,
         orcahello_model_path=args.orcahello_model_path,
         feed_filter=args.feed,
+        predicted_category_filter=args.category,
         start_time=start_time,
         end_time=end_time,
     )

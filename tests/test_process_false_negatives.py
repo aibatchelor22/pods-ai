@@ -245,3 +245,79 @@ class TestProcessFalseNegatives:
         assert summary["appended"] == 0
         mock_add_samples.assert_not_called()
         orcahello_model.predict.assert_not_called()
+
+    def test_filters_by_predicted_category_before_segment_processing(self, tmp_path):
+        """A predicted-category filter should skip non-matching detections after inference."""
+        feed = _make_feed()
+        matching_detection = OrcaHelloDetection(
+            id="det_1",
+            feed=feed,
+            timestamp=datetime(2025, 1, 1, 12, 5, 0, tzinfo=timezone.utc),
+            status="confirmed",
+            comments="",
+        )
+        non_matching_detection = OrcaHelloDetection(
+            id="det_2",
+            feed=feed,
+            timestamp=datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+            status="confirmed",
+            comments="",
+        )
+        wav_path = tmp_path / "input.wav"
+        wav_path.write_bytes(b"wav")
+        segment_dir = tmp_path / "segments"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        manual_samples_path = tmp_path / "manual_samples.csv"
+
+        segment_timestamp = "2025_01_01_04_05_02_PST"
+        (segment_dir / f"rpi-test_{segment_timestamp}.wav").write_bytes(b"segment")
+
+        podsai_model = Mock()
+        podsai_model.predict.side_effect = [
+            {"global_prediction_label": "WATER", "global_confidence": 0.9},
+            {"global_prediction_label": "transient", "global_confidence": 0.9},
+        ]
+
+        orcahello_model = Mock()
+        orcahello_model.predict.return_value = {
+            "global_prediction_label": "resident",
+            "global_confidence": 0.9,
+        }
+
+        def _get_model(*args, **kwargs):
+            return podsai_model if kwargs.get("model_type") == "podsai" else orcahello_model
+
+        with patch("process_false_negatives.get_model_inference", side_effect=_get_model), \
+             patch("process_false_negatives.get_orcasite_feeds_with_retry", return_value=[feed]), \
+             patch(
+                 "process_false_negatives.get_orcahello_detections",
+                 return_value=[matching_detection, non_matching_detection],
+             ), \
+             patch("process_false_negatives.download_60s_audio", return_value=str(wav_path)), \
+             patch(
+                 "process_false_negatives.add_samples",
+                 return_value=[
+                     {
+                         "Category": "transient",
+                         "NodeName": "rpi_test",
+                         "Timestamp": segment_timestamp,
+                         "URI": "https://example.com/new",
+                         "Description": "desc",
+                         "Notes": "manual",
+                         "Confidence": "91.0",
+                     },
+                 ],
+             ) as mock_add_samples:
+            summary = process_false_negatives(
+                manual_samples_path=manual_samples_path,
+                output_dir=segment_dir,
+                predicted_category_filter="water",
+            )
+
+        assert summary["confirmed"] == 2
+        assert summary["mismatched_segments"] == 1
+        assert summary["appended"] == 1
+        assert podsai_model.predict.call_count == 2
+        assert orcahello_model.predict.call_count == 1
+        assert mock_add_samples.call_count == 1
+        assert mock_add_samples.call_args.kwargs["base_timestamp"] == "2025_01_01_04_05_00_PST"

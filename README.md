@@ -211,7 +211,9 @@ Key dependencies:
 - **process_false_negatives.py**: Re-checks confirmed OrcaHello detections by
   downloading the 60-second WAV, re-running PODS-AI and OrcaHello segment inference,
   and appending segments where OrcaHello predicts resident but PODS-AI does not to
-  `output/csv/manual_samples.csv` with corrected class `resident`.
+  `output/csv/manual_samples.csv` with corrected class `resident`. Supports
+  `--category CATEGORY` to process only detections whose PODS-AI predicted category
+  matches the provided value.
 - **run_inference.py**: Runs a model on a wav file and prints the global prediction,
   confidence, and per-class probabilities.
 - **LiveInferenceOrchestrator.py**: Runs live/date-range HLS inference with the multiclass
