@@ -32,7 +32,7 @@ RESIDENT_LABEL = "resident"
 MATRIX_CELL_PADDING = 2
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_MODEL_REVISION = "adb2da7fd0e67b9075b699648f578ff880f45c2c"
+PODSAI_MODEL_REVISION = "f3ece5f8060891831c04014a40097507c2f324b1"
 
 
 @dataclass
