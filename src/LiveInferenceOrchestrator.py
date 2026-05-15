@@ -494,6 +494,15 @@ def run_loop(
         end_dt = datetime.strptime(hls_end_time_pst, "%Y-%m-%d %H:%M")
         end_unix = int(pytz_tz("US/Pacific").localize(end_dt).timestamp())
 
+        logger.debug(
+            f"DateRange: start_unix={start_unix}, end_unix={end_unix}, "
+            f"start_pst={hls_start_time_pst}, end_pst={hls_end_time_pst}"
+        )
+        logger.info(
+            f"Fetching DateRange segments: start_unix={start_unix}, "
+            f"end_unix={end_unix}, segment_size={segment_size}"
+        )
+
         segments = orcasound_client.get_segments(
             start_unix=start_unix,
             end_unix=end_unix,
@@ -501,6 +510,8 @@ def run_loop(
         )
         if max_segments is not None:
             segments = segments[:max_segments]
+
+        logger.info(f"Got {len(segments)} segments from date range")
 
         for segment in segments:
             _process_segment(
@@ -528,10 +539,20 @@ def run_loop(
             end_unix = now - live_delay_buffer
             start_unix = end_unix - segment_size
 
+            logger.info(
+                f"--- [iter {live_iteration_count}] LiveHLS poll: fetching segments in "
+                f"[{start_unix:.0f}, {end_unix:.0f}] "
+                f"(now={now:.0f}, delay={live_delay_buffer}s)"
+            )
+
             segments = orcasound_client.get_segments(
                 start_unix=start_unix,
                 end_unix=end_unix,
                 segment_size=segment_size,
+            )
+
+            logger.info(
+                f"[iter {live_iteration_count}] LiveHLS poll: got {len(segments)} segments"
             )
 
             for segment in segments:
@@ -551,6 +572,10 @@ def run_loop(
                 break
 
             sleep_time = _next_aligned_time(now, segment_size) - time.time()
+            logger.debug(
+                f"Sleeping for {sleep_time:.1f}s until "
+                f"{_next_aligned_time(now, segment_size):.0f}"
+            )
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
