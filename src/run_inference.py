@@ -13,6 +13,7 @@ Usage:
 import argparse
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +22,37 @@ from model_inference import get_model_inference
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
 PODSAI_MODEL_REVISION = "f3ece5f8060891831c04014a40097507c2f324b1"
+PROPOSED_DESCRIPTION_EXTRA_CLASSES = {"vessel", "human", "jingle"}
+
+
+def _build_proposed_description(
+    global_prediction_label: str,
+    local_prediction_labels: list[str],
+) -> str:
+    """Build a proposed description string from global and local predictions.
+
+    Args:
+        global_prediction_label: Predicted class label for the whole file.
+        local_prediction_labels: Segment-level predicted class labels.
+
+    Returns:
+        Proposed description text beginning with "AI:" and optionally appending
+        a dominant non-whale context class from {"vessel", "human", "jingle"}.
+    """
+    proposed_description = f"AI: {global_prediction_label}"
+    if not local_prediction_labels:
+        return proposed_description
+
+    most_common = Counter(local_prediction_labels).most_common(1)
+    if not most_common:
+        return proposed_description
+    most_common_label, _ = most_common[0]
+    if (
+        most_common_label in PROPOSED_DESCRIPTION_EXTRA_CLASSES
+        and most_common_label != global_prediction_label
+    ):
+        proposed_description = f"{proposed_description} and {most_common_label}"
+    return proposed_description
 
 
 def run_inference(wav_path: str, model_type: str = "podsai",
@@ -48,6 +80,7 @@ def run_inference(wav_path: str, model_type: str = "podsai",
               that class and whose confidence exceeds the model's threshold.
             - global_prediction_label: predicted class label for the whole file
             - global_confidence: confidence score (0.0-1.0) for the global prediction
+            - proposed_description: text description suitable for manual sample notes
             - predict_time: time in seconds spent in the model's predict() method
     """
 
@@ -67,6 +100,10 @@ def run_inference(wav_path: str, model_type: str = "podsai",
             "other": other_prob,
             "resident": round(resident_prob, 4),
         }
+        local_prediction_labels = [
+            "resident" if int(local_prediction) == 1 else "other"
+            for local_prediction in result.get("local_predictions", [])
+        ]
         global_prediction = result.get("global_prediction", 0)
         global_prediction_label = "resident" if global_prediction else "other"
         global_confidence = resident_prob
@@ -88,6 +125,10 @@ def run_inference(wav_path: str, model_type: str = "podsai",
             "other": other_prob,
             "resident": round(resident_prob, 4),
         }
+        local_prediction_labels = [
+            "resident" if int(local_prediction) == 1 else "other"
+            for local_prediction in result.get("local_predictions", [])
+        ]
         global_prediction = result.get("global_prediction", 0)
         global_prediction_label = "resident" if global_prediction else "other"
         global_confidence = resident_prob
@@ -106,6 +147,14 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         predict_time = time.perf_counter() - start_time
 
         probabilities = result["per_class_probabilities"]
+        local_prediction_labels = []
+        for local_prediction in result.get("local_predictions", []):
+            if isinstance(local_prediction, str):
+                local_prediction_labels.append(local_prediction)
+            else:
+                label = getattr(model, "id2label", {}).get(local_prediction)
+                if isinstance(label, str):
+                    local_prediction_labels.append(label)
         global_prediction_label = result.get("global_prediction_label", "")
         global_confidence = float(result.get("global_confidence", 0.0))
 
@@ -114,10 +163,13 @@ def run_inference(wav_path: str, model_type: str = "podsai",
             f"Unknown model type: {model_type!r}. Use 'podsai', 'fastai', or 'orcahello'."
         )
 
+    proposed_description = _build_proposed_description(global_prediction_label, local_prediction_labels)
+
     return {
         "probabilities": probabilities,
         "global_prediction_label": global_prediction_label,
         "global_confidence": global_confidence,
+        "proposed_description": proposed_description,
         "predict_time": predict_time,
     }
 
@@ -132,10 +184,12 @@ def print_results(results: dict, model_type: str) -> None:
     probabilities = results["probabilities"]
     label = results["global_prediction_label"]
     confidence = results["global_confidence"]
+    proposed_description = results["proposed_description"]
     predict_time = results.get("predict_time", 0.0)
 
     print(f"Model type: {model_type}")
     print(f"Global prediction: {label} (confidence: {confidence:.4f})")
+    print(f"Proposed description: {proposed_description}")
     print(f"Prediction time: {predict_time:.2f}s")
     print()
     print("Per-class probabilities:")
