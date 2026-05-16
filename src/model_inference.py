@@ -555,7 +555,7 @@ def get_model_inference(model_path: Optional[str] = None, model_type: str = "fas
         model_path: Optional path to the model file or directory.
         model_type: Type of model to use. Supports:
             - "fastai": FastAI model from aifororcas-livesystem (default)
-            - "podsai": PODS-AI Wav2Vec2 model for multi-class classification
+            - "podsai": PODS-AI multi-class audio model (supports spectrogram-based checkpoints)
             - "orcahello": OrcaHello SRKW detector (orcasound/orcahello-srkw-detector-v1)
             - "dummy": DummyModelInference for testing
         auto_download: If True and model_type is "fastai", automatically download model if not found
@@ -660,7 +660,7 @@ def get_model_inference(model_path: Optional[str] = None, model_type: str = "fas
         raise ValueError(
             f"Unknown model type: {model_type}. "
             f"Supported types: 'dummy' (for testing), 'fastai' (for production), "
-            f"'podsai' (for PODS-AI Wav2Vec2 models), "
+            f"'podsai' (for PODS-AI audio-classification models), "
             f"'orcahello' (for OrcaHello SRKW detector). "
             f"For production use with FastAI model, set MODEL_TYPE=fastai and ensure model is available."
         )

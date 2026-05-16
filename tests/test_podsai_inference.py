@@ -119,8 +119,8 @@ def synthetic_audio_60s():
 class TestPodsAIInferenceIndexing:
     """Test indexing semantics for timestamp correction."""
 
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_output_length_with_hop_duration_2(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model, synthetic_audio_60s
@@ -144,8 +144,8 @@ class TestPodsAIInferenceIndexing:
         # For timestamp correction to work as documented, extract_training_samples.py
         # must infer hop_duration = audio_duration / len(local_confidences).
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_output_length_with_hop_duration_1(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model, synthetic_audio_60s
@@ -165,8 +165,8 @@ class TestPodsAIInferenceIndexing:
         
         # With 1-second hop, local_confidences[i] ≈ second i (close to FastAI behavior).
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_index_to_time_mapping(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model, synthetic_audio_60s
@@ -201,8 +201,8 @@ class TestPodsAIInferenceIndexing:
                 assert expected_time < audio_duration + hop_duration, \
                     f"Index {i} maps to {expected_time}s, beyond audio duration {audio_duration}s"
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_short_audio_handling(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model
@@ -233,8 +233,8 @@ class TestPodsAIInferenceIndexing:
         finally:
             Path(audio_path).unlink(missing_ok=True)
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_exact_multiple_of_hop_duration(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model
@@ -267,8 +267,8 @@ class TestPodsAIInferenceIndexing:
         finally:
             Path(audio_path).unlink(missing_ok=True)
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_output_format_compatibility(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model, synthetic_audio_60s
@@ -310,8 +310,8 @@ class TestPodsAIInferenceIndexing:
         assert result["hop_duration"] == 2.0
         assert result["segment_duration"] == 3.0
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_empty_audio_handling(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model
@@ -347,8 +347,8 @@ class TestPodsAIInferenceIndexing:
         finally:
             Path(audio_path).unlink(missing_ok=True)
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_call_likelihood_computation(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, synthetic_audio_60s
@@ -406,8 +406,8 @@ class TestPodsAIInferenceIndexing:
 class TestPodsAIInferenceErrorHandling:
     """Test error handling in PodsAIInference."""
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_invalid_audio_file(
         self, mock_extractor_class, mock_model_class,
         mock_feature_extractor, mock_podsai_model
@@ -432,8 +432,8 @@ class TestPodsAIInferenceErrorHandling:
         assert result["hop_duration"] == 2.0
         assert result["segment_duration"] == 3.0
     
-    @patch('podsai_inference.Wav2Vec2ForSequenceClassification')
-    @patch('podsai_inference.Wav2Vec2FeatureExtractor')
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
     def test_model_missing_negative_class(
         self, mock_extractor_class, mock_model_class
     ):

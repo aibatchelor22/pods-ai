@@ -26,7 +26,7 @@ The `src` directory has the following scripts for different steps meant to be ru
    - Testing samples are written to subdirectories under `output/testing-wav`
    - For testing samples, all rows download 60-second wav files (`tp_human_only` uses the row timestamp; others are centered on the row timestamp)
 6. **make_spectrograms.py**: Create a png file for each wav file in a subdirectory of `output/png`
-7. **train_podsai_model.py**: A script to train a PODS-AI model on the generated training samples.
+7. **train_podsai_model.py**: A script to train a PODS-AI model on the generated training samples. By default it now fine-tunes a spectrogram-based HuggingFace audio classifier (`MIT/ast-finetuned-audioset-10-10-0.4593`).
 
 ```mermaid
 flowchart TD;

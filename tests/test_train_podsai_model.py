@@ -28,8 +28,8 @@ def _import_stubbed_train_module(monkeypatch):
     fake_datasets.ClassLabel = object
 
     fake_transformers = types.ModuleType("transformers")
-    fake_transformers.Wav2Vec2FeatureExtractor = object
-    fake_transformers.Wav2Vec2ForSequenceClassification = object
+    fake_transformers.AutoFeatureExtractor = object
+    fake_transformers.AutoModelForAudioClassification = object
     fake_transformers.TrainingArguments = object
     fake_transformers.Trainer = object
 
@@ -121,6 +121,110 @@ def _patch_metrics(module):
     module.F1_METRIC = _FakeMetric("f1")
 
 
+def test_default_training_model_uses_spectrogram_checkpoint(monkeypatch, tmp_path):
+    """Training should default to the spectrogram-based AST checkpoint."""
+    module = _import_stubbed_train_module(monkeypatch)
+
+    captured = {}
+
+    class _FakeFeatureExtractor:
+        @classmethod
+        def from_pretrained(cls, model_name):
+            captured["feature_extractor_model_name"] = model_name
+            return cls()
+
+        def save_pretrained(self, _output_dir):
+            return None
+
+        def __call__(self, processed_audio, **_kwargs):
+            return {"input_values": processed_audio}
+
+    class _FakeModel:
+        @classmethod
+        def from_pretrained(cls, model_name, **kwargs):
+            captured["model_name"] = model_name
+            captured["model_kwargs"] = kwargs
+            return cls()
+
+    class _FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            captured["training_args"] = kwargs
+
+    class _FakeTrainer:
+        def __init__(self, model, args, train_dataset, eval_dataset, compute_metrics):
+            self.model = model
+            self.args = args
+            self.train_dataset = train_dataset
+            self.eval_dataset = eval_dataset
+            self.compute_metrics = compute_metrics
+
+        def train(self, resume_from_checkpoint=None):
+            return resume_from_checkpoint
+
+        def evaluate(self):
+            return {"f1": 1.0}
+
+        def save_model(self, _output_dir):
+            return None
+
+    class _FakeDatasetDict(dict):
+        def map(self, _func, batched, remove_columns):
+            assert batched is True
+            assert remove_columns == ["audio"]
+            return self
+
+    fake_dataset = _FakeDatasetDict(train=[{"label": 0}], test=[{"label": 0}])
+
+    monkeypatch.setattr(module, "setup_label_mappings", lambda _num_classes: None)
+    monkeypatch.setattr(module, "load_audio_dataset", lambda _data_dir, _num_classes: fake_dataset)
+    monkeypatch.setattr(module, "analyze_dataset", lambda _dataset: None)
+    monkeypatch.setattr(module, "AutoFeatureExtractor", _FakeFeatureExtractor)
+    monkeypatch.setattr(module, "AutoModelForAudioClassification", _FakeModel)
+    monkeypatch.setattr(module, "TrainingArguments", _FakeTrainingArguments)
+    monkeypatch.setattr(module, "Trainer", _FakeTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_podsai_model.py",
+            "--output_dir",
+            str(tmp_path / "model"),
+        ],
+    )
+
+    module.main()
+
+    assert captured["feature_extractor_model_name"] == "MIT/ast-finetuned-audioset-10-10-0.4593"
+    assert captured["model_name"] == "MIT/ast-finetuned-audioset-10-10-0.4593"
+
+
+def test_preprocess_function_normalizes_audio_length_before_extractor(monkeypatch):
+    """preprocess_function should pad/truncate clips before calling the extractor."""
+    module = _import_stubbed_train_module(monkeypatch)
+
+    captured = {}
+
+    class _CapturingFeatureExtractor:
+        def __call__(self, processed_audio, **kwargs):
+            captured["processed_audio"] = processed_audio
+            captured["kwargs"] = kwargs
+            return {"input_values": processed_audio}
+
+    examples = {
+        "audio": [
+            {"array": np.ones(16000, dtype=np.float32)},
+            {"array": np.ones(64000, dtype=np.float32)},
+        ],
+        "label": [0, 1],
+    }
+
+    result = module.preprocess_function(examples, _CapturingFeatureExtractor(), max_duration=3.0)
+
+    assert all(len(audio) == 48000 for audio in captured["processed_audio"])
+    assert captured["kwargs"] == {"sampling_rate": 16000, "padding": True}
+    assert result["labels"] == [0, 1]
+
+
 def test_push_to_hub_uses_last_six_checkpoints(monkeypatch, tmp_path):
     """Hub uploads should retain and publish the last 6 epoch checkpoints."""
     module = _import_stubbed_train_module(monkeypatch)
@@ -178,8 +282,8 @@ def test_push_to_hub_uses_last_six_checkpoints(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "setup_label_mappings", lambda _num_classes: None)
     monkeypatch.setattr(module, "load_audio_dataset", lambda _data_dir, _num_classes: fake_dataset)
     monkeypatch.setattr(module, "analyze_dataset", lambda _dataset: None)
-    monkeypatch.setattr(module, "Wav2Vec2FeatureExtractor", _FakeFeatureExtractor)
-    monkeypatch.setattr(module, "Wav2Vec2ForSequenceClassification", _FakeModel)
+    monkeypatch.setattr(module, "AutoFeatureExtractor", _FakeFeatureExtractor)
+    monkeypatch.setattr(module, "AutoModelForAudioClassification", _FakeModel)
     monkeypatch.setattr(module, "TrainingArguments", _FakeTrainingArguments)
     monkeypatch.setattr(module, "Trainer", _FakeTrainer)
     monkeypatch.setattr(

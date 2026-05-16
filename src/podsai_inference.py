@@ -4,8 +4,10 @@
 """
 PODS-AI model inference wrapper for orca call detection.
 
-This module provides a wrapper around Wav2Vec2 audio classification models
+This module provides a wrapper around HuggingFace audio classification models
 that implements the interface expected by PODS-AI's model_inference system.
+The default training path now targets spectrogram-based architectures such as
+AST, while inference remains compatible with existing PODS-AI checkpoints.
 """
 
 import torch
@@ -13,7 +15,7 @@ import librosa
 import numpy as np
 from collections import Counter
 from typing import Optional
-from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
+from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 from pathlib import Path
 from datetime import datetime
 
@@ -73,7 +75,7 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
 
         # Load feature extractor and model.
         try:
-            self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
+            self.feature_extractor = AutoFeatureExtractor.from_pretrained(
                 model_path, **pretrained_kwargs
             )
         except Exception as e:
@@ -82,7 +84,7 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
             raise RuntimeError(error_msg) from e
 
         try:
-            self.model = Wav2Vec2ForSequenceClassification.from_pretrained(
+            self.model = AutoModelForAudioClassification.from_pretrained(
                 model_path, **pretrained_kwargs
             )
             self.model.to(self.device)
