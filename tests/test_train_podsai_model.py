@@ -196,6 +196,7 @@ def test_default_training_model_uses_spectrogram_checkpoint(monkeypatch, tmp_pat
 
     assert captured["feature_extractor_model_name"] == "MIT/ast-finetuned-audioset-10-10-0.4593"
     assert captured["model_name"] == "MIT/ast-finetuned-audioset-10-10-0.4593"
+    assert captured["model_kwargs"]["ignore_mismatched_sizes"] is True
 
 
 def test_preprocess_function_normalizes_audio_length_before_extractor(monkeypatch):

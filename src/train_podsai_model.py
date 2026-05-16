@@ -468,6 +468,7 @@ def main() -> None:
             num_labels=len(LABEL2ID),
             label2id=LABEL2ID,
             id2label=ID2LABEL,
+            ignore_mismatched_sizes=True,
         )
     except Exception as e:
         error_msg = f"Error loading model from {args.model_name}: {type(e).__name__}: {e}"
