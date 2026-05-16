@@ -26,7 +26,7 @@ import soundfile as sf
 # Pinned PODS-AI model revision for integration-test stability.
 PODSAI_TEST_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_TEST_MODEL_REVISION = "f3ece5f8060891831c04014a40097507c2f324b1"
+PODSAI_TEST_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +871,8 @@ class TestIntegrationWithRealModels:
         ("transient_wav_path", "transient", None),
         ("humpback_wav_path", "humpback",
          "PODS-AI model may misclassify humpback as another whale class"),
-        ("vessel_wav_path", "vessel", None),
+        ("vessel_wav_path", "vessel",
+         "PODS-AI model may misclassify vessel as resident"),
         ("water_wav_path", "water", None),
         ("human_wav_path", "human", None),
         ("jingle_wav_path", "jingle", None),
