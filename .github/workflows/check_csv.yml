@@ -35,7 +35,9 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
-          egress-policy: audit
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
@@ -112,7 +114,23 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
-          egress-policy: audit
+          egress-policy: block
+          allowed-endpoints: >
+            *.archive.ubuntu.com:80
+            *.microsoft.com:443
+            aifororcasmetadatastore-westus2.documents.azure.com:443
+            aifororcasmetadatastore.documents.azure.com:443
+            api.github.com:443
+            archive.ubuntu.com:443
+            audio-orcasound-net.s3.amazonaws.com:443
+            dl.google.com:443
+            esm.ubuntu.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            live.orcasound.net:443
+            pypi.org:443
+            s3-us-west-2.amazonaws.com:443
+            trainedproductionmodels.blob.core.windows.net:443
 
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
@@ -183,7 +201,32 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
-          egress-policy: audit
+          egress-policy: block
+          allowed-endpoints: >
+            *.microsoft.com:443
+            *.microsoft.com:80
+            adl.windows.com:80
+            aifororcasmetadatastore-westus2.documents.azure.com:443
+            aifororcasmetadatastore.documents.azure.com:443
+            api.github.com:443
+            audio-orcasound-net.s3.amazonaws.com:443
+            client.wns.windows.com:443
+            community.chocolatey.org:443
+            dc.services.visualstudio.com:443
+            dns.msftncsi.com:443
+            ecs.office.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            incoming.telemetry.mozilla.org:443
+            live.orcasound.net:443
+            login.live.com:443
+            ocsp.digicert.com:80
+            ocsp.sectigo.com:80
+            packages.chocolatey.org:443
+            pypi.org:443
+            s3-us-west-2.amazonaws.com:443
+            telemetry-incoming.r53-2.services.mozilla.com:443
+            trainedproductionmodels.blob.core.windows.net:443
 
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
@@ -251,7 +294,19 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
-          egress-policy: audit
+          egress-policy: block
+          allowed-endpoints: >
+            *.archive.ubuntu.com:80
+            *.microsoft.com:443
+            api.github.com:443
+            audio-orcasound-net.s3.amazonaws.com:443
+            dl.google.com:443
+            esm.ubuntu.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            pypi.org:443
+            s3-us-west-2.amazonaws.com:443
+            trainedproductionmodels.blob.core.windows.net:443
 
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
@@ -305,7 +360,27 @@ jobs:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5  # v2.19.3
         with:
-          egress-policy: audit
+          egress-policy: block
+          allowed-endpoints: >
+            *.microsoft.com:443
+            *.microsoft.com:80
+            api.github.com:443
+            au.download.windowsupdate.com:80
+            audio-orcasound-net.s3.amazonaws.com:443
+            community.chocolatey.org:443
+            dc.services.visualstudio.com:443
+            download.windowsupdate.com:80
+            files.pythonhosted.org:443
+            github.com:443
+            incoming.telemetry.mozilla.org:443
+            login.live.com:443
+            ocsp.digicert.com:80
+            ocsp.sectigo.com:80
+            packages.chocolatey.org:443
+            pypi.org:443
+            s3-us-west-2.amazonaws.com:443
+            telemetry-incoming.r53-2.services.mozilla.com:443
+            trainedproductionmodels.blob.core.windows.net:443
 
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
