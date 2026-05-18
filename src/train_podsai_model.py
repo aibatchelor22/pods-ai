@@ -19,10 +19,13 @@ Usage:
 
 import argparse
 from collections import Counter
+from functools import partial
+import os
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+import torch
 
 # Configure datasets to use soundfile for audio decoding BEFORE importing datasets components.
 import datasets.config
@@ -66,6 +69,7 @@ F1_METRIC = evaluate.load("f1")
 # Whale classes for optimization in multi-class mode.
 WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
 CHECKPOINT_SAVE_LIMIT = 6
+DEFAULT_MAX_PREPROCESSING_WORKERS = 8
 
 
 class FeatureExtractorProtocol(Protocol):
@@ -235,6 +239,26 @@ def preprocess_function(examples: dict, feature_extractor: FeatureExtractorProto
     inputs["labels"] = examples["label"]
 
     return inputs
+
+
+def get_preprocessing_workers(dataset: DatasetDict, requested_workers: int) -> int:
+    """Determine a safe number of dataset preprocessing workers.
+
+    Args:
+        dataset: Dataset splits that will be preprocessed.
+        requested_workers: User-requested worker count.
+
+    Returns:
+        Effective worker count capped by the smallest dataset split.
+    """
+    if requested_workers < 1:
+        raise ValueError(f"preprocessing_workers must be at least 1, got {requested_workers}")
+
+    split_sizes = [len(split_dataset) for split_dataset in dataset.values()]
+    if not split_sizes:
+        return 1
+
+    return max(1, min(requested_workers, min(split_sizes)))
 
 
 def compute_metrics(eval_pred: EvalPrediction) -> dict:
@@ -419,6 +443,12 @@ def main() -> None:
         help="Learning rate (default: 3e-5)",
     )
     parser.add_argument(
+        "--preprocessing_workers",
+        type=int,
+        default=max(1, min(DEFAULT_MAX_PREPROCESSING_WORKERS, os.cpu_count() or 1)),
+        help="Number of parallel workers for AST feature preprocessing (default: min of 8 or available CPU cores)",
+    )
+    parser.add_argument(
         "--push_to_hub",
         action="store_true",
         help="Push trained model to HuggingFace Hub",
@@ -477,11 +507,17 @@ def main() -> None:
         raise RuntimeError(error_msg) from e
 
     # Preprocess dataset.
-    print("Preprocessing dataset...")
+    preprocessing_workers = get_preprocessing_workers(dataset, args.preprocessing_workers)
+    print(f"Preprocessing dataset with {preprocessing_workers} worker(s)...")
+    map_kwargs = {
+        "batched": True,
+        "remove_columns": ["audio"],
+    }
+    if preprocessing_workers > 1:
+        map_kwargs["num_proc"] = preprocessing_workers
     dataset = dataset.map(
-        lambda x: preprocess_function(x, feature_extractor),
-        batched=True,
-        remove_columns=["audio"],
+        partial(preprocess_function, feature_extractor=feature_extractor),
+        **map_kwargs,
     )
 
     # Training arguments.
@@ -496,6 +532,7 @@ def main() -> None:
         num_train_epochs=args.epochs,
         warmup_ratio=0.1,
         logging_steps=10,
+        fp16=torch.cuda.is_available(),
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         push_to_hub=args.push_to_hub,

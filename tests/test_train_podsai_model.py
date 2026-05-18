@@ -41,6 +41,14 @@ def _import_stubbed_train_module(monkeypatch):
     fake_transformers.EvalPrediction = _EvalPrediction
 
     fake_evaluate = types.ModuleType("evaluate")
+    fake_torch = types.ModuleType("torch")
+
+    class _FakeCuda:
+        @staticmethod
+        def is_available():
+            return False
+
+    fake_torch.cuda = _FakeCuda()
 
     class _DummyMetric:
         def __init__(self, key):
@@ -55,6 +63,7 @@ def _import_stubbed_train_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "datasets.config", fake_datasets_config)
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
     monkeypatch.setitem(sys.modules, "evaluate", fake_evaluate)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     sys.modules.pop("train_podsai_model", None)
     return importlib.import_module("train_podsai_model")
 
@@ -224,6 +233,169 @@ def test_preprocess_function_normalizes_audio_length_before_extractor(monkeypatc
     assert all(len(audio) == 48000 for audio in captured["processed_audio"])
     assert captured["kwargs"] == {"sampling_rate": 16000, "padding": True}
     assert result["labels"] == [0, 1]
+
+
+def test_preprocessing_workers_are_capped_by_smallest_split(monkeypatch, tmp_path):
+    """Dataset preprocessing should not request more workers than the smallest split size."""
+    module = _import_stubbed_train_module(monkeypatch)
+
+    captured = {}
+
+    class _FakeFeatureExtractor:
+        @classmethod
+        def from_pretrained(cls, _model_name):
+            return cls()
+
+        def save_pretrained(self, _output_dir):
+            return None
+
+        def __call__(self, processed_audio, **_kwargs):
+            return {"input_values": processed_audio}
+
+    class _FakeModel:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class _FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            captured["training_args"] = kwargs
+
+    class _FakeTrainer:
+        def __init__(self, model, args, train_dataset, eval_dataset, compute_metrics):
+            self.model = model
+            self.args = args
+            self.train_dataset = train_dataset
+            self.eval_dataset = eval_dataset
+            self.compute_metrics = compute_metrics
+
+        def train(self, resume_from_checkpoint=None):
+            return resume_from_checkpoint
+
+        def evaluate(self):
+            return {"f1": 1.0}
+
+        def save_model(self, _output_dir):
+            return None
+
+    class _FakeDatasetDict(dict):
+        def map(self, func, **kwargs):
+            assert callable(func)
+            captured["map_kwargs"] = kwargs
+            return self
+
+    fake_dataset = _FakeDatasetDict(
+        train=[{"label": 0}] * 8,
+        test=[{"label": 0}] * 2,
+    )
+
+    monkeypatch.setattr(module, "setup_label_mappings", lambda _num_classes: None)
+    monkeypatch.setattr(module, "load_audio_dataset", lambda _data_dir, _num_classes: fake_dataset)
+    monkeypatch.setattr(module, "analyze_dataset", lambda _dataset: None)
+    monkeypatch.setattr(module, "AutoFeatureExtractor", _FakeFeatureExtractor)
+    monkeypatch.setattr(module, "AutoModelForAudioClassification", _FakeModel)
+    monkeypatch.setattr(module, "TrainingArguments", _FakeTrainingArguments)
+    monkeypatch.setattr(module, "Trainer", _FakeTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_podsai_model.py",
+            "--output_dir",
+            str(tmp_path / "model"),
+            "--preprocessing_workers",
+            "4",
+        ],
+    )
+
+    module.main()
+
+    assert captured["map_kwargs"] == {
+        "batched": True,
+        "remove_columns": ["audio"],
+        "num_proc": 2,
+    }
+    assert captured["training_args"]["fp16"] is False
+
+
+def test_training_enables_fp16_when_cuda_is_available(monkeypatch, tmp_path):
+    """Training arguments should enable fp16 automatically when CUDA is available."""
+    module = _import_stubbed_train_module(monkeypatch)
+
+    captured = {}
+
+    class _FakeFeatureExtractor:
+        @classmethod
+        def from_pretrained(cls, _model_name):
+            return cls()
+
+        def save_pretrained(self, _output_dir):
+            return None
+
+        def __call__(self, processed_audio, **_kwargs):
+            return {"input_values": processed_audio}
+
+    class _FakeModel:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class _FakeTrainingArguments:
+        def __init__(self, **kwargs):
+            captured["training_args"] = kwargs
+
+    class _FakeTrainer:
+        def __init__(self, model, args, train_dataset, eval_dataset, compute_metrics):
+            self.model = model
+            self.args = args
+            self.train_dataset = train_dataset
+            self.eval_dataset = eval_dataset
+            self.compute_metrics = compute_metrics
+
+        def train(self, resume_from_checkpoint=None):
+            return resume_from_checkpoint
+
+        def evaluate(self):
+            return {"f1": 1.0}
+
+        def save_model(self, _output_dir):
+            return None
+
+    class _FakeDatasetDict(dict):
+        def map(self, func, batched, remove_columns):
+            assert callable(func)
+            captured["map_kwargs"] = {
+                "batched": batched,
+                "remove_columns": remove_columns,
+            }
+            assert batched is True
+            assert remove_columns == ["audio"]
+            return self
+
+    fake_dataset = _FakeDatasetDict(train=[{"label": 0}], test=[{"label": 0}])
+
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(module, "setup_label_mappings", lambda _num_classes: None)
+    monkeypatch.setattr(module, "load_audio_dataset", lambda _data_dir, _num_classes: fake_dataset)
+    monkeypatch.setattr(module, "analyze_dataset", lambda _dataset: None)
+    monkeypatch.setattr(module, "AutoFeatureExtractor", _FakeFeatureExtractor)
+    monkeypatch.setattr(module, "AutoModelForAudioClassification", _FakeModel)
+    monkeypatch.setattr(module, "TrainingArguments", _FakeTrainingArguments)
+    monkeypatch.setattr(module, "Trainer", _FakeTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_podsai_model.py",
+            "--output_dir",
+            str(tmp_path / "model"),
+        ],
+    )
+
+    module.main()
+
+    assert captured["training_args"]["fp16"] is True
+    assert "num_proc" not in captured.get("map_kwargs", {})
 
 
 def test_push_to_hub_uses_last_six_checkpoints(monkeypatch, tmp_path):

@@ -9,7 +9,7 @@ on:
       epochs:
         description: 'Number of training epochs'
         required: false
-        default: '10'
+        default: '5'
         type: string
       batch_size:
         description: 'Training batch size'
