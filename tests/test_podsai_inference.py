@@ -11,10 +11,46 @@ with correct length and indexing semantics for use in timestamp correction.
 import pytest
 import numpy as np
 import tempfile
+import time
 import soundfile as sf
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import torch
+
+
+# Pinned PODS-AI model revision for integration-test stability.
+PODSAI_TEST_MODEL_ID = "davethaler/whale-call-detector"
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+PODSAI_TEST_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
+
+
+def _resolve_podsai_test_model_path() -> str:
+    """Return local PODS-AI model path or a pinned Hub snapshot for integration tests."""
+    local_path = Path("model/multiclass")
+    if local_path.exists():
+        return str(local_path)
+
+    try:
+        from huggingface_hub import file_exists as hf_file_exists
+        from huggingface_hub import snapshot_download as hf_snapshot_download
+        if not hf_file_exists(
+            PODSAI_TEST_MODEL_ID,
+            "preprocessor_config.json",
+            revision=PODSAI_TEST_MODEL_REVISION,
+        ):
+            pytest.skip(
+                f"Hub model '{PODSAI_TEST_MODEL_ID}' revision "
+                f"'{PODSAI_TEST_MODEL_REVISION}' is missing preprocessor_config.json."
+            )
+        return hf_snapshot_download(
+            repo_id=PODSAI_TEST_MODEL_ID,
+            revision=PODSAI_TEST_MODEL_REVISION,
+        )
+    except Exception:
+        pytest.skip(
+            f"HuggingFace Hub is not reachable; cannot load model "
+            f"'{PODSAI_TEST_MODEL_ID}' revision '{PODSAI_TEST_MODEL_REVISION}'"
+        )
 
 
 @pytest.fixture
@@ -48,6 +84,7 @@ def mock_podsai_model():
     # Set metadata attributes that _print_model_metadata expects.
     mock_config._name_or_path = "test-model"
     mock_config.architectures = ["Wav2Vec2ForSequenceClassification"]
+    mock_config.model_type = "wav2vec2"
     mock_config._commit_hash = None  # Optional, can be None
 
     mock_model.config = mock_config
@@ -73,6 +110,15 @@ def mock_podsai_model():
 def mock_feature_extractor():
     """Create a mock feature extractor."""
     mock_extractor = Mock()
+
+    # Set attributes accessed by _compute_input_values() when computing the
+    # full-audio spectrogram and slicing windows from it.
+    mock_extractor.num_mel_bins = 128
+    mock_extractor.max_length = 1024
+    mock_extractor.mean = -4.2677393
+    mock_extractor.std = 4.5689974
+    mock_extractor.do_normalize = True
+    mock_extractor.hop_length = 10  # ms per frame
 
     def mock_extract(audio, sampling_rate, return_tensors, padding):
         # Return dummy tensors. Supports both single array and batched list inputs.
@@ -460,3 +506,49 @@ class TestPodsAIInferenceErrorHandling:
         # Should raise ValueError for missing negative class.
         with pytest.raises(ValueError, match="must include at least one negative/background class"):
             PodsAIInference("test-model-path")
+
+
+class TestIntegrationWithRealModels:
+    """Integration tests that require the real PODS-AI model."""
+
+    @pytest.fixture
+    def podsai_model_path(self) -> str:
+        """Path to local PODS-AI model or a pinned Hub snapshot fallback."""
+        return _resolve_podsai_test_model_path()
+
+    def test_predict_60s_wav_performance(self, podsai_model_path: str) -> None:
+        """Inference on a 60-second wav file must complete in under 10 seconds.
+
+        This test guards against performance regressions in the inference pipeline.
+        For AST models the full-audio spectrogram optimization (one fbank call
+        instead of one per segment) keeps the budget well under 10 seconds on a
+        CPU-only machine.  For Wav2Vec2 (and other raw-audio) models the raw-audio
+        path is used instead; both should comfortably fit the 10-second budget.
+        """
+        from podsai_inference import PodsAIInference
+
+        # Create a 60-second synthetic WAV of silence.
+        sr = 16000
+        duration = 60
+        audio = np.zeros(duration * sr, dtype=np.float32)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            sf.write(f.name, audio, sr)
+            wav_path = f.name
+
+        try:
+            model = PodsAIInference(podsai_model_path)
+            start = time.perf_counter()
+            result = model.predict(wav_path, segment_duration=3, hop_duration=2)
+            elapsed = time.perf_counter() - start
+
+            print(f"\nPodsAI predict() took {elapsed:.2f}s for a 60-second WAV")
+
+            assert elapsed < 10.0, (
+                f"PodsAI inference on a 60-second WAV took {elapsed:.2f}s, "
+                f"expected < 10s. Check for performance regressions in the inference pipeline."
+            )
+            # 60s audio with segment_duration=3 and hop_duration=2 → 29 positions.
+            assert len(result["local_confidences"]) == 29
+        finally:
+            Path(wav_path).unlink(missing_ok=True)

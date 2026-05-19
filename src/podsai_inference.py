@@ -26,6 +26,11 @@ from model_inference import ModelInference
 # For every SEGMENT_GROUP_SIZE segments, require at least 1 positive prediction.
 SEGMENT_GROUP_SIZE = 10
 
+# HuggingFace model_type value for the Audio Spectrogram Transformer architecture.
+# AST models expect a pre-computed mel spectrogram; raw-audio models (e.g. Wav2Vec2)
+# use the feature extractor directly.
+MODEL_TYPE_AST = "audio-spectrogram-transformer"
+
 
 class PodsAIInference(ModelInference):  # Inherit from ModelInference
     """
@@ -37,7 +42,8 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
 
     def __init__(self, model_path: str, device: Optional[str] = None,
                  threshold: float = 0.5, min_num_positive_calls_threshold: int = 3,
-                 model_revision: Optional[str] = None) -> None:
+                 model_revision: Optional[str] = None,
+                 inference_batch_size: int = 8) -> None:
         """
         Initialize the inference model.
 
@@ -53,10 +59,14 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
                                              Default: use instance value (typically 3).
             model_revision: Git commit hash or tag to pin the HuggingFace Hub model revision.
                            Ignored when model_path is a local directory. (default: None)
+            inference_batch_size: Number of spectrogram windows processed per model forward pass
+                                  (default: 8). Smaller values reduce peak attention-matrix memory
+                                  at the cost of more forward passes; tune for your hardware.
         """
         super().__init__(model_path)  # Call parent constructor
         self.threshold = threshold
         self.min_num_positive_calls_threshold = min_num_positive_calls_threshold
+        self.inference_batch_size = inference_batch_size
 
         # Auto-detect device. Default to GPU if available, otherwise CPU. Allow override via argument.
         if device is None:
@@ -84,15 +94,32 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
             raise RuntimeError(error_msg) from e
 
         try:
-            self.model = AutoModelForAudioClassification.from_pretrained(
-                model_path, **pretrained_kwargs
-            )
+            # Try SDPA (Scaled Dot-Product Attention) first for better memory efficiency.
+            # SDPA fuses the Q×K^T softmax Attn×V computation in one kernel, which
+            # reduces intermediate tensor allocations and peak attention-matrix memory.
+            # Fall back to the default implementation when SDPA is not supported.
+            try:
+                self.model = AutoModelForAudioClassification.from_pretrained(
+                    model_path, attn_implementation="sdpa", **pretrained_kwargs
+                )
+            except (ValueError, NotImplementedError):
+                self.model = AutoModelForAudioClassification.from_pretrained(
+                    model_path, **pretrained_kwargs
+                )
             self.model.to(self.device)
             self.model.eval()
         except Exception as e:
             error_msg = f"Error loading model from {model_path}: {type(e).__name__}: {e}"
             print(error_msg)
             raise RuntimeError(error_msg) from e
+
+        # Detect model architecture to select the appropriate inference input path.
+        # AST models (audio-spectrogram-transformer) consume a pre-computed mel spectrogram
+        # of shape (batch, max_length, num_mel_bins).  All other models (e.g. Wav2Vec2)
+        # expect raw audio samples of shape (batch, sequence_length).
+        self._use_spectrogram_input = (
+            getattr(self.model.config, 'model_type', '') == MODEL_TYPE_AST
+        )
 
         # Get label mapping. This assumes the model was trained with a config that includes id2label and label2id.
         self.id2label = self.model.config.id2label
@@ -193,6 +220,88 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
 
         if not metadata_found:
             print("Model metadata: No version or date information available.")
+
+    def _compute_input_values(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        num_positions: int,
+        hop_samples: int,
+        segment_samples: int,
+    ) -> torch.Tensor:
+        """
+        Compute mel spectrogram for the full audio once, then extract sliding windows.
+
+        Computing the spectrogram once avoids the overhead of 29 separate feature-extractor
+        calls and eliminates redundant computation for overlapping windows (a 2-second hop
+        on 3-second segments has 1 second of overlap per adjacent pair).
+
+        Args:
+            audio: Full audio samples at sample rate sr.
+            sr: Sample rate of the audio.
+            num_positions: Number of sliding-window positions.
+            hop_samples: Hop size in samples.
+            segment_samples: Segment size in samples.
+
+        Returns:
+            Tensor of shape (num_positions, max_length, num_mel_bins) ready for the model.
+        """
+        import torchaudio
+
+        # Read ASTFeatureExtractor configuration with sensible defaults.
+        num_mel_bins: int = getattr(self.feature_extractor, 'num_mel_bins', 128)
+        max_length: int = getattr(self.feature_extractor, 'max_length', 1024)
+        fe_mean: float = getattr(self.feature_extractor, 'mean', -4.2677393)
+        fe_std: float = getattr(self.feature_extractor, 'std', 4.5689974)
+        do_normalize: bool = getattr(self.feature_extractor, 'do_normalize', True)
+        frame_shift_ms: float = getattr(self.feature_extractor, 'hop_length', 10)
+
+        # Compute mel spectrogram for the entire audio in a single torchaudio call.
+        # Using the same parameters as ASTFeatureExtractor._extract_fbank_features().
+        waveform = torch.from_numpy(audio).float().unsqueeze(0)  # (1, n_samples)
+        full_fbank = torchaudio.compliance.kaldi.fbank(
+            waveform,
+            htk_compat=True,
+            sample_frequency=sr,
+            use_energy=False,
+            window_type="hanning",
+            num_mel_bins=num_mel_bins,
+            dither=0.0,
+            frame_shift=frame_shift_ms,
+        )  # Shape: (total_frames, num_mel_bins)
+
+        # Convert sample counts to frame counts.
+        frames_per_second = 1000.0 / frame_shift_ms  # e.g., 100 frames/s at 10 ms/frame
+        hop_frames = round(hop_samples / sr * frames_per_second)
+        seg_frames = round(segment_samples / sr * frames_per_second)
+
+        # Slice each window, apply per-utterance mean normalisation, and pad to max_length.
+        # This replicates ASTFeatureExtractor._extract_fbank_features() for each window.
+        windows: list[torch.Tensor] = []
+        for pos_idx in range(num_positions):
+            start_frame = pos_idx * hop_frames
+            end_frame = start_frame + seg_frames
+            window = full_fbank[start_frame:end_frame, :]
+
+            # Per-utterance mean subtraction (matches ASTFeatureExtractor._extract_fbank_features).
+            window = window - window.mean()
+
+            # Pad or truncate to max_length.
+            if window.shape[0] < max_length:
+                pad_len = max_length - window.shape[0]
+                window = torch.nn.functional.pad(window, (0, 0, 0, pad_len))
+            else:
+                window = window[:max_length, :]
+
+            windows.append(window)
+
+        input_values = torch.stack(windows, dim=0)  # (num_positions, max_length, num_mel_bins)
+
+        # Apply global normalisation (matches ASTFeatureExtractor.normalize).
+        if do_normalize:
+            input_values = (input_values - fe_mean) / (fe_std * 2.0)
+
+        return input_values
 
     def predict(self, wav_path: str, segment_duration: int = 3, hop_duration: int = 2,
                 threshold: Optional[float] = None, min_num_positive_calls_threshold: Optional[int] = None) -> dict[str, object]:
@@ -305,41 +414,46 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         if num_positions < 1:
             num_positions = 1
 
-        # Collect all segments first, then batch-process them in a single forward pass
-        # for better performance (fewer model calls, better hardware utilization).
-        segments = []
-        for pos_idx in range(num_positions):
-            start = pos_idx * hop_samples
-            end = min(start + segment_samples, len(audio))
-            segment = audio[start:end]
-
-            # Pad if necessary (for short audio or last segment).
-            if len(segment) < segment_samples:
-                padding = segment_samples - len(segment)
-                segment = np.pad(segment, (0, padding), mode='constant')
-            segments.append(segment)
-
-        with torch.no_grad():
-            # Extract features for all segments at once.
-            inputs = self.feature_extractor(
-                segments,
-                sampling_rate=sr,
-                return_tensors="pt",
-                padding=True,
+        if self._use_spectrogram_input:
+            # AST path: compute the full-audio mel spectrogram once, then slice windows.
+            # This avoids 29 separate fbank calls (one per segment) and eliminates redundant
+            # computation for overlapping windows, dramatically reducing feature-extraction time.
+            # Windows are fed to the model in mini-batches to limit peak attention-matrix memory.
+            input_values = self._compute_input_values(
+                audio, sr, num_positions, hop_samples, segment_samples
             )
 
-            # Move to device. This is important for performance, especially if using GPU.
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            all_probs_list: list[torch.Tensor] = []
+            with torch.inference_mode():
+                for batch_start in range(0, num_positions, self.inference_batch_size):
+                    batch = input_values[batch_start:batch_start + self.inference_batch_size]
+                    outputs = self.model(input_values=batch.to(self.device))
+                    batch_probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                    all_probs_list.append(batch_probs.cpu())
+            all_probs = torch.cat(all_probs_list, dim=0)
+        else:
+            # Raw-audio path (e.g. Wav2Vec2): collect segments, run feature extractor,
+            # then do a single batched forward pass.
+            segments = []
+            for pos_idx in range(num_positions):
+                start = pos_idx * hop_samples
+                end = min(start + segment_samples, len(audio))
+                segment = audio[start:end]
+                if len(segment) < segment_samples:
+                    segment = np.pad(segment, (0, segment_samples - len(segment)), mode='constant')
+                segments.append(segment)
 
-            # Get predictions for all segments in one forward pass.
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-            probs = torch.nn.functional.softmax(logits, dim=-1)
+            with torch.inference_mode():
+                inputs = self.feature_extractor(
+                    segments, sampling_rate=sr, return_tensors="pt", padding=True
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                outputs = self.model(**inputs)
+                all_probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu()
 
-            # Get predicted class (argmax) and store probabilities for each segment.
-            predicted_classes = torch.argmax(probs, dim=-1).tolist()
-            segment_class_ids = [int(c) for c in predicted_classes]
-            segment_probs = [probs[i].cpu().numpy() for i in range(len(segments))]
+        predicted_classes = torch.argmax(all_probs, dim=-1).tolist()
+        segment_class_ids = [int(c) for c in predicted_classes]
+        segment_probs = [all_probs[i].numpy() for i in range(num_positions)]
 
         # Guard against empty predictions list.
         # This can happen if the audio is too short or if there was an error during processing.
