@@ -746,7 +746,7 @@ class TestMainCLI:
         assert mock_infer.call_args.kwargs["model_revision"] == OLD_PODSAI_MODEL_REVISION
 
     def test_default_models_include_oldpodsai(self, tmp_path):
-        """main() defaults to evaluating fastai, orcahello, podsai, and oldpodsai."""
+        """main() defaults to evaluating fastai, orcahello, oldpodsai, and podsai."""
         from compare_models import ModelResult, OLD_PODSAI_MODEL_REVISION, PODSAI_MODEL_REVISION, main
 
         rows = _make_testing_rows()
@@ -770,9 +770,9 @@ class TestMainCLI:
 
         assert result == 0
         assert mock_evaluate.call_count == 4
-        # Order matches default models: fastai, orcahello, podsai, oldpodsai.
+        # Order matches default models: fastai, orcahello, oldpodsai, podsai.
         called_revisions = [call.kwargs["model_revision"] for call in mock_evaluate.call_args_list]
-        assert called_revisions == [None, None, PODSAI_MODEL_REVISION, OLD_PODSAI_MODEL_REVISION]
+        assert called_revisions == [None, None, OLD_PODSAI_MODEL_REVISION, PODSAI_MODEL_REVISION]
 
     def test_returns_0_on_success_with_fastai(self, tmp_path):
         """main() returns 0 when it successfully evaluates fastai on test samples."""

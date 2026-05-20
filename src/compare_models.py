@@ -8,7 +8,7 @@ Usage:
     python compare_models.py [options]
 
 Loads a test set from testing_samples.csv, then runs each enabled model
-(fastai, orcahello, podsai (AST), oldpodsai (Wav2Vec2)) on the corresponding
+(fastai, orcahello, oldpodsai (Wav2Vec2)), podsai (AST) on the corresponding
 60-second WAV files and
 reports correct identifications, false positives, and false negatives per model.
 
@@ -40,8 +40,8 @@ OLD_PODSAI_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
 MODEL_TYPE_TO_INFERENCE_TYPE = {
     "fastai": "fastai",
     "orcahello": "orcahello",
-    "podsai": "podsai",
     "oldpodsai": "podsai",
+    "podsai": "podsai",
 }
 
 
@@ -174,7 +174,7 @@ def is_resident_prediction(global_prediction_label: str, model_type: str) -> boo
     """
     Determine whether a model's prediction corresponds to "resident" (SRKW).
 
-    All model types (fastai, orcahello, podsai, oldpodsai) use "resident" as the
+    All model types (fastai, orcahello, oldpodsai, podsai) use "resident" as the
     positive class label, so the check is the same regardless of model type.
 
     Args:
@@ -199,7 +199,7 @@ def evaluate_model(
     Run a model against all test samples and accumulate results.
 
     Args:
-        model_type: One of 'fastai', 'orcahello', 'podsai', or 'oldpodsai'.
+        model_type: One of 'fastai', 'orcahello', 'oldpodsai', or 'podsai'.
                     'oldpodsai' is mapped to 'podsai' inference internally.
         model_path: Path to the model (or HuggingFace Hub model ID).
         samples: List of testing samples.
@@ -388,10 +388,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--models",
-        default="fastai,orcahello,podsai,oldpodsai",
+        default="fastai,orcahello,oldpodsai,podsai",
         help=(
             "Comma-separated list of models to evaluate "
-            "(default: fastai,orcahello,podsai,oldpodsai)."
+            "(default: fastai,orcahello,oldpodsai,podsai)."
         ),
     )
     parser.add_argument(
@@ -415,7 +415,7 @@ def main() -> int:
         default=PODSAI_MODEL_ID,
         help=(
             "Path to PODS-AI model directory or HuggingFace Hub ID. "
-            "Used by both podsai (AST) and oldpodsai (Wav2Vec2). "
+            "Used by both and oldpodsai (Wav2Vec2) and podsai (AST). "
             f"Defaults to {PODSAI_MODEL_ID!r} when not specified."
         ),
     )
@@ -468,7 +468,7 @@ def main() -> int:
         return 1
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
-    valid_models = {"fastai", "orcahello", "podsai", "oldpodsai"}
+    valid_models = {"fastai", "orcahello", "oldpodsai", "podsai"}
     for model in models:
         if model not in valid_models:
             print(
@@ -480,14 +480,14 @@ def main() -> int:
     model_paths: dict[str, Optional[str]] = {
         "fastai": args.fastai_model_path,
         "orcahello": args.orcahello_model_path,
-        "podsai": args.podsai_model_path,
         "oldpodsai": args.podsai_model_path,
+        "podsai": args.podsai_model_path,
     }
     model_revisions: dict[str, Optional[str]] = {
         "fastai": None,
         "orcahello": None,
-        "podsai": args.podsai_model_revision,
         "oldpodsai": OLD_PODSAI_MODEL_REVISION,
+        "podsai": args.podsai_model_revision,
     }
 
     # Validate max_samples if specified.
