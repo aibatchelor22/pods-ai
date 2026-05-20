@@ -67,7 +67,8 @@ jobs:
             echo "Applying $FILE"
             kubectl apply -f "$FILE"
             # Derive namespace from filename, e.g. LiveInferenceSystem/deploy/bush-point-configmap.yaml -> bush-point
-            NAMESPACE=$(basename "$FILE" -configmap.yaml)
+            FILENAME=$(basename "$FILE")
+            NAMESPACE=${FILENAME%-configmap.yaml}
             echo "Restarting deployment/pods-ai-inference-system in namespace $NAMESPACE"
             kubectl rollout restart deployment/pods-ai-inference-system -n "$NAMESPACE"
           done
