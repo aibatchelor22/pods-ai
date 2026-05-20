@@ -21,7 +21,10 @@ from model_inference import get_model_inference
 
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"
+PODSAI_AST_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"
+PODSAI_WAV2VEC2_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
+# Preserve the existing exported constant name for compatibility.
+PODSAI_MODEL_REVISION = PODSAI_AST_MODEL_REVISION
 PROPOSED_DESCRIPTION_EXTRA_CLASSES = {"vessel", "human", "jingle"}
 
 
@@ -57,7 +60,8 @@ def _build_proposed_description(
 
 def run_inference(wav_path: str, model_type: str = "podsai",
                   model_path: Optional[str] = None,
-                  model_revision: Optional[str] = None) -> dict:
+                  model_revision: Optional[str] = None,
+                  model_variant: str = "ast") -> dict:
     """
     Run inference on a wav file and return per-class probabilities.
 
@@ -72,6 +76,11 @@ def run_inference(wav_path: str, model_type: str = "podsai",
                         Only used when model_path is a Hub model ID (not a local path).
                         Defaults to PODSAI_MODEL_REVISION when model_path is the default
                         PODS-AI Hub model.
+        model_variant: PODS-AI model variant to use when model_type is "podsai"
+                       and the default PODS-AI Hub model/revision is being used
+                       (model_path and model_revision are not explicitly set).
+                       Supported values are "ast" (default) and "wav2vec2".
+                       Ignored when model_path or model_revision is explicitly provided.
 
     Returns:
         Dictionary with:
@@ -134,10 +143,17 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         global_confidence = resident_prob
 
     elif model_type == "podsai":
+        if model_variant not in {"ast", "wav2vec2"}:
+            raise ValueError(
+                f"Unknown PODS-AI model variant: {model_variant!r}. Use 'ast' or 'wav2vec2'."
+            )
         if model_path is None:
             model_path = PODSAI_MODEL_ID
             if model_revision is None:
-                model_revision = PODSAI_MODEL_REVISION
+                if model_variant == "wav2vec2":
+                    model_revision = PODSAI_WAV2VEC2_MODEL_REVISION
+                else:
+                    model_revision = PODSAI_AST_MODEL_REVISION
 
         model = get_model_inference(model_type="podsai", model_path=model_path,
                                     model_revision=model_revision)
@@ -221,6 +237,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--type",
+        default="ast",
+        choices=("ast", "wav2vec2"),
+        help=(
+            "PODS-AI model type to use with --model podsai (default: ast). "
+            "ast selects the AST-based checkpoint, wav2vec2 selects the older Wav2Vec2 checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--model-path",
         default=None,
         help=(
@@ -250,7 +275,7 @@ def main() -> int:
 
     try:
         results = run_inference(wav_path, model_type=args.model, model_path=args.model_path,
-                                model_revision=args.model_revision)
+                                model_revision=args.model_revision, model_variant=args.type)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

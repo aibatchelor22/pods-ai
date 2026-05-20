@@ -714,6 +714,66 @@ class TestMainCLI:
             result = main()
         assert result == 1
 
+    def test_accepts_oldpodsai_model(self, tmp_path):
+        """main() accepts oldpodsai and evaluates it using the podsai inference path."""
+        from compare_models import OLD_PODSAI_MODEL_REVISION, main
+
+        rows = _make_testing_rows()
+        testing_csv = self._write_testing_csv(tmp_path, rows)
+
+        wav_dir = tmp_path / "testing-wav"
+        row = rows[0]
+        node = row["NodeName"].replace("_", "-")
+        wav = wav_dir / row["Category"] / f"{node}_{row['Timestamp']}.wav"
+        wav.parent.mkdir(parents=True, exist_ok=True)
+        wav.touch()
+
+        mock_result = {"global_prediction_label": "resident", "global_confidence": 0.8, "predict_time": 1.5}
+        test_args = [
+            "compare_models.py",
+            "--testing-csv", str(testing_csv),
+            "--wav-dir", str(wav_dir),
+            "--models", "oldpodsai",
+            "--max-samples", "1",
+        ]
+        with patch.object(sys, "argv", test_args):
+            with patch("compare_models.run_inference", return_value=mock_result) as mock_infer:
+                result = main()
+
+        assert result == 0
+        mock_infer.assert_called_once()
+        assert mock_infer.call_args.kwargs["model_type"] == "podsai"
+        assert mock_infer.call_args.kwargs["model_revision"] == OLD_PODSAI_MODEL_REVISION
+
+    def test_default_models_include_oldpodsai(self, tmp_path):
+        """main() defaults to evaluating fastai, orcahello, podsai, and oldpodsai."""
+        from compare_models import ModelResult, OLD_PODSAI_MODEL_REVISION, PODSAI_MODEL_REVISION, main
+
+        rows = _make_testing_rows()
+        testing_csv = self._write_testing_csv(tmp_path, rows)
+        wav_dir = tmp_path / "testing-wav"
+        wav_dir.mkdir()
+
+        test_args = [
+            "compare_models.py",
+            "--testing-csv", str(testing_csv),
+            "--wav-dir", str(wav_dir),
+            "--max-samples", "1",
+        ]
+        with patch.object(sys, "argv", test_args):
+            with patch("compare_models.evaluate_model", side_effect=lambda **kwargs: ModelResult(
+                model_type=kwargs["model_type"],
+                total=1,
+                skipped=1,
+            )) as mock_evaluate:
+                result = main()
+
+        assert result == 0
+        assert mock_evaluate.call_count == 4
+        # Order matches default models: fastai, orcahello, podsai, oldpodsai.
+        called_revisions = [call.kwargs["model_revision"] for call in mock_evaluate.call_args_list]
+        assert called_revisions == [None, None, PODSAI_MODEL_REVISION, OLD_PODSAI_MODEL_REVISION]
+
     def test_returns_0_on_success_with_fastai(self, tmp_path):
         """main() returns 0 when it successfully evaluates fastai on test samples."""
         from compare_models import main
