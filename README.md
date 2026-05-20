@@ -653,3 +653,27 @@ model_global_threshold: 3
 model_path: "./model"
 model_name: "model.pkl"
 ```
+
+## GitHub CI configuration
+
+The following repository secrets must be configured using information obtained
+from HuggingFace:
+
+* HF_TOKEN — Get this from https://huggingface.co/settings/tokens after logging in as the account used to publish the model (e.g., "davethaler").  This is used by train_model.yml.
+
+or from portal.azure.com:
+
+* COSMOS_KEY — "aifororcasmetadatastore" CosmosDB account → "Keys" → "Read-only Keys" → primary key.  This is used by make_csv.py, check_csv.yml, and train_model.yml.
+* AZURE_COSMOSDB_PRIMARY_KEY — "aifororcasmetadatastore" CosmosDB account → "Keys" → "Read-write Keys" → primary key.  This is used by LiveInferenceOrchestrator.py.
+* AZURE_STORAGE_CONNECTION_STRING — "livemlaudiospecstorage" storage account. See the "Connection String" section in [these instructions](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-quickstart-blobs-python?tabs=connection-string%2Croles-azure-portal%2Csign-in-azure-cli&pivots=blob-storage-quickstart-scratch#authenticate-to-azure-and-authorize-access-to-blob-data).  This is used by LiveInferenceOrchestrator.py.
+* INFERENCESYSTEM_APPINSIGHTS_CONNECTION_STRING — "InferenceSystemInsights" Application Insights → "Overview" → connection string.  This is used by LiveInferenceOrchestrator.py.
+* ACR_USERNAME — "orcaconservancycr" Container registry → "Access keys" → "Username".  This is used by LiveInferenceSystem-deploy.yaml.
+* ACR_PASSWORD — "orcaconservancycr" Container registry → "Access keys" → "password".  This is used by LiveInferenceSystem-deploy.yaml.
+* ACR_REGISTRY — "orcaconservancycr" Container registry → "Access keys" → "Registry name".  This is used by LiveInferenceSystem-deploy.yaml.
+* KUBE_CONFIG — This is used by LiveInferenceSystem-deploy-configmaps.yaml.  To obtain the KUBE_CONFIG value, run the following:
+
+```
+az aks get-credentials --resource-group LiveSRKWNotificationSystem --name inference-system-AKS --admin --file kubeconfig
+```
+
+This produces a file named `kubeconfig`, the contents of which can be used as the KUBE_CONFIG value.

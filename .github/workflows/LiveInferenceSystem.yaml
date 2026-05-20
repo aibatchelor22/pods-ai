@@ -49,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: changes
     if: ${{ needs.changes.outputs.src == 'true' }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     permissions:
       contents: read
@@ -81,8 +83,10 @@ jobs:
       - name: Smoke test container (LiveHLS)
         run: |
           docker run --rm \
-            -v $PWD/LiveInferenceSystem/tests/orch_configs/LiveHLS/LiveHLS_OrcasoundLab.yml:/config/config.yml \
+            -v $PWD/LiveInferenceSystem/tests/orch_configs/LiveHLS/LiveHLS_AndrewsBay.yml:/config/config.yml \
             pods-ai-inference:ci \
             --max_live_iterations 2 2>&1 | tee output.log
           grep -q "\[iter 1\]" output.log
-          grep -q "No HLS folders" output.log || grep -q "Failed to load M3U8" output.log || grep -q "global_prediction" output.log
+          grep -q "No HLS folders" output.log || \
+          grep -q "Failed to load M3U8" output.log || \
+          grep -q "Inference: prediction=" output.log
