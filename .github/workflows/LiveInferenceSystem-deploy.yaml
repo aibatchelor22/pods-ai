@@ -1,0 +1,115 @@
+# Copyright (c) PODS-AI contributors
+# SPDX-License-Identifier: MIT
+---
+name: LiveInferenceSystem-deploy
+
+on:
+  push:
+    tags:
+      - 'LiveInferenceSystem.v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag to deploy from'
+        required: true
+        default: 'main'
+      release_tag:
+        description: 'Container release tag (e.g., v1.2.3)'
+        required: true
+
+concurrency:
+  # Cancel any CI/CD workflow currently in progress for the same PR.
+  # Allow running concurrently with any other commits.
+  group: LiveInferenceSystem-deploy-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: pods-ai-live-inference-system
+      ACR_REGISTRY: orcaconservancycr.azurecr.io
+    steps:
+      - uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40  # v2.19.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          submodules: 'false'
+
+      - name: Initialize orcahello submodule
+        run: git submodule update --init external/orcahello
+
+      - name: Resolve release tag suffix
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "RELEASE_TAG=${GITHUB_REF_NAME#LiveInferenceSystem.}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+          fi
+
+      - name: Check if ACR secrets are set
+        run: |
+          if [ -z "${{ secrets.ACR_USERNAME }}" ] || [ -z "${{ secrets.ACR_PASSWORD }}" ]; then
+            echo "ACR credentials are missing"
+            exit 1
+          else
+            echo "ACR credentials are set"
+          fi
+
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          # Remove unnecessary packages and cached files
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/share/swift
+          # Clean up Docker
+          docker system prune -af
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Build Dockerfile image
+        run: |
+          docker build -f LiveInferenceSystem/Dockerfile -t $IMAGE_NAME .
+
+      - name: List Docker images
+        run: docker images
+
+      - name: Get image creation date in MM-DD-YYYY
+        run: |
+          IMAGE_ID=$(docker images $IMAGE_NAME --format "{{.ID}}" | head -n 1)
+          CREATED=$(docker inspect --format='{{.Created}}' $IMAGE_ID)
+          DATE_STRING=$(date -d "$CREATED" +"%m-%d-%Y")
+          echo "DATE_STRING=$DATE_STRING" >> $GITHUB_ENV
+
+      - name: Define full image tag
+        run: |
+          IMAGE_TAG="$ACR_REGISTRY/$IMAGE_NAME:$DATE_STRING.$RELEASE_TAG"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Tag docker container
+        run: |
+          docker tag $IMAGE_NAME $IMAGE_TAG
+
+      - name: Docker login to ACR
+        run: |
+          echo ${{ secrets.ACR_PASSWORD }} | docker login ${{ env.ACR_REGISTRY }} -u ${{ secrets.ACR_USERNAME }} --password-stdin
+
+      - name: Push docker container to ACR
+        run: |
+          docker push $IMAGE_TAG

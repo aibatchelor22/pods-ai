@@ -1,0 +1,88 @@
+# Copyright (c) PODS-AI contributors
+# SPDX-License-Identifier: MIT
+---
+name: LiveInferenceSystem
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: live-inference-system-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Check for file changes
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d  # v4.0.1
+        id: filter
+        with:
+          filters: |
+            src:
+              - LiveInferenceSystem/**
+              - src/LiveInferenceOrchestrator.py
+              - src/model_inference.py
+              - src/podsai_inference.py
+              - src/orcahello_inference.py
+              - src/spectrogram_visualizer.py
+              - src/audio_utils.py
+              - .github/workflows/LiveInferenceSystem.yaml
+
+  test-docker:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.src == 'true' }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          submodules: 'false'
+
+      - name: Initialize orcahello submodule
+        run: git submodule update --init external/orcahello
+
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift
+          docker system prune -af
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Build Dockerfile image
+        run: |
+          docker build -f LiveInferenceSystem/Dockerfile -t pods-ai-inference:ci .
+
+      - name: Smoke test container (LiveHLS)
+        run: |
+          docker run --rm \
+            -v $PWD/LiveInferenceSystem/tests/orch_configs/LiveHLS/LiveHLS_OrcasoundLab.yml:/config/config.yml \
+            pods-ai-inference:ci \
+            --max_live_iterations 2 2>&1 | tee output.log
+          grep -q "\[iter 1\]" output.log
+          grep -q "No HLS folders" output.log || grep -q "Failed to load M3U8" output.log || grep -q "global_prediction" output.log

@@ -599,6 +599,78 @@ python get_best_timestamp.py orcasound-lab 2023_08_18_00_59_53_PST
 # https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-08-18T07%3A59%3A50.000Z
 ```
 
+## LiveInferenceSystem Container
+
+`LiveInferenceSystem/` packages `src/LiveInferenceOrchestrator.py` as a Docker container for
+production deployment to Azure Kubernetes Service (AKS), following the same pattern used by
+[OrcaHello's InferenceSystem](https://github.com/orcasound/orcahello/tree/main/InferenceSystem).
+The two containers can run side-by-side in the same Kubernetes cluster without conflicts.
+
+### Quick Start
+
+Build the image from the repo root (requires the `external/orcahello` submodule):
+
+```bash
+git submodule update --init external/orcahello
+docker build -f LiveInferenceSystem/Dockerfile -t pods-ai-live-inference-system .
+```
+
+> **macOS M-series:** prefix with `docker buildx build --platform linux/amd64`
+
+Run locally by mounting an orchestrator config at `/config/config.yml`:
+
+```bash
+# Linux/Mac
+docker run --rm -it --env-file .env \
+  -v $PWD/LiveInferenceSystem/tests/orch_configs/LiveHLS/LiveHLS_OrcasoundLab.yml:/config/config.yml \
+  pods-ai-live-inference-system \
+  --max_live_iterations 2
+
+# Windows
+docker run --rm -it --env-file .env ^
+  -v %cd%/LiveInferenceSystem/tests/orch_configs/LiveHLS/LiveHLS_OrcasoundLab.yml:/config/config.yml ^
+  pods-ai-live-inference-system ^
+  --max_live_iterations 2
+```
+
+The `.env` file should contain Azure credentials (see `LiveInferenceOrchestrator.py` for required
+environment variables).
+
+### Deployment
+
+In production each hydrophone location runs as a separate deployment in its own Kubernetes
+namespace.  The `LiveInferenceSystem/deploy/` directory contains the Kubernetes manifests:
+
+- `<location>.yaml` — deployment spec
+- `<location>-configmap.yaml` — hydrophone-specific orchestrator configuration
+
+To release a new container image, push a tag of the form `LiveInferenceSystem.v#.#.#`.
+This triggers the `LiveInferenceSystem-deploy` workflow, which builds the image and pushes it to
+`orcaconservancycr.azurecr.io/pods-ai-live-inference-system`.
+
+To deploy to a hydrophone location:
+
+```bash
+NAMESPACE=orcasound-lab  # or andrews-bay, bush-point, etc.
+kubectl apply -f LiveInferenceSystem/deploy/$NAMESPACE-configmap.yaml
+# Scale to 0 first — required by the Recreate strategy on memory-constrained nodes
+# so that the old pod is fully terminated before the new pod starts.
+kubectl scale deployment pods-ai-inference-system -n $NAMESPACE --replicas=0
+kubectl apply -f LiveInferenceSystem/deploy/$NAMESPACE.yaml
+```
+
+To add a new hydrophone location, create `deploy/<namespace>-configmap.yaml` and
+`deploy/<namespace>.yaml` using an existing pair as a template, then create the namespace and
+secret:
+
+```bash
+kubectl create namespace <namespace>
+kubectl create secret generic pods-ai-inference-system -n <namespace> \
+    --from-literal=AZURE_COSMOSDB_PRIMARY_KEY='<key>' \
+    --from-literal=AZURE_STORAGE_CONNECTION_STRING='<string>' \
+    --from-literal=INFERENCESYSTEM_APPINSIGHTS_CONNECTION_STRING='<string>'
+```
+
 ## Architecture
 
 The timestamp correction implementation follows the architecture described in the [aifororcas-livesystem](https://github.com/orcasound/aifororcas-livesystem):

@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 from model_inference import get_model_inference
 from pytz import timezone as pytz_tz
+from run_inference import build_proposed_description
 
 
 AZURE_STORAGE_ACCOUNT_NAME = "livemlaudiospecstorage"
@@ -167,6 +168,13 @@ def build_cosmosdb_metadata(
         },
     )
 
+    global_label = result.get("global_prediction_label", "")
+    local_labels = [
+        prediction_to_label(p, id2label)
+        for p in result.get("local_predictions", [])
+    ]
+    proposed_description = build_proposed_description(global_label, local_labels)
+
     return {
         "id": str(uuid.uuid4()),
         "modelId": model_id,
@@ -175,10 +183,11 @@ def build_cosmosdb_metadata(
         "reviewed": False,
         "timestamp": timestamp_in_iso,
         "whaleFoundConfidence": float(result.get("global_confidence", 0.0)) * 100.0,
-        "globalPredictionLabel": result.get("global_prediction_label", ""),
+        "globalPredictionLabel": global_label,
         "location": location,
         "source_guid": source_guid,
         "predictions": prediction_list,
+        "comments": proposed_description,
     }
 
 

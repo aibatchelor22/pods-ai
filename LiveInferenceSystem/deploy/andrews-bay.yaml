@@ -1,0 +1,62 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pods-ai-inference-system
+  namespace: andrews-bay
+spec:
+  replicas: 1
+  # NOTE: This deployment intentionally uses a single replica with a Recreate
+  # strategy due to memory constraints and so that only one inference pod processes
+  # hydrophone audio at a time.  This avoids concurrent inference instances for
+  # this site, and the temporary detection gap during upgrades is acceptable.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pods-ai-inference-system
+  template:
+    metadata:
+      labels:
+        app: pods-ai-inference-system
+    spec:
+      nodeSelector:
+        kubernetes.azure.com/agentpool: f4sv2pool
+      containers:
+        - name: pods-ai-inference-system
+          image: orcaconservancycr.azurecr.io/pods-ai-live-inference-system:latest
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1600Mi"
+            limits:
+              cpu: "1"
+              memory: "2500Mi"
+          env:
+            - name: AZURE_COSMOSDB_PRIMARY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pods-ai-inference-system
+                  key: AZURE_COSMOSDB_PRIMARY_KEY
+            - name: AZURE_STORAGE_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: pods-ai-inference-system
+                  key: AZURE_STORAGE_CONNECTION_STRING
+            - name: INFERENCESYSTEM_APPINSIGHTS_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: pods-ai-inference-system
+                  key: INFERENCESYSTEM_APPINSIGHTS_CONNECTION_STRING
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: pods-ai-hydrophone-configs

@@ -1,0 +1,16 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pods-ai-hydrophone-configs
+  namespace: orcasound-lab
+data:
+  config.yml: |
+    model_id: "davethaler/whale-call-detector"
+    model_hf_repo_id: "davethaler/whale-call-detector"
+    hls_stream_type: "LiveHLS"
+    hls_live_delay_buffer: 60
+    inference_segment_size: 60
+    hls_hydrophone_id: "rpi_orcasound_lab"
+    upload_to_azure: true
+    delete_local_wavs: true

@@ -13,9 +13,23 @@ pods-ai/
 │   ├── dependabot.yml            # Dependabot updates for GitHub Actions
 │   ├── renovate.json             # Renovate configuration
 │   └── workflows/
-│       ├── check_csv.yml         # CI: regenerates and validates detections.csv
-│       └── validate-yaml.yml     # CI: yamllint on all YAML files
+│       ├── check_csv.yml                          # CI: regenerates and validates detections.csv
+│       ├── LiveInferenceSystem.yaml               # CI: build and smoke-test the Docker container
+│       ├── LiveInferenceSystem-deploy.yaml        # CD: push container image to ACR on tag
+│       ├── LiveInferenceSystem-deploy-configmaps.yaml  # CD: apply K8s configmaps on change
+│       └── validate-yaml.yml                      # CI: yamllint on all YAML files
 ├── external/                     # Git submodules such as OrcaHello
+├── LiveInferenceSystem/          # Docker container for live inference (mirrors OrcaHello's InferenceSystem/)
+│   ├── Dockerfile                # Container definition (build from repo root)
+│   ├── .dockerignore
+│   ├── pyproject.toml            # Production Python dependencies (uses uv)
+│   ├── uv.lock                   # Locked dependency versions
+│   ├── deploy/                   # Kubernetes manifests for each hydrophone location
+│   │   ├── <location>.yaml          # Deployment spec
+│   │   └── <location>-configmap.yaml  # Hydrophone-specific orchestrator config
+│   └── tests/
+│       └── orch_configs/         # Orchestrator config files for smoke tests
+│           └── LiveHLS/
 ├── output/                       # Generated CSV, WAV, PNG, and model artifacts
 ├── tests/                        # Pytest test suite
 ├── LICENSE
@@ -32,6 +46,7 @@ pods-ai/
     ├── download_wavs.py            # Step 4: download wav files
     ├── extract_training_samples.py # Step 3: detections.csv → initial training/testing samples
     ├── get_best_timestamp.py       # Timestamp correction helper
+    ├── LiveInferenceOrchestrator.py  # Live HLS inference loop (entry point for Docker container)
     ├── merge_training_samples.py   # Step 4: initial/manual samples → training samples
     ├── make_csv.py                 # Step 1: query APIs → detections.csv
     ├── make_spectrograms.py        # Step 6: wav → PNG spectrograms
@@ -97,9 +112,23 @@ Classification kinds: `tp_human_only`, `tp_machine_only`, `fp_machine_only`, `tp
 ## CI / CD
 
 - **check_csv.yml** – Runs on every PR; re-executes `make_csv.py`, `extract_training_samples.py`, and, when relevant files changed, `merge_training_samples.py`, then asserts no diff in the committed CSV files (requires `COSMOS_KEY` secret for `make_csv.py`).
+- **LiveInferenceSystem.yaml** – Runs on every PR touching `LiveInferenceSystem/**` or the orchestrator source files; builds the Docker image from the repo root and runs a LiveHLS smoke test.
+- **LiveInferenceSystem-deploy.yaml** – Triggered by a `LiveInferenceSystem.v#.#.#` tag push; builds and pushes the container image to `orcaconservancycr.azurecr.io/pods-ai-live-inference-system`.
+- **LiveInferenceSystem-deploy-configmaps.yaml** – Triggered when `LiveInferenceSystem/deploy/*-configmap.yaml` files change on `main`; applies updated configmaps and restarts the affected deployments via `kubectl`.
 - **validate-yaml.yml** – Runs `yamllint` against all YAML files using the rules in `.yamllint.yml` (line-length disabled, truthy check-keys disabled).
 - **dependabot.yml** – Weekly updates for GitHub Actions dependencies.
 - **renovate.json** – Tracks additional dependency updates, including the pinned PODS-AI test model revision.
+
+## LiveInferenceSystem Container
+
+`LiveInferenceSystem/` mirrors the structure of OrcaHello's `InferenceSystem/` and packages the live inference orchestrator as a Docker container for AKS deployment.
+
+- **Docker build context**: repo root (not `LiveInferenceSystem/`), so the Dockerfile accesses both `src/` and `external/orcahello/InferenceSystem/src/orcasound_hls/`.
+- **Container image name**: `pods-ai-live-inference-system` (different from OrcaHello's `live-inference-system` to allow side-by-side coexistence).
+- **K8s deployment name**: `pods-ai-inference-system` (different from OrcaHello's `inference-system`); both share the same namespaces (e.g. `bush-point`, `orcasound-lab`).
+- **ConfigMap name**: `pods-ai-hydrophone-configs` (mounted at `/config/config.yml`).
+- **Secrets**: `pods-ai-inference-system` secret per namespace with `AZURE_COSMOSDB_PRIMARY_KEY`, `AZURE_STORAGE_CONNECTION_STRING`, and `INFERENCESYSTEM_APPINSIGHTS_CONNECTION_STRING`.
+- The `external/orcahello` submodule must be initialized before building the Docker image.
 
 ## Dependencies
 
