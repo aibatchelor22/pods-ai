@@ -21,7 +21,7 @@ from model_inference import get_model_inference
 
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
+PODSAI_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"
 PROPOSED_DESCRIPTION_EXTRA_CLASSES = {"vessel", "human", "jingle"}
 
 

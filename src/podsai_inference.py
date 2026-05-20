@@ -30,6 +30,12 @@ SEGMENT_GROUP_SIZE = 10
 # AST models expect a pre-computed mel spectrogram; raw-audio models (e.g. Wav2Vec2)
 # use the feature extractor directly.
 MODEL_TYPE_AST = "audio-spectrogram-transformer"
+# AST adds two learned special tokens: [CLS] and distillation token.
+NUM_SPECIAL_TOKENS = 2
+# Default AST patch geometry when config omits explicit values.
+DEFAULT_AST_PATCH_SIZE = 16
+DEFAULT_AST_FREQUENCY_STRIDE = 10
+DEFAULT_AST_TIME_STRIDE = 10
 
 
 class PodsAIInference(ModelInference):  # Inherit from ModelInference
@@ -120,6 +126,8 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         self._use_spectrogram_input = (
             getattr(self.model.config, 'model_type', '') == MODEL_TYPE_AST
         )
+        # Cache resized AST positional embeddings by token count to avoid re-interpolating.
+        self._ast_pos_embed_cache: dict[int, torch.Tensor] = {}
 
         # Get label mapping. This assumes the model was trained with a config that includes id2label and label2id.
         self.id2label = self.model.config.id2label
@@ -161,6 +169,82 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         # Store which classes are considered negative (non-whale)
         self.negative_class_ids = {self.label2id[label] for label in found_negative}
         print(f"Treating classes as negative/background: {found_negative}")
+
+    def _ensure_ast_position_embeddings(
+        self, target_frames: int, num_mel_bins: int
+    ) -> bool:
+        """
+        Resize AST position embeddings to match the requested spectrogram shape.
+        This updates model embeddings in-place for the requested token shape.
+        Callers should not share this inference instance across threads.
+
+        Returns:
+            True if embeddings already match target shape or were resized successfully.
+            False if AST embedding resize is unavailable for the current model.
+        """
+        ast_module = getattr(self.model, "audio_spectrogram_transformer", None)
+        embeddings = getattr(ast_module, "embeddings", None)
+        position_embeddings = getattr(embeddings, "position_embeddings", None)
+        if position_embeddings is None or position_embeddings.ndim != 3:
+            return False
+
+        config = self.model.config
+        try:
+            patch_size = int(getattr(config, "patch_size", DEFAULT_AST_PATCH_SIZE))
+            freq_stride = int(getattr(config, "frequency_stride", DEFAULT_AST_FREQUENCY_STRIDE))
+            time_stride = int(getattr(config, "time_stride", DEFAULT_AST_TIME_STRIDE))
+            cfg_max_length = int(getattr(config, "max_length", target_frames))
+            cfg_num_mel_bins = int(getattr(config, "num_mel_bins", num_mel_bins))
+        except (TypeError, ValueError):
+            return False
+
+        target_freq = (num_mel_bins - patch_size) // freq_stride + 1
+        target_time = (target_frames - patch_size) // time_stride + 1
+        if target_freq < 1 or target_time < 1:
+            return False
+        target_tokens = target_freq * target_time + NUM_SPECIAL_TOKENS
+        target_cache_key = (target_freq, target_time)
+
+        if position_embeddings.shape[1] == target_tokens:
+            return True
+
+        if target_cache_key in self._ast_pos_embed_cache:
+            resized = self._ast_pos_embed_cache[target_cache_key]
+            embeddings.position_embeddings = torch.nn.Parameter(resized, requires_grad=False)
+            return True
+
+        source_freq = (cfg_num_mel_bins - patch_size) // freq_stride + 1
+        source_time = (cfg_max_length - patch_size) // time_stride + 1
+        if source_freq < 1 or source_time < 1:
+            return False
+        source_cache_key = (source_freq, source_time)
+
+        source_embeddings = self._ast_pos_embed_cache.get(source_cache_key)
+        if source_embeddings is None:
+            # Keep an immutable copy of the current embeddings because we mutate
+            # model embeddings in-place for resized token grids.
+            source_embeddings = position_embeddings.detach().clone()
+            self._ast_pos_embed_cache[source_cache_key] = source_embeddings
+
+        source_patch = source_embeddings[:, NUM_SPECIAL_TOKENS:, :]
+        source_tokens = source_patch.shape[1]
+        if source_freq * source_time != source_tokens:
+            return False
+
+        # Convert token sequence [batch, tokens, hidden] into [batch, hidden, freq, time]
+        # so bilinear interpolation can resize the 2D patch grid.
+        hidden_dim = source_embeddings.shape[-1]
+        source_patch = source_patch.reshape(1, source_freq, source_time, hidden_dim).permute(0, 3, 1, 2)
+        resized_patch = torch.nn.functional.interpolate(
+            source_patch, size=(target_freq, target_time), mode="bilinear", align_corners=False
+        )
+        # Convert back from [batch, hidden, freq, time] to token sequence format.
+        resized_patch = resized_patch.permute(0, 2, 3, 1).reshape(1, target_freq * target_time, hidden_dim)
+        resized = torch.cat([source_embeddings[:, :NUM_SPECIAL_TOKENS, :], resized_patch], dim=1)
+
+        self._ast_pos_embed_cache[target_tokens] = resized.detach()
+        embeddings.position_embeddings = torch.nn.Parameter(resized, requires_grad=False)
+        return True
 
     def _print_model_metadata(self, model_path: str) -> None:
         """
@@ -244,7 +328,7 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
             segment_samples: Segment size in samples.
 
         Returns:
-            Tensor of shape (num_positions, max_length, num_mel_bins) ready for the model.
+            Tensor of shape (num_positions, target_frames, num_mel_bins) ready for the model.
         """
         import torchaudio
 
@@ -275,7 +359,15 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         hop_frames = round(hop_samples / sr * frames_per_second)
         seg_frames = round(segment_samples / sr * frames_per_second)
 
-        # Slice each window, apply per-utterance mean normalisation, and pad to max_length.
+        # Use segment-length windows for AST to avoid unnecessary compute, but ensure
+        # model positional embeddings are resized to the resulting patch grid.
+        target_frames = max(1, min(max_length, seg_frames))
+        if self._use_spectrogram_input:
+            if not self._ensure_ast_position_embeddings(target_frames, num_mel_bins):
+                print("Warning: AST positional embedding resize unavailable; using full max_length input.")
+                target_frames = max_length
+
+        # Slice each window, apply per-utterance mean normalisation, and pad to target_frames.
         # This replicates ASTFeatureExtractor._extract_fbank_features() for each window.
         windows: list[torch.Tensor] = []
         for pos_idx in range(num_positions):
@@ -286,12 +378,12 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
             # Per-utterance mean subtraction (matches ASTFeatureExtractor._extract_fbank_features).
             window = window - window.mean()
 
-            # Pad or truncate to max_length.
-            if window.shape[0] < max_length:
-                pad_len = max_length - window.shape[0]
+            # Pad or truncate to target_frames.
+            if window.shape[0] < target_frames:
+                pad_len = target_frames - window.shape[0]
                 window = torch.nn.functional.pad(window, (0, 0, 0, pad_len))
             else:
-                window = window[:max_length, :]
+                window = window[:target_frames, :]
 
             windows.append(window)
 

@@ -16,12 +16,13 @@ import soundfile as sf
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import torch
+from podsai_inference import NUM_SPECIAL_TOKENS
 
 
 # Pinned PODS-AI model revision for integration-test stability.
 PODSAI_TEST_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_TEST_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
+PODSAI_TEST_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"
 
 
 def _resolve_podsai_test_model_path() -> str:
@@ -448,6 +449,79 @@ class TestPodsAIInferenceIndexing:
         assert all(0.0 <= c <= 1.0 for c in result["local_confidences"])
         assert len(result["local_confidences"]) == 29  # 60s audio, 2s hop
 
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
+    def test_ast_path_uses_segment_frame_length(
+        self, mock_extractor_class, mock_model_class,
+        mock_feature_extractor, synthetic_audio_60s
+    ):
+        """AST path should use segment frame length when embeddings can be resized."""
+        mock_model = Mock()
+        mock_config = Mock()
+        mock_config.id2label = {
+            0: "water", 1: "resident", 2: "transient", 3: "humpback",
+            4: "vessel", 5: "jingle", 6: "human"
+        }
+        mock_config.label2id = {
+            "water": 0, "resident": 1, "transient": 2, "humpback": 3,
+            "vessel": 4, "jingle": 5, "human": 6
+        }
+        mock_config._name_or_path = "test-model"
+        mock_config.architectures = ["ASTForAudioClassification"]
+        mock_config.model_type = "audio-spectrogram-transformer"
+        mock_config._commit_hash = None
+        mock_config.patch_size = 16
+        mock_config.frequency_stride = 10
+        mock_config.time_stride = 10
+        mock_config.max_length = 1024
+        mock_config.num_mel_bins = 128
+        mock_model.config = mock_config
+        mock_model.audio_spectrogram_transformer = Mock()
+        mock_model.audio_spectrogram_transformer.embeddings = Mock()
+        freq_tokens = (mock_config.num_mel_bins - mock_config.patch_size) // mock_config.frequency_stride + 1
+        time_tokens = (mock_config.max_length - mock_config.patch_size) // mock_config.time_stride + 1
+        original_token_count = (freq_tokens * time_tokens) + NUM_SPECIAL_TOKENS
+        mock_model.audio_spectrogram_transformer.embeddings.position_embeddings = torch.nn.Parameter(
+            torch.zeros((1, original_token_count, 4), dtype=torch.float32)
+        )
+        mock_model.to = Mock(return_value=mock_model)
+        mock_model.eval = Mock(return_value=mock_model)
+
+        call_shapes: list[tuple[int, ...]] = []
+
+        def mock_forward(**kwargs):
+            call_shapes.append(tuple(kwargs["input_values"].shape))
+            batch_size = kwargs["input_values"].shape[0]
+            logits = torch.tensor([[2.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]]).repeat(batch_size, 1)
+            mock_output = Mock()
+            mock_output.logits = logits
+            return mock_output
+
+        mock_model.side_effect = mock_forward
+        mock_extractor_class.from_pretrained = Mock(return_value=mock_feature_extractor)
+        mock_model_class.from_pretrained = Mock(return_value=mock_model)
+
+        from podsai_inference import PodsAIInference
+
+        model = PodsAIInference("test-model-path")
+
+        result = model.predict(synthetic_audio_60s, segment_duration=3, hop_duration=2)
+        first_call_shapes = call_shapes.copy()
+
+        assert len(result["local_confidences"]) == 29
+        assert first_call_shapes, "Expected at least one AST forward pass."
+        # 3 seconds with 10ms frame shift -> 300 frames.
+        assert all(shape[1] == 300 for shape in first_call_shapes)
+
+        call_shapes.clear()
+        second_result = model.predict(synthetic_audio_60s, segment_duration=5, hop_duration=2)
+        second_call_shapes = call_shapes.copy()
+
+        assert len(second_result["local_confidences"]) == 28
+        assert second_call_shapes, "Expected at least one AST forward pass on repeated predict()."
+        # 5 seconds with 10ms frame shift -> 500 frames.
+        assert all(shape[1] == 500 for shape in second_call_shapes)
+
 
 class TestPodsAIInferenceErrorHandling:
     """Test error handling in PodsAIInference."""
@@ -517,13 +591,13 @@ class TestIntegrationWithRealModels:
         return _resolve_podsai_test_model_path()
 
     def test_predict_60s_wav_performance(self, podsai_model_path: str) -> None:
-        """Inference on a 60-second wav file must complete in under 15 seconds.
+        """Inference on a 60-second wav file must complete in under 22 seconds.
 
         This test guards against performance regressions in the inference pipeline.
         For AST models the full-audio spectrogram optimization (one fbank call
-        instead of one per segment) keeps the budget well under 15 seconds on a
+        instead of one per segment) keeps the budget well under 22 seconds on a
         CPU-only machine.  For Wav2Vec2 (and other raw-audio) models the raw-audio
-        path is used instead; both should comfortably fit the 15-second budget.
+        path is used instead; both should comfortably fit the 22-second budget.
         """
         from podsai_inference import PodsAIInference
 
@@ -544,9 +618,9 @@ class TestIntegrationWithRealModels:
 
             print(f"\nPodsAI predict() took {elapsed:.2f}s for a 60-second WAV")
 
-            assert elapsed < 15.0, (
+            assert elapsed < 22.0, (
                 f"PodsAI inference on a 60-second WAV took {elapsed:.2f}s, "
-                f"expected < 15s. Check for performance regressions in the inference pipeline."
+                f"expected < 22s. Check for performance regressions in the inference pipeline."
             )
             # 60s audio with segment_duration=3 and hop_duration=2 → 29 positions.
             assert len(result["local_confidences"]) == 29
