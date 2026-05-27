@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Unit tests for PODS-AI LiveInferenceOrchestrator helpers."""
 
+from unittest.mock import Mock
+
 import LiveInferenceOrchestrator as orchestrator
 
 
@@ -96,3 +98,57 @@ def test_build_cosmosdb_metadata_comments_appends_dominant_extra_class() -> None
     )
 
     assert metadata["comments"] == "AI: resident and vessel"
+
+
+def test_upload_detection_to_azure_skips_existing_blobs(tmp_path) -> None:
+    """BlobAlreadyExists upload races should be treated as skip/no-op."""
+    clip_path = tmp_path / "existing.wav"
+    clip_path.write_bytes(b"clip")
+    spectrogram_path = tmp_path / "existing.png"
+    spectrogram_path.write_bytes(b"spectrogram")
+
+    result = {
+        "local_predictions": [],
+        "local_confidences": [],
+        "global_confidence": 0.9,
+        "global_prediction_label": "resident",
+    }
+
+    class BlobAlreadyExistsError(Exception):
+        error_code = "BlobAlreadyExists"
+
+    audio_blob_client = Mock()
+    audio_blob_client.upload_blob.side_effect = BlobAlreadyExistsError()
+    spectrogram_blob_client = Mock()
+    spectrogram_blob_client.upload_blob.side_effect = BlobAlreadyExistsError()
+    blob_service_client = Mock()
+    blob_service_client.get_blob_client.side_effect = [
+        audio_blob_client,
+        spectrogram_blob_client,
+    ]
+
+    container = Mock()
+    database = Mock()
+    database.get_container_client.return_value = container
+    cosmos_client = Mock()
+    cosmos_client.get_database_client.return_value = database
+    logger = Mock()
+
+    orchestrator.upload_detection_to_azure(
+        clip_path=str(clip_path),
+        spectrogram_path=str(spectrogram_path),
+        result=result,
+        start_timestamp="2026-01-01T00:00:00Z",
+        hls_hydrophone_id="rpi_orcasound_lab",
+        model_id="podsai-model",
+        blob_service_client=blob_service_client,
+        cosmos_client=cosmos_client,
+        logger=logger,
+    )
+
+    audio_blob_client.exists.assert_not_called()
+    spectrogram_blob_client.exists.assert_not_called()
+    audio_blob_client.upload_blob.assert_called_once()
+    spectrogram_blob_client.upload_blob.assert_called_once()
+    logger.info.assert_any_call("Blob already exists, skipping upload: existing.wav")
+    logger.info.assert_any_call("Blob already exists, skipping upload: existing.png")
