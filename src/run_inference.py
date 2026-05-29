@@ -21,7 +21,7 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Optional
+from typing import Any, Optional
 
 import ffmpeg
 from pytz import timezone as pytz_tz
@@ -35,6 +35,7 @@ PODSAI_WAV2VEC2_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
 # Preserve the existing exported constant name for compatibility.
 PODSAI_MODEL_REVISION = PODSAI_AST_MODEL_REVISION
 PROPOSED_DESCRIPTION_EXTRA_CLASSES = {"vessel", "human", "jingle"}
+NEGATIVE_LABELS = {"other", "water", "vessel", "jingle", "human"}
 PACIFIC_TZ = pytz_tz("US/Pacific")
 UTC_TZ = timezone.utc
 MIN_SEGMENT_DURATION = 0.001
@@ -58,6 +59,10 @@ def _format_utc_iso_z(dt: datetime) -> str:
 
 def _build_clip_id(start_time_utc: datetime) -> str:
     return start_time_utc.astimezone(PACIFIC_TZ).strftime("%Y_%m_%d_%H_%M_%S_PST")
+
+
+def _format_pacific_timestamp(dt: datetime) -> str:
+    return dt.astimezone(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def download_60s_audio_from_start_utc(
@@ -210,10 +215,64 @@ def build_proposed_description(
     return proposed_description
 
 
+def prediction_to_label(prediction: Any, id2label: Optional[dict[int, str]]) -> str:
+    """Return a string label for a local/global prediction value."""
+    if isinstance(prediction, str):
+        return prediction
+    if isinstance(prediction, int) and id2label is not None:
+        return id2label.get(prediction, str(prediction))
+    return str(prediction)
+
+
+def calculate_positive_segments(
+    local_predictions: list[Any],
+    local_confidences: list[Any],
+    hop_duration: float,
+    segment_duration: float,
+    id2label: Optional[dict[int, str]] = None,
+    negative_labels: Optional[set[str]] = None,
+    threshold: Optional[float] = None,
+    start_time_utc: Optional[datetime] = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Count positive segments and optionally include UTC/Pacific timestamps."""
+    effective_negative_labels = (
+        negative_labels if negative_labels is not None else NEGATIVE_LABELS
+    )
+    confidence_threshold = float(threshold) if threshold is not None else 0.0
+    positive_segments: list[dict[str, Any]] = []
+
+    for idx, (local_prediction, local_confidence) in enumerate(
+        zip(local_predictions, local_confidences)
+    ):
+        label = prediction_to_label(local_prediction, id2label)
+        confidence = float(local_confidence)
+        if label in effective_negative_labels or confidence < confidence_threshold:
+            continue
+
+        start_seconds = idx * float(hop_duration)
+        segment_info: dict[str, Any] = {
+            "index": idx,
+            "label": label,
+            "confidence": confidence,
+            "start_time_seconds": start_seconds,
+            "duration_seconds": float(segment_duration),
+        }
+        if start_time_utc is not None:
+            segment_start_time_utc = start_time_utc + timedelta(seconds=start_seconds)
+            segment_info["start_time_utc"] = _format_utc_iso_z(segment_start_time_utc)
+            segment_info["start_time_pacific"] = _format_pacific_timestamp(
+                segment_start_time_utc
+            )
+        positive_segments.append(segment_info)
+
+    return len(positive_segments), positive_segments
+
+
 def run_inference(wav_path: str, model_type: str = "podsai",
                   model_path: Optional[str] = None,
                   model_revision: Optional[str] = None,
-                  model_variant: str = "ast") -> dict:
+                  model_variant: str = "ast",
+                  start_time_utc: Optional[datetime] = None) -> dict:
     """
     Run inference on a wav file and return per-class probabilities.
 
@@ -243,7 +302,15 @@ def run_inference(wav_path: str, model_type: str = "podsai",
             - global_confidence: confidence score (0.0-1.0) for the global prediction
             - proposed_description: text description suitable for manual sample notes
             - predict_time: time in seconds spent in the model's predict() method
+            - positive_segments_count: number of positive PODS-AI segments above threshold
+            - positive_segments: list of positive segment details (label/confidence/timestamps)
     """
+    local_predictions: list[Any] = []
+    local_confidences: list[Any] = []
+    hop_duration = 2.0
+    segment_duration = 3.0
+    positive_segments_count = 0
+    positive_segments: list[dict[str, Any]] = []
 
     if model_type == "fastai":
         if model_path is None:
@@ -253,6 +320,10 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         start_time = time.perf_counter()
         result = model.predict(wav_path)
         predict_time = time.perf_counter() - start_time
+        local_predictions = result.get("local_predictions", [])
+        local_confidences = result.get("local_confidences", [])
+        hop_duration = float(result.get("hop_duration", 1.0))
+        segment_duration = float(result.get("segment_duration", 3.0))
         # local_confidences that exceed the threshold (resident windows).
         resident_prob = float(result.get("global_confidence", 0.0))
         other_prob = round(1.0 - resident_prob, 4)
@@ -277,6 +348,10 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         start_time = time.perf_counter()
         result = model.predict(wav_path)
         predict_time = time.perf_counter() - start_time
+        local_predictions = result.get("local_predictions", [])
+        local_confidences = result.get("local_confidences", [])
+        hop_duration = float(result.get("hop_duration", 1.0))
+        segment_duration = float(result.get("segment_duration", 2.0))
 
         # The OrcaHello SRKW detector is a binary classifier (other vs resident).
         resident_prob = float(result.get("global_confidence", 0.0))
@@ -313,18 +388,29 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         start_time = time.perf_counter()
         result = model.predict(wav_path)
         predict_time = time.perf_counter() - start_time
+        local_predictions = result.get("local_predictions", [])
+        local_confidences = result.get("local_confidences", [])
+        hop_duration = float(result.get("hop_duration", 2.0))
+        segment_duration = float(result.get("segment_duration", 3.0))
 
         probabilities = result["per_class_probabilities"]
         local_prediction_labels = []
-        for local_prediction in result.get("local_predictions", []):
-            if isinstance(local_prediction, str):
-                local_prediction_labels.append(local_prediction)
-            else:
-                label = getattr(model, "id2label", {}).get(local_prediction)
-                if isinstance(label, str):
-                    local_prediction_labels.append(label)
+        id2label = getattr(model, "id2label", {})
+        for local_prediction in local_predictions:
+            label = prediction_to_label(local_prediction, id2label)
+            if isinstance(label, str):
+                local_prediction_labels.append(label)
         global_prediction_label = result.get("global_prediction_label", "")
         global_confidence = float(result.get("global_confidence", 0.0))
+        positive_segments_count, positive_segments = calculate_positive_segments(
+            local_predictions=local_predictions,
+            local_confidences=local_confidences,
+            hop_duration=hop_duration,
+            segment_duration=segment_duration,
+            id2label=id2label,
+            threshold=getattr(model, "threshold", None),
+            start_time_utc=start_time_utc,
+        )
 
     else:
         raise ValueError(
@@ -339,6 +425,12 @@ def run_inference(wav_path: str, model_type: str = "podsai",
         "global_confidence": global_confidence,
         "proposed_description": proposed_description,
         "predict_time": predict_time,
+        "local_predictions": local_predictions,
+        "local_confidences": local_confidences,
+        "hop_duration": hop_duration,
+        "segment_duration": segment_duration,
+        "positive_segments_count": positive_segments_count,
+        "positive_segments": positive_segments,
     }
 
 
@@ -359,6 +451,21 @@ def print_results(results: dict, model_type: str) -> None:
     print(f"Global prediction: {label} (confidence: {confidence:.4f})")
     print(f"Proposed description: {proposed_description}")
     print(f"Prediction time: {predict_time:.2f}s")
+    if model_type == "podsai":
+        local_predictions = results.get("local_predictions", [])
+        positive_segments = results.get("positive_segments", [])
+        positive_segments_count = results.get("positive_segments_count", 0)
+        print(f"Positive segments: {positive_segments_count}/{len(local_predictions)}")
+        if positive_segments:
+            print("Positive segment timestamps:")
+            for segment in positive_segments:
+                timestamp = segment.get("start_time_pacific")
+                if timestamp is None:
+                    timestamp = f"+{float(segment.get('start_time_seconds', 0.0)):.1f}s"
+                print(
+                    f"  {timestamp}: {segment.get('label', '')} "
+                    f"(confidence: {float(segment.get('confidence', 0.0)):.3f})"
+                )
     print()
     print("Per-class probabilities:")
     for class_name, prob in sorted(probabilities.items()):
@@ -468,6 +575,7 @@ def main() -> int:
         return 1
 
     with ExitStack() as stack:
+        start_time_utc: Optional[datetime] = None
         if args.wav_file:
             if args.node_name is not None:
                 print(
@@ -515,6 +623,7 @@ def main() -> int:
                 model_path=args.model_path,
                 model_revision=args.model_revision,
                 model_variant=args.type,
+                start_time_utc=start_time_utc,
             )
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)

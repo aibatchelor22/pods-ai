@@ -290,6 +290,50 @@ class TestRunInferencePodsAI:
             assert "global_prediction_label" in result
             assert "global_confidence" in result
             assert "proposed_description" in result
+            assert "positive_segments_count" in result
+            assert "positive_segments" in result
+        finally:
+            Path(wav_path).unlink(missing_ok=True)
+
+    def test_positive_segments_include_pacific_timestamps(self):
+        """PODS-AI positives include Pacific timestamps when start_time_utc is provided."""
+        wav_path = _make_wav()
+        try:
+            mock_model = _make_podsai_model_mock(num_local=4)
+            mock_model.predict.return_value = {
+                "local_predictions": [0, 1, 2, 4],
+                "local_confidences": [0.6, 0.7, 0.8, 0.9],
+                "global_prediction": 1,
+                "global_prediction_label": "resident",
+                "global_confidence": 0.7,
+                "per_class_probabilities": {
+                    "water": 0.0,
+                    "resident": 0.7,
+                    "transient": 0.8,
+                    "humpback": 0.0,
+                    "vessel": 0.9,
+                    "jingle": 0.0,
+                    "human": 0.0,
+                },
+                "hop_duration": 2.0,
+                "segment_duration": 3.0,
+            }
+            with patch("run_inference.get_model_inference", return_value=mock_model):
+                from run_inference import run_inference
+
+                result = run_inference(
+                    wav_path,
+                    model_type="podsai",
+                    model_path="fake-path",
+                    start_time_utc=datetime(2025, 1, 15, 20, 29, 0, tzinfo=timezone.utc),
+                )
+
+            assert result["positive_segments_count"] == 2
+            assert len(result["positive_segments"]) == 2
+            assert result["positive_segments"][0]["label"] == "resident"
+            assert result["positive_segments"][0]["start_time_pacific"] == "2025-01-15 12:29:02 PST"
+            assert result["positive_segments"][1]["label"] == "transient"
+            assert result["positive_segments"][1]["start_time_pacific"] == "2025-01-15 12:29:04 PST"
         finally:
             Path(wav_path).unlink(missing_ok=True)
 
@@ -865,6 +909,35 @@ class TestMainCLI:
         assert "fastai" in captured.out
         assert "0.7000" in captured.out
         assert "AI: resident" in captured.out
+
+    def test_print_results_outputs_positive_segment_summary_for_podsai(self, capsys):
+        """print_results() writes positive segment count and timestamps for PODS-AI."""
+        from run_inference import print_results
+        results = {
+            "probabilities": {"resident": 0.7, "water": 0.3},
+            "global_prediction_label": "resident",
+            "global_confidence": 0.7,
+            "proposed_description": "AI: resident",
+            "local_predictions": [0, 1, 2, 4],
+            "positive_segments_count": 2,
+            "positive_segments": [
+                {
+                    "label": "resident",
+                    "confidence": 0.7,
+                    "start_time_pacific": "2025-01-15 12:29:02 PST",
+                },
+                {
+                    "label": "transient",
+                    "confidence": 0.8,
+                    "start_time_pacific": "2025-01-15 12:29:04 PST",
+                },
+            ],
+        }
+        print_results(results, "podsai")
+        captured = capsys.readouterr()
+        assert "Positive segments: 2/4" in captured.out
+        assert "2025-01-15 12:29:02 PST: resident (confidence: 0.700)" in captured.out
+        assert "2025-01-15 12:29:04 PST: transient (confidence: 0.800)" in captured.out
 
 
 class TestPinnedPodsAIModelPath:
