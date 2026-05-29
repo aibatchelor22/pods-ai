@@ -322,15 +322,24 @@ the model's threshold — the same statistic used for `global_confidence`.  For 
 binary model, `resident = global_confidence` and `other = 1 - global_confidence`.
 
 ```
-usage: python run_inference.py <wav_file> [--model {podsai,fastai,orcahello}] [--type {ast,wav2vec2}] [--model-path PATH]
+usage: python run_inference.py [wav_file]
+       [--node-name NODE_NAME]
+       [--end-timestamp-str YYYY_MM_DD_HH_MM_SS_PST | --start-timestamp-utc YYYY-MM-DDTHH:MM:SSZ]
+       [--model {podsai,fastai,orcahello}] [--type {ast,wav2vec2}] [--model-path PATH]
 ```
 
 | Argument | Description |
 |---|---|
 | `wav_file` | Path to the wav file to score |
+| `--node-name` | Hydrophone feed node name (for download mode) |
+| `--end-timestamp-str` | PST **end** timestamp used with `--node-name` (format: `YYYY_MM_DD_HH_MM_SS_PST`) |
+| `--start-timestamp-utc` | UTC **start** timestamp used with `--node-name` (format: `YYYY-MM-DDTHH:MM:SSZ`) |
 | `--model` | Model type: `podsai` (default), `fastai`, or `orcahello` |
 | `--type` | PODS-AI model variant used with `--model podsai`: `ast` (default) or `wav2vec2` (older model variant). These map to the currently pinned revisions in `src/run_inference.py` |
 | `--model-path` | Path to model directory or HuggingFace Hub model ID. Required for `podsai`; defaults to `./model` for `fastai`; defaults to `orcasound/orcahello-srkw-detector-v1` for `orcahello`; defaults to `davethaler/whale-call-detector` for `podsai` |
+
+When using `--node-name`, provide exactly one timestamp argument:
+`--end-timestamp-str` or `--start-timestamp-utc`.
 
 **Example — PODS-AI model**
 

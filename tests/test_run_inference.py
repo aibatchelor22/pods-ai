@@ -15,8 +15,8 @@ Tests cover:
 
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -700,6 +700,27 @@ class TestMainCLI:
             from run_inference import main
             assert main() == 1
 
+    def test_main_returns_one_when_multiple_timestamp_args_provided(self):
+        """main() returns exit code 1 when both start and end timestamp args are provided."""
+        with patch(
+            "sys.argv",
+            [
+                "run_inference.py",
+                "--node-name",
+                "rpi_sunset_bay",
+                "--end-timestamp-str",
+                "2025_01_15_12_30_00_PST",
+                "--start-timestamp-utc",
+                "2025-01-15T20:29:00Z",
+                "--model",
+                "fastai",
+                "--model-path",
+                "./model",
+            ],
+        ):
+            from run_inference import main
+            assert main() == 1
+
     def test_main_returns_one_when_wav_and_download_args_provided(self):
         """main() returns exit code 1 when both wav_file and download args are provided."""
         wav_path = _make_wav()
@@ -711,7 +732,7 @@ class TestMainCLI:
                     wav_path,
                     "--node-name",
                     "rpi_sunset_bay",
-                    "--timestamp-str",
+                    "--end-timestamp-str",
                     "2025_01_15_12_30_00_PST",
                     "--model",
                     "fastai",
@@ -737,12 +758,9 @@ class TestMainCLI:
             Path(wav_path).unlink(missing_ok=True)
 
     def test_main_downloads_wav_from_node_name_and_timestamp(self):
-        """main() can download wav when --node-name and --timestamp-str are provided."""
+        """main() can download wav when --node-name and --end-timestamp-str are provided."""
         wav_path = _make_wav()
         try:
-            fake_extract_module = SimpleNamespace(
-                download_60s_audio=lambda node_name, timestamp_str, tmp_dir: wav_path
-            )
             mock_model = _make_fastai_model_mock()
             with patch(
                 "sys.argv",
@@ -750,14 +768,17 @@ class TestMainCLI:
                     "run_inference.py",
                     "--node-name",
                     "rpi_sunset_bay",
-                    "--timestamp-str",
+                    "--end-timestamp-str",
                     "2025_01_15_12_30_00_PST",
                     "--model",
                     "fastai",
                     "--model-path",
                     "./model",
                 ],
-            ), patch.dict(sys.modules, {"extract_training_samples": fake_extract_module}), patch(
+            ), patch(
+                "run_inference.download_60s_audio_from_start_utc",
+                return_value=wav_path,
+            ), patch(
                 "run_inference.get_model_inference", return_value=mock_model
             ):
                 from run_inference import main
@@ -765,25 +786,55 @@ class TestMainCLI:
         finally:
             Path(wav_path).unlink(missing_ok=True)
 
+    def test_main_downloads_wav_from_node_name_and_start_timestamp_utc(self):
+        """main() can download wav when --node-name and --start-timestamp-utc are provided."""
+        wav_path = _make_wav()
+        try:
+            mock_model = _make_fastai_model_mock()
+            with patch(
+                "sys.argv",
+                [
+                    "run_inference.py",
+                    "--node-name",
+                    "rpi_sunset_bay",
+                    "--start-timestamp-utc",
+                    "2025-01-15T20:29:00Z",
+                    "--model",
+                    "fastai",
+                    "--model-path",
+                    "./model",
+                ],
+            ), patch(
+                "run_inference.download_60s_audio_from_start_utc",
+                return_value=wav_path,
+            ) as mock_download, patch(
+                "run_inference.get_model_inference", return_value=mock_model
+            ):
+                from run_inference import main
+                assert main() == 0
+                mock_download.assert_called_once()
+                _, start_time_utc, _ = mock_download.call_args[0]
+                assert isinstance(start_time_utc, datetime)
+                assert start_time_utc.tzinfo == timezone.utc
+        finally:
+            Path(wav_path).unlink(missing_ok=True)
+
     def test_main_returns_one_when_download_fails(self):
-        """main() returns exit code 1 when download_60s_audio returns None."""
-        fake_extract_module = SimpleNamespace(
-            download_60s_audio=lambda node_name, timestamp_str, tmp_dir: None
-        )
+        """main() returns exit code 1 when audio download returns None."""
         with patch(
             "sys.argv",
             [
                 "run_inference.py",
                 "--node-name",
                 "rpi_sunset_bay",
-                "--timestamp-str",
+                "--end-timestamp-str",
                 "2025_01_15_12_30_00_PST",
                 "--model",
                 "fastai",
                 "--model-path",
                 "./model",
             ],
-        ), patch.dict(sys.modules, {"extract_training_samples": fake_extract_module}):
+        ), patch("run_inference.download_60s_audio_from_start_utc", return_value=None):
             from run_inference import main
             assert main() == 1
 
