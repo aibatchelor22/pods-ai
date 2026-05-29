@@ -203,9 +203,13 @@ Key dependencies:
   segment to a `new/` directory using the standard filename convention, and prints the
   predicted class for each segment. Useful for labelling new recordings and adding them
   to the training set. See [add_samples.py](#add_samplespy) below.
-- **process_false_positives.py**: Re-checks rejected OrcaHello resident detections by
-  downloading the 60-second WAV, re-running PODS-AI, and appending resident
+- **process_false_positives.py**: Re-checks rejected OrcaHello detections by
+  downloading the 60-second WAV, re-running PODS-AI, and appending whale-class
   sub-segments with corrected classes to `output/csv/manual_samples.csv`.
+  The corrected class is inferred from the human-authored portion of the moderation
+  comments (auto-generated "AI: …" lines are ignored).  Explicit negations in the
+  comments are understood: "No humpback" suppresses the humpback match, and
+  "No humpback nor vessel" resolves the corrected class to `water`.
   Supports `--category CATEGORY` to process only detections whose inferred
   actual category matches the provided value.
 - **process_false_negatives.py**: Re-checks confirmed OrcaHello detections by
