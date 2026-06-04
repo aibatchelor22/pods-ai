@@ -21,7 +21,6 @@ human,rpi_sunset_bay,2025_02_17_15_40_30_PST,https://live.orcasound.net/bouts/ne
 human,rpi_sunset_bay,2025_02_17_15_52_44_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-02-17T23%3A52%3A44.000Z,Radio station,fp_machine_only,59.8893
 human,rpi_sunset_bay,2025_04_20_13_22_50_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-04-20T20%3A22%3A50.271Z,"Radio triggered detection, some water nose also present",fp_machine_only,59.1335
 human,rpi_sunset_bay,2025_04_20_13_39_26_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-04-20T20%3A39%3A26.372Z,Radio,fp_machine_only,76.1576
-humpback,rpi_andrews_bay,2025_11_24_20_13_43_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-11-25T04%3A13%3A43.000Z,Distant humpback calls at 20:14.,tp_human_only,
 humpback,rpi_andrews_bay,2025_12_12_01_14_55_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-12T09%3A14%3A55.000Z,Humpback!,tp_human_only,
 humpback,rpi_andrews_bay,2025_12_12_01_59_14_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-12T09%3A59%3A14.000Z,Humpback song,tp_human_only,
 humpback,rpi_andrews_bay,2025_12_12_02_16_55_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-12T10%3A16%3A55.000Z,Humpback singing continues,tp_human_only,
@@ -29,6 +28,7 @@ humpback,rpi_andrews_bay,2025_12_17_22_12_58_PST,https://live.orcasound.net/bout
 humpback,rpi_andrews_bay,2025_12_17_22_19_10_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-18T06%3A19%3A10.000Z,Clear humpback calls continuing,tp_human_only,
 humpback,rpi_andrews_bay,2025_12_17_22_40_49_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-18T06%3A40%3A49.000Z,Humpback song continues in quiet seas,tp_human_only,
 humpback,rpi_orcasound_lab,2025_11_09_03_35_15_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-09T11%3A35%3A15.576Z,"Good humpback calls, quiet ambient",tp_machine_only,57.4149
+humpback,rpi_orcasound_lab,2025_11_14_01_41_25_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-14T09%3A41%3A25.000Z,Humpback Whales,tp_human_only,
 humpback,rpi_orcasound_lab,2025_11_27_06_03_58_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-27T14%3A03%3A58.457Z,Humpback song,tp_machine_only,63.1126
 humpback,rpi_orcasound_lab,2025_12_04_01_40_34_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-12-04T09%3A40%3A34.542Z,Humpback songlike calls,tp_machine_only,65.9482
 humpback,rpi_orcasound_lab,2025_12_04_01_41_06_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-12-04T09%3A41%3A06.000Z,Humpback calls,tp_machine_only,62.0961

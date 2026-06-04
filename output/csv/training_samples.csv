@@ -42,7 +42,6 @@ human,rpi_sunset_bay,2025_05_04_20_13_42_PST,https://live.orcasound.net/bouts/ne
 human,rpi_sunset_bay,2025_05_04_20_13_46_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-05-05T03%3A13%3A46.000Z,radio,fp_machine_only,69.9
 human,rpi_sunset_bay,2025_05_04_20_13_50_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-05-05T03%3A13%3A50.000Z,radio,fp_machine_only,74.4
 human,rpi_sunset_bay,2025_05_04_20_13_54_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2025-05-05T03%3A13%3A54.000Z,radio,fp_machine_only,75.0
-humpback,rpi_andrews_bay,2025_11_24_20_14_00_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-11-25T04%3A14%3A00.000Z,Distant humpback calls at 20:14.,tp_human_only,100.0
 humpback,rpi_andrews_bay,2025_12_12_01_14_17_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-12T09%3A14%3A17.000Z,Humpback!,tp_human_only,31.0
 humpback,rpi_andrews_bay,2025_12_12_01_59_02_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-12T09%3A59%3A02.000Z,Humpback song,tp_human_only,15.3
 humpback,rpi_andrews_bay,2025_12_12_02_16_29_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-12T10%3A16%3A29.000Z,Humpback singing continues,tp_human_only,59.4
@@ -51,6 +50,7 @@ humpback,rpi_andrews_bay,2025_12_17_22_18_52_PST,https://live.orcasound.net/bout
 humpback,rpi_andrews_bay,2025_12_17_22_40_45_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2025-12-18T06%3A40%3A45.000Z,Humpback song continues in quiet seas,tp_human_only,70.0
 humpback,rpi_orcasound_lab,2023_10_28_07_33_43_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-10-28T14%3A33%3A43.000Z,Humpback vocalizing,tp_human_only,51.7
 humpback,rpi_orcasound_lab,2025_11_09_03_35_12_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-09T11%3A35%3A12.000Z,"Good humpback calls, quiet ambient",tp_machine_only,57.4
+humpback,rpi_orcasound_lab,2025_11_14_01_41_23_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-14T09%3A41%3A23.000Z,Humpback Whales,tp_human_only,100.0
 humpback,rpi_orcasound_lab,2025_11_27_06_03_35_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-27T14%3A03%3A35.000Z,Humpback song,fp_machine,75.2
 humpback,rpi_orcasound_lab,2025_11_27_06_03_45_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-27T14%3A03%3A45.000Z,Humpback song,fp_machine,75.3
 humpback,rpi_orcasound_lab,2025_11_27_06_03_55_PST,https://live.orcasound.net/bouts/new/orcasound-lab?time=2025-11-27T14%3A03%3A55.000Z,Humpback song,tp_machine_only,100.0
@@ -357,6 +357,8 @@ vessel,rpi_sunset_bay,2026_01_05_23_38_31_PST,https://live.orcasound.net/bouts/n
 vessel,rpi_sunset_bay,2026_01_05_23_38_41_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2026-01-06T07%3A38%3A41.000Z,Train,fp_machine,76.6
 vessel,rpi_sunset_bay,2026_01_05_23_38_45_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2026-01-06T07%3A38%3A45.000Z,Train,fp_machine,80.9
 vessel,rpi_sunset_bay,2026_01_05_23_39_05_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2026-01-06T07%3A39%3A05.000Z,Train,fp_machine,80.0
+water,rpi_andrews_bay,2026_05_25_19_24_10_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T02%3A24%3A10.000Z,Electrical noise,fp_machine_only,100.0
+water,rpi_andrews_bay,2026_05_26_14_08_43_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T21%3A08%3A43.000Z,Electrical noise,fp_machine_only,100.0
 water,rpi_bush_point,2024_06_28_18_57_00_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-06-29T01%3A57%3A00.000Z,Water slosh,fp_machine_only,61.9
 water,rpi_bush_point,2024_07_04_13_56_41_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-07-04T20%3A56%3A41.000Z,Watery sounds.,fp_machine_only,65.2
 water,rpi_bush_point,2025_06_07_01_03_15_PST,https://live.orcasound.net/bouts/new/bush-point?time=2025-06-07T08%3A03%3A15.000Z,Water slosh,fp_machine_only,70.4

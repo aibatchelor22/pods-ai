@@ -196,3 +196,5 @@ water,rpi_port_townsend,2025_12_08_00_02_29_PST,https://live.orcasound.net/bouts
 water,rpi_port_townsend,2025_12_13_11_01_42_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2025-12-13T19%3A01%3A42.000Z,Water slosh,fp_machine_only,68.3
 water,rpi_port_townsend,2025_12_13_11_02_12_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2025-12-13T19%3A02%3A12.000Z,Water slosh,fp_machine_only,71.5
 water,rpi_port_townsend,2025_12_13_11_02_32_PST,https://live.orcasound.net/bouts/new/port-townsend?time=2025-12-13T19%3A02%3A32.000Z,Water slosh,fp_machine_only,67.9
+water,rpi_andrews_bay,2026_05_25_19_24_10_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T02%3A24%3A07.000Z,Electrical noise,fp_machine_only,100.0
+water,rpi_andrews_bay,2026_05_26_14_08_43_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T21%3A08%3A43.000Z,Electrical noise,fp_machine_only,100.0
