@@ -33,6 +33,7 @@ datasets.config.AUDIO_BACKENDS_USE_TORCH = False
 datasets.config.AUDIOCODEC_DEFAULT_DECODER = "soundfile"
 
 from datasets import Dataset, Audio, DatasetDict, ClassLabel
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from transformers import (
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
@@ -60,11 +61,57 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LABEL2ID = {}
 ID2LABEL = {}
 
+
+class _SklearnMetricFallback:
+    """Fallback metric implementation used when evaluate metrics are unavailable."""
+
+    def __init__(self, metric_name: str):
+        self.metric_name = metric_name
+
+    def compute(
+        self,
+        predictions: list[int] | np.ndarray,
+        references: list[int] | np.ndarray,
+        average: str | None = None,
+        labels: list[int] | None = None,
+    ) -> dict:
+        predictions = np.asarray(predictions)
+        references = np.asarray(references)
+
+        if self.metric_name == "accuracy":
+            return {"accuracy": float(accuracy_score(references, predictions))}
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            references,
+            predictions,
+            average=average,
+            labels=labels,
+            zero_division=0,
+        )
+        metric_value = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }[self.metric_name]
+        return {self.metric_name: metric_value}
+
+
+def _load_metric(metric_name: str):
+    """Load an evaluate metric with sklearn fallback if unavailable."""
+    try:
+        return evaluate.load(metric_name)
+    except FileNotFoundError:
+        print(
+            f"Warning: evaluate metric '{metric_name}' unavailable; using sklearn fallback.",
+        )
+        return _SklearnMetricFallback(metric_name)
+
+
 # Load metrics once at module scope.
-ACCURACY_METRIC = evaluate.load("accuracy")
-PRECISION_METRIC = evaluate.load("precision")
-RECALL_METRIC = evaluate.load("recall")
-F1_METRIC = evaluate.load("f1")
+ACCURACY_METRIC = _load_metric("accuracy")
+PRECISION_METRIC = _load_metric("precision")
+RECALL_METRIC = _load_metric("recall")
+F1_METRIC = _load_metric("f1")
 
 # Whale classes for optimization in multi-class mode.
 WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}

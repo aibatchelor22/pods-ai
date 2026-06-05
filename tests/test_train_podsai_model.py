@@ -568,3 +568,22 @@ def test_f1_fallback_supports_multiclass_non_whale_labels(monkeypatch):
 
     # Symmetric confusion gives per-class F1=0.5 for all classes => weighted F1=0.5.
     assert metrics["f1"] == pytest.approx(0.5)
+
+
+def test_metric_loader_falls_back_to_sklearn_when_evaluate_metric_missing(monkeypatch):
+    """Metric loading should gracefully fall back when evaluate modules are unavailable."""
+    module = _import_stubbed_train_module(monkeypatch)
+
+    def _raise_not_found(_name):
+        raise FileNotFoundError("missing metric module")
+
+    monkeypatch.setattr(module.evaluate, "load", _raise_not_found)
+
+    accuracy_metric = module._load_metric("accuracy")
+    f1_metric = module._load_metric("f1")
+
+    accuracy = accuracy_metric.compute(predictions=[1, 0, 1], references=[1, 1, 1])
+    per_class_f1 = f1_metric.compute(predictions=[0, 1, 1, 0], references=[0, 1, 0, 1], average=None, labels=[0, 1])
+
+    assert accuracy["accuracy"] == pytest.approx(2.0 / 3.0)
+    assert np.allclose(per_class_f1["f1"], np.array([0.5, 0.5]))
