@@ -203,6 +203,9 @@ Key dependencies:
   segment to a `new/` directory using the standard filename convention, and prints the
   predicted class for each segment. Useful for labelling new recordings and adding them
   to the training set. See [add_samples.py](#add_samplespy) below.
+- **concatenate_wavs.py**: Concatenates WAV files in a directory into a single output file,
+  adding a short beep between clips to make quick listen-through review easier. See
+  [concatenate_wavs.py](#concatenate_wavspy) below.
 - **process_false_positives.py**: Re-checks rejected OrcaHello detections by
   downloading the 60-second WAV, re-running PODS-AI, and appending whale-class
   sub-segments with corrected classes to `output/csv/manual_samples.csv`.
@@ -315,6 +318,23 @@ Segment predictions:
   rpi-orcasound-lab_2025_01_15_12_30_02_PST.wav: resident
   rpi-orcasound-lab_2025_01_15_12_30_04_PST.wav: resident
   ...
+```
+
+### concatenate_wavs.py
+
+Concatenate all WAV files in a directory into a single WAV file with a short beep
+between clips.
+
+```bash
+cd src
+python concatenate_wavs.py <directory> [--output OUTPUT_FILENAME]
+```
+
+Example:
+
+```bash
+cd src
+python concatenate_wavs.py ../output/wav/resident --output concatenated.wav
 ```
 
 ### run_inference.py
