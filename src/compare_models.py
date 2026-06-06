@@ -9,15 +9,17 @@ Usage:
 
 Loads a test set from testing_samples.csv, then runs each enabled model
 (fastai, orcahello, oldpodsai (Wav2Vec2)), podsai (AST) on the corresponding
-60-second WAV files and
-reports correct identifications, false positives, and false negatives per model.
+60-second WAV files and reports correct identifications, whale-class F1, and
+per-whale-class false-positive/false-negative rates per model.
 
 A "correct" identification means:
-  - Model predicted "resident" (SRKW) when the label is "resident".
-  - Model predicted anything other than "resident" when the label is not "resident".
+  - For fastai and orcahello, model predicted "resident" (SRKW) when the label is
+    "resident", or anything other than "resident" when the label is not "resident".
+  - For podsai and oldpodsai, the predicted category exactly matches the label.
 
-A "false positive" means the model predicted "resident" when the correct label is not "resident".
-A "false negative" means the model predicted something other than "resident" when the label is "resident".
+For each whale class X (resident, transient, humpback):
+  - X false positives are samples predicted as X when the correct label was not X.
+  - X false negatives are samples whose correct label is X but the model predicted something else.
 """
 
 import argparse
@@ -30,6 +32,12 @@ from typing import Optional
 from run_inference import run_inference
 
 RESIDENT_LABEL = "resident"
+WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
+SUMMARY_LABELS = [
+    ("resident", "R"),
+    ("transient", "T"),
+    ("humpback", "H"),
+]
 MATRIX_CELL_PADDING = 2
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
@@ -103,6 +111,90 @@ class ModelResult:
         if not self.predict_times:
             return None
         return sum(self.predict_times) / len(self.predict_times)
+
+    @property
+    def whale_f1(self) -> Optional[float]:
+        """Macro F1 across whale classes present in the confusion matrix."""
+        whale_labels = sorted(
+            label
+            for label in _labels_seen_in_confusion_matrix(self.confusion_matrix)
+            if label in WHALE_CLASS_NAMES
+        )
+        if not whale_labels:
+            return None
+
+        f1_scores = []
+        for label in whale_labels:
+            true_positives = self.confusion_matrix.get(label, {}).get(label, 0)
+            false_positives = sum(
+                predicted_counts.get(label, 0)
+                for actual_label, predicted_counts in self.confusion_matrix.items()
+                if actual_label != label
+            )
+            false_negatives = sum(
+                count
+                for predicted_label, count in self.confusion_matrix.get(label, {}).items()
+                if predicted_label != label
+            )
+
+            precision_denominator = true_positives + false_positives
+            recall_denominator = true_positives + false_negatives
+            precision = (
+                true_positives / precision_denominator
+                if precision_denominator else 0.0
+            )
+            recall = (
+                true_positives / recall_denominator
+                if recall_denominator else 0.0
+            )
+            if precision + recall == 0:
+                f1_scores.append(0.0)
+            else:
+                f1_scores.append((2 * precision * recall) / (precision + recall))
+
+        return sum(f1_scores) / len(f1_scores)
+
+    def actual_count_for_label(self, label: str) -> int:
+        """Return how many evaluated samples have the given ground-truth label."""
+        return sum(self.confusion_matrix.get(label, {}).values())
+
+    def false_positive_count_for_label(self, label: str) -> int:
+        """Return the number of evaluated samples incorrectly predicted as the given label."""
+        return sum(
+            predicted_counts.get(label, 0)
+            for actual_label, predicted_counts in self.confusion_matrix.items()
+            if actual_label != label
+        )
+
+    def false_negative_count_for_label(self, label: str) -> int:
+        """Return the number of evaluated samples with the given label predicted as something else."""
+        return sum(
+            count
+            for predicted_label, count in self.confusion_matrix.get(label, {}).items()
+            if predicted_label != label
+        )
+
+    def false_positive_rate_for_label(self, label: str) -> Optional[float]:
+        """Return the fraction of non-label samples incorrectly predicted as the given label.
+
+        Returns None when there are no evaluated samples whose actual label differs from
+        the given label.
+        """
+        negative_count = self.evaluated - self.actual_count_for_label(label)
+        if negative_count == 0:
+            return None
+        return self.false_positive_count_for_label(label) / negative_count
+
+    def false_negative_rate_for_label(self, label: str) -> Optional[float]:
+        """Return the fraction of actual label samples predicted as something else.
+
+        Returns None when there are no evaluated samples whose actual label matches the
+        given label.
+        """
+        actual_count = self.actual_count_for_label(label)
+        if actual_count == 0:
+            return None
+        return self.false_negative_count_for_label(label) / actual_count
 
 
 def load_test_samples(testing_csv: Path, max_samples: Optional[int] = None,
@@ -187,6 +279,42 @@ def is_resident_prediction(global_prediction_label: str, model_type: str) -> boo
     return global_prediction_label == RESIDENT_LABEL
 
 
+def is_exact_match_model(model_type: str) -> bool:
+    """Return True when a model uses exact-category matching for correctness."""
+    return model_type in {"podsai", "oldpodsai"}
+
+
+def is_correct_prediction(actual_label: str, predicted_label: str, model_type: str) -> bool:
+    """Return whether a prediction should count toward the Correct column.
+
+    Args:
+        actual_label: Ground-truth category for the sample.
+        predicted_label: Model-predicted category for the sample.
+        model_type: Model family used to interpret correctness.
+
+    Returns:
+        True when the prediction is correct under the model-specific summary rules.
+    """
+    if is_exact_match_model(model_type):
+        return predicted_label == actual_label
+    return is_resident_prediction(predicted_label, model_type) == (actual_label == RESIDENT_LABEL)
+
+
+def _labels_seen_in_confusion_matrix(confusion_matrix: dict[str, dict[str, int]]) -> set[str]:
+    """Return all labels that appear as actual or predicted in a confusion matrix.
+
+    Args:
+        confusion_matrix: Mapping of actual labels to per-predicted-label counts.
+
+    Returns:
+        Set of unique labels appearing either as actual labels or predicted labels.
+    """
+    labels = set(confusion_matrix)
+    for predicted_counts in confusion_matrix.values():
+        labels.update(predicted_counts)
+    return labels
+
+
 def evaluate_model(
     model_type: str,
     model_path: Optional[str],
@@ -241,15 +369,17 @@ def evaluate_model(
         predicted_label = inference_result.get("global_prediction_label", "")
         predicted_resident = is_resident_prediction(predicted_label, model_type)
 
-        if predicted_resident == expected_resident:
+        if is_correct_prediction(sample.category, predicted_label, model_type):
             result.correct += 1
             status = "correct"
         elif predicted_resident and not expected_resident:
             result.false_positives += 1
             status = "false_positive"
-        else:
+        elif expected_resident and not predicted_resident:
             result.false_negatives += 1
             status = "false_negative"
+        else:
+            status = "incorrect"
 
         # Update per-class confusion matrix.
         actual_label = sample.category
@@ -300,14 +430,17 @@ def print_confusion_matrix(result: ModelResult) -> None:
     if not actual_labels or not predicted_labels:
         return
 
+    row_totals = {actual: sum(matrix.get(actual, {}).values()) for actual in actual_labels}
     all_labels = sorted(set(actual_labels) | set(predicted_labels))
-    col_width = max(len(label) for label in all_labels) + MATRIX_CELL_PADDING
+    widest_total = max(len("total"), max(len(str(total)) for total in row_totals.values()))
+    col_width = max(max(len(label) for label in predicted_labels), widest_total) + MATRIX_CELL_PADDING
     row_label_width = max(len(label) for label in all_labels) + MATRIX_CELL_PADDING
 
     print(f"Confusion Matrix for {result.model_type} (rows=actual, cols=predicted):")
     print(f"{'':>{row_label_width}}", end="")
     for label in predicted_labels:
         print(f"{label:>{col_width}}", end="")
+    print(f"{'total':>{col_width}}", end="")
     print()
 
     for actual in actual_labels:
@@ -315,6 +448,7 @@ def print_confusion_matrix(result: ModelResult) -> None:
         for predicted in predicted_labels:
             count = matrix.get(actual, {}).get(predicted, 0)
             print(f"{count:>{col_width}}", end="")
+        print(f"{row_totals[actual]:>{col_width}}", end="")
         print()
 
 
@@ -325,37 +459,53 @@ def print_summary(results: list[ModelResult]) -> None:
     Args:
         results: List of ModelResult objects, one per model.
     """
-    print()
-    print("=" * 90)
-    print("Model Comparison Summary")
-    print("=" * 90)
+    class_column_format = " {:>7} {:>7}"
     header = (
-        f"{'Model':<15} {'Evaluated':>9} {'Correct':>9} {'Accuracy':>9}"
-        f" {'FP':>6} {'FP%':>7} {'FN':>6} {'FN%':>7} {'Avg Time':>10}"
+        f"{'Model':<15} {'Evaluated':>9} {'Correct':>9} {'Accuracy':>9} {'F1':>7}"
+        f"{class_column_format.format('RFP%', 'RFN%')}"
+        f"{class_column_format.format('TFP%', 'TFN%')}"
+        f"{class_column_format.format('HFP%', 'HFN%')}"
+        f" {'Avg Time':>10}"
     )
+    separator = "=" * len(header)
+    print()
+    print(separator)
+    print("Model Comparison Summary")
+    print(separator)
     print(header)
-    print("-" * 90)
+    print("-" * len(header))
 
     for r in results:
         evaluated = r.evaluated
         accuracy = f"{r.accuracy:.1%}" if r.accuracy is not None else "N/A"
-        fp_rate = f"{r.false_positive_rate:.1%}" if r.false_positive_rate is not None else "N/A"
-        fn_rate = f"{r.false_negative_rate:.1%}" if r.false_negative_rate is not None else "N/A"
+        whale_f1 = f"{r.whale_f1:.3f}" if r.whale_f1 is not None else "N/A"
         avg_time = f"{r.avg_predict_time:.2f}s" if r.avg_predict_time is not None else "N/A"
+        class_stats = []
+        for label, _ in SUMMARY_LABELS:
+            false_positive_rate = r.false_positive_rate_for_label(label)
+            false_negative_rate = r.false_negative_rate_for_label(label)
+            class_stats.append(
+                class_column_format.format(
+                    f"{false_positive_rate:.1%}" if false_positive_rate is not None else "N/A",
+                    f"{false_negative_rate:.1%}" if false_negative_rate is not None else "N/A",
+                )
+            )
 
         print(
-            f"{r.model_type:<15} {evaluated:>9} {r.correct:>9} {accuracy:>9}"
-            f" {r.false_positives:>6} {fp_rate:>7} {r.false_negatives:>6} {fn_rate:>7} {avg_time:>10}"
+            f"{r.model_type:<15} {evaluated:>9} {r.correct:>9} {accuracy:>9} {whale_f1:>7}"
+            f"{''.join(class_stats)} {avg_time:>10}"
         )
         if r.skipped:
             print(f"  ({r.skipped} skipped due to missing WAV or inference error)")
 
-    print("=" * 90)
+    print(separator)
     print()
     print("Definitions:")
-    print("  Correct      = predicted resident when expected, or non-resident when expected")
-    print("  FP (false+)  = predicted resident when correct class was non-resident")
-    print("  FN (false-)  = predicted non-resident when correct class was resident")
+    print("  Accuracy     = Correct / Evaluated")
+    print("  Correct      = fastai/orcahello: resident vs other; oldpodsai/podsai: exact category match")
+    print("  F1           = macro F1 over humpback, resident, and transient classes that are present")
+    print("  [R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class")
+    print("  [R|T|H]FN%   = among actual samples of that class, fraction predicted as another class")
     print("  Avg Time     = average time spent in model predict() per 60-second WAV file")
 
     for r in results:

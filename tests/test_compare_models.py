@@ -10,7 +10,7 @@ Tests cover:
 - is_resident_prediction() label mapping
 - evaluate_model() with mocked run_inference
 - print_summary() output
-- ModelResult property calculations
+- ModelResult property calculations, including whale-class F1 and per-whale-class FP/FN rates
 - main() CLI error handling
 """
 
@@ -379,6 +379,59 @@ class TestModelResultProperties:
         r = ModelResult(model_type="fastai", total=3, predict_times=[1.0, 2.0, 3.0])
         assert abs(r.avg_predict_time - 2.0) < 1e-9
 
+    def test_whale_f1_none_when_no_whale_labels_present(self):
+        """whale_f1 is None when the confusion matrix includes no whale classes."""
+        from compare_models import ModelResult
+        r = ModelResult(
+            model_type="fastai",
+            confusion_matrix={"human": {"other": 2}, "water": {"other": 1}},
+        )
+        assert r.whale_f1 is None
+
+    def test_whale_f1_macro_average_over_present_whale_classes(self):
+        """whale_f1 averages per-class F1 over present humpback/resident/transient labels."""
+        from compare_models import ModelResult
+        r = ModelResult(
+            model_type="podsai",
+            confusion_matrix={
+                "resident": {"resident": 2, "transient": 1},
+                "humpback": {"humpback": 1, "resident": 1},
+                "transient": {"transient": 1},
+                "human": {"resident": 1},
+            },
+        )
+        assert r.whale_f1 == pytest.approx((4 / 7 + 2 / 3 + 2 / 3) / 3)
+
+    def test_false_negative_rate_for_label_uses_actual_label_denominator(self):
+        """Per-label FN% is normalized by the number of actual samples of that label."""
+        from compare_models import ModelResult
+        r = ModelResult(
+            model_type="fastai",
+            total=4,
+            confusion_matrix={
+                "transient": {"other": 2},
+                "resident": {"resident": 1},
+                "human": {"other": 1},
+            },
+        )
+        assert r.false_negative_count_for_label("transient") == 2
+        assert r.false_negative_rate_for_label("transient") == pytest.approx(1.0)
+
+    def test_false_positive_rate_for_label_uses_non_label_denominator(self):
+        """Per-label FP% is normalized by samples whose true label is not that label."""
+        from compare_models import ModelResult
+        r = ModelResult(
+            model_type="podsai",
+            total=5,
+            confusion_matrix={
+                "resident": {"resident": 1},
+                "human": {"resident": 1, "human": 1},
+                "transient": {"resident": 1, "transient": 1},
+            },
+        )
+        assert r.false_positive_count_for_label("resident") == 2
+        assert r.false_positive_rate_for_label("resident") == pytest.approx(0.5)
+
 
 # ---------------------------------------------------------------------------
 # Tests for evaluate_model()
@@ -441,6 +494,28 @@ class TestEvaluateModel:
 
         assert result.correct == 0
         assert result.false_positives == 1
+        assert result.false_negatives == 0
+
+    def test_fastai_other_prediction_correct_for_non_resident(self, tmp_path):
+        """Binary models still count non-resident predicted as non-resident as correct."""
+        from compare_models import TestSample, evaluate_model
+
+        sample = TestSample(
+            category="human",
+            node_name="rpi_sunset_bay",
+            timestamp="2024_08_07_11_23_23_PST",
+            uri="",
+            description="",
+            notes="fp_machine_only",
+        )
+        wav_dir = self._make_wav_files(tmp_path, [sample])
+
+        mock_result = {"global_prediction_label": "other", "global_confidence": 0.7, "predict_time": 1.2}
+        with patch("compare_models.run_inference", return_value=mock_result):
+            result = evaluate_model("fastai", "./model", [sample], wav_dir)
+
+        assert result.correct == 1
+        assert result.false_positives == 0
         assert result.false_negatives == 0
 
     def test_false_negative_counted(self, tmp_path):
@@ -529,8 +604,8 @@ class TestEvaluateModel:
         assert result.false_positives == 0
         assert result.false_negatives == 0
 
-    def test_podsai_water_prediction_correct_for_non_resident(self, tmp_path):
-        """PODS-AI "water" prediction for a non-resident sample counts as correct."""
+    def test_podsai_non_matching_non_resident_prediction_not_correct(self, tmp_path):
+        """PODS-AI uses exact category matches for Correct, even within non-resident classes."""
         from compare_models import TestSample, evaluate_model
 
         sample = TestSample(
@@ -544,6 +619,28 @@ class TestEvaluateModel:
         wav_dir = self._make_wav_files(tmp_path, [sample])
 
         mock_result = {"global_prediction_label": "water", "global_confidence": 0.8, "predict_time": 1.8}
+        with patch("compare_models.run_inference", return_value=mock_result):
+            result = evaluate_model("podsai", "/path/to/model", [sample], wav_dir)
+
+        assert result.correct == 0
+        assert result.false_positives == 0
+        assert result.false_negatives == 0
+
+    def test_podsai_exact_matching_category_counts_as_correct(self, tmp_path):
+        """PODS-AI counts exact multiclass matches as correct."""
+        from compare_models import TestSample, evaluate_model
+
+        sample = TestSample(
+            category="humpback",
+            node_name="rpi_sunset_bay",
+            timestamp="2024_08_07_11_23_23_PST",
+            uri="",
+            description="",
+            notes="",
+        )
+        wav_dir = self._make_wav_files(tmp_path, [sample])
+
+        mock_result = {"global_prediction_label": "humpback", "global_confidence": 0.8, "predict_time": 1.8}
         with patch("compare_models.run_inference", return_value=mock_result):
             result = evaluate_model("podsai", "/path/to/model", [sample], wav_dir)
 
@@ -643,7 +740,8 @@ class TestPrintSummary:
         print_summary(results)
         captured = capsys.readouterr().out
         assert "Definitions:" in captured
-        assert "false+" in captured or "FP" in captured
+        assert "Accuracy     = Correct / Evaluated" in captured
+        assert "[R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class" in captured
 
     def test_prints_avg_time(self, capsys):
         """print_summary includes average time column."""
@@ -652,6 +750,58 @@ class TestPrintSummary:
         print_summary(results)
         captured = capsys.readouterr().out
         assert "Avg Time" in captured
+
+    def test_prints_whale_f1_column(self, capsys):
+        """print_summary includes the whale-class F1 column."""
+        from compare_models import ModelResult, print_summary
+        results = [
+            ModelResult(
+                model_type="podsai",
+                total=3,
+                correct=2,
+                confusion_matrix={
+                    "resident": {"resident": 1},
+                    "humpback": {"resident": 1},
+                    "transient": {"transient": 1},
+                },
+            )
+        ]
+        print_summary(results)
+        captured = capsys.readouterr().out
+        assert " F1 " in captured
+        assert "0.556" in captured
+
+    def test_prints_per_whale_fp_fn_rate_columns(self, capsys):
+        """print_summary includes resident, transient, and humpback FP%/FN% columns without counts."""
+        from compare_models import ModelResult, print_summary
+        results = [ModelResult(model_type="fastai", total=1, correct=1, confusion_matrix={"resident": {"resident": 1}})]
+        print_summary(results)
+        captured = capsys.readouterr().out
+        for header in ("RFP%", "RFN%", "TFP%", "TFN%", "HFP%", "HFN%"):
+            assert header in captured
+        for header in (" RFP ", " RFN ", " TFP ", " TFN ", " HFP ", " HFN "):
+            assert header not in captured
+
+    def test_binary_model_non_resident_whale_rates_match_expected_summary(self, capsys):
+        """fastai/orcahello show 0% FP and 100% FN rates for transient/humpback when present."""
+        from compare_models import ModelResult, print_summary
+        result = ModelResult(
+            model_type="fastai",
+            total=4,
+            correct=1,
+            confusion_matrix={
+                "resident": {"resident": 1},
+                "transient": {"other": 2},
+                "humpback": {"other": 1},
+            },
+            predict_times=[1.0, 1.1, 1.2, 1.3],
+        )
+        print_summary([result])
+        captured = capsys.readouterr().out
+        fastai_line = next(line for line in captured.splitlines() if line.strip().startswith("fastai"))
+        columns = fastai_line.split()
+        assert columns[7:9] == ["0.0%", "100.0%"]
+        assert columns[9:11] == ["0.0%", "100.0%"]
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1207,28 @@ class TestConfusionMatrix:
         assert "2" in captured
         assert "1" in captured
         assert "9" in captured
+
+    def test_print_confusion_matrix_includes_total_column(self, capsys):
+        """print_confusion_matrix appends a total column with per-row totals."""
+        from compare_models import ModelResult, print_confusion_matrix
+
+        result = ModelResult(
+            model_type="fastai",
+            confusion_matrix={
+                "resident": {"resident": 7, "other": 2},
+                "other": {"resident": 1, "other": 9},
+            },
+        )
+        print_confusion_matrix(result)
+        captured = capsys.readouterr().out
+
+        lines = captured.splitlines()
+        header_line = next(line for line in lines if "other" in line and "resident" in line)
+        resident_line = next(line for line in lines if line.startswith("  resident"))
+        other_line = next(line for line in lines if line.startswith("     other"))
+        assert "total" in header_line
+        assert resident_line.split()[-1] == "9"
+        assert other_line.split()[-1] == "10"
 
     def test_print_confusion_matrix_zero_for_unseen_pairs(self, capsys):
         """print_confusion_matrix shows 0 for class pairs that never occurred."""
