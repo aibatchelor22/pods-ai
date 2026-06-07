@@ -510,6 +510,31 @@ def test_whale_f1_computed_from_whale_classes_only(monkeypatch):
     assert metrics["f1_vessel"] == 0.0
 
 
+def test_compute_metrics_prints_dataset_context(monkeypatch, capsys):
+    """compute_metrics should print which evaluation dataset/split is being reported."""
+    module = _import_stubbed_train_module(monkeypatch)
+    _patch_metrics(module)
+    module.ID2LABEL = {
+        0: "water",
+        1: "resident",
+        2: "transient",
+        3: "humpback",
+        4: "vessel",
+        5: "jingle",
+        6: "human",
+    }
+
+    labels = np.array([1, 2, 3, 0, 4, 5, 6])
+    predictions = np.array([1, 2, 3, 0, 4, 5, 6])
+    logits = np.eye(7)[predictions]
+
+    eval_pred = module.EvalPrediction(predictions=logits, label_ids=labels)
+    module.compute_metrics(eval_pred)
+
+    captured = capsys.readouterr().out
+    assert "trainer test split from output/wav (80/20 split of training samples)" in captured
+
+
 def test_whale_f1_reflects_mixed_whale_predictions(monkeypatch):
     """f1 should drop when whale-class predictions include errors."""
     module = _import_stubbed_train_module(monkeypatch)

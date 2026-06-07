@@ -337,6 +337,7 @@ def compute_metrics(eval_pred: EvalPrediction) -> dict:
     print("\n" + "="*60)
     print("DETAILED EVALUATION METRICS")
     print("="*60)
+    print("Dataset: trainer test split from output/wav (80/20 split of training samples).")
 
     # Class distribution in predictions vs ground truth.
     print("\nClass Distribution:")

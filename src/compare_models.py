@@ -507,6 +507,7 @@ def print_summary(results: list[ModelResult]) -> None:
     print("  [R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class")
     print("  [R|T|H]FN%   = among actual samples of that class, fraction predicted as another class")
     print("  Avg Time     = average time spent in model predict() per 60-second WAV file")
+    print("  Note         = compares end-to-end 60-second inference on testing_samples.csv")
 
     for r in results:
         print()

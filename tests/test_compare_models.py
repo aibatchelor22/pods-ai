@@ -742,6 +742,7 @@ class TestPrintSummary:
         assert "Definitions:" in captured
         assert "Accuracy     = Correct / Evaluated" in captured
         assert "[R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class" in captured
+        assert "compares end-to-end 60-second inference on testing_samples.csv" in captured
 
     def test_prints_avg_time(self, capsys):
         """print_summary includes average time column."""
