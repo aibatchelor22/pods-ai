@@ -525,6 +525,24 @@ class TestPodsAIInferenceIndexing:
 
 class TestPodsAIInferenceErrorHandling:
     """Test error handling in PodsAIInference."""
+
+    @patch('podsai_inference.AutoModelForAudioClassification')
+    @patch('podsai_inference.AutoFeatureExtractor')
+    def test_feature_extractor_fails_immediately_on_bad_revision(
+        self, mock_extractor_class, mock_model_class, mock_feature_extractor, mock_podsai_model
+    ):
+        """When a pinned revision fails, the job must fail immediately (no fallback)."""
+        mock_extractor_class.from_pretrained.side_effect = OSError("revision not found")
+        mock_model_class.from_pretrained = Mock(return_value=mock_podsai_model)
+
+        from podsai_inference import PodsAIInference
+
+        with pytest.raises(RuntimeError):
+            PodsAIInference("test-model-path", model_revision="deadbeef")
+
+        assert mock_extractor_class.from_pretrained.call_count == 1
+        assert mock_extractor_class.from_pretrained.call_args.args[0] == "test-model-path"
+        assert mock_extractor_class.from_pretrained.call_args.kwargs.get("revision") == "deadbeef"
     
     @patch('podsai_inference.AutoModelForAudioClassification')
     @patch('podsai_inference.AutoFeatureExtractor')

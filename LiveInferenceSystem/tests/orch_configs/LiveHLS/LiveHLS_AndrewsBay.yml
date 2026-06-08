@@ -1,6 +1,6 @@
 ---
 model_id: "davethaler/whale-call-detector"
-model_hf_repo_id: "davethaler/whale-call-detector"
+model_hf_repo_id: "/usr/src/hf_cache"
 hls_stream_type: "LiveHLS"
 hls_hydrophone_id: "rpi_andrews_bay"
 hls_live_delay_buffer: 60

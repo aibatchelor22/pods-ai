@@ -27,11 +27,11 @@ spec:
           image: orcaconservancycr.azurecr.io/pods-ai-live-inference-system:latest
           resources:
             requests:
-              cpu: "1"
-              memory: "1600Mi"
+              cpu: "400m"
+              memory: "1200Mi"
             limits:
-              cpu: "1"
-              memory: "2500Mi"
+              cpu: "700m"
+              memory: "1800Mi"
           env:
             - name: AZURE_COSMOSDB_PRIMARY_KEY
               valueFrom:
