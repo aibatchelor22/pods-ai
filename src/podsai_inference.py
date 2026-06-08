@@ -10,6 +10,7 @@ The default training path now targets spectrogram-based architectures such as
 AST, while inference remains compatible with existing PODS-AI checkpoints.
 """
 
+import os
 import torch
 import librosa
 import numpy as np
@@ -84,10 +85,14 @@ class PodsAIInference(ModelInference):  # Inherit from ModelInference
         print(f"Loading PODS-AI model from {model_path}{revision_info}...")
         print(f"Using device: {self.device}")
 
-        # Build kwargs for from_pretrained; only pass revision for Hub IDs (not local paths).
+        # Build kwargs for from_pretrained; only pass revision/token for Hub IDs (not local paths).
         pretrained_kwargs: dict = {}
-        if model_revision and not Path(model_path).exists():
-            pretrained_kwargs["revision"] = model_revision
+        if not Path(model_path).exists():
+            if model_revision:
+                pretrained_kwargs["revision"] = model_revision
+            hf_token = os.getenv("HF_TOKEN")
+            if hf_token:
+                pretrained_kwargs["token"] = hf_token
 
         # Load feature extractor and model.
         try:
