@@ -26,6 +26,13 @@ from typing import Any, Optional
 import ffmpeg
 from pytz import timezone as pytz_tz
 
+from audio_utils import (
+    download_from_url,
+    get_cached_folders,
+    get_difference_between_times_in_seconds,
+    get_folders_between_timestamp,
+    load_m3u8_with_retry,
+)
 from model_inference import get_model_inference
 
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
@@ -71,14 +78,6 @@ def download_60s_audio_from_start_utc(
     tmp_dir: str,
 ) -> Optional[str]:
     """Download a 60-second clip beginning at start_time_utc."""
-    from extract_training_samples import (
-        download_from_url,
-        get_cached_folders,
-        get_difference_between_times_in_seconds,
-        get_folders_between_timestamp,
-        load_m3u8_with_retry,
-    )
-
     duration_seconds = 60.0
     end_time_utc = start_time_utc + timedelta(seconds=duration_seconds)
     start_unix_time = int(start_time_utc.timestamp())

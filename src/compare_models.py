@@ -7,7 +7,7 @@ Compare multiple models on a test set of audio samples.
 Usage:
     python compare_models.py [options]
 
-Loads a test set from testing_samples.csv, then runs each enabled model
+Loads a test set from testing_60s_samples.csv, then runs each enabled model
 (fastai, orcahello, oldpodsai (Wav2Vec2)), podsai (AST) on the corresponding
 60-second WAV files and reports correct identifications, whale-class F1, and
 per-whale-class false-positive/false-negative rates per model.
@@ -200,10 +200,10 @@ class ModelResult:
 def load_test_samples(testing_csv: Path, max_samples: Optional[int] = None,
                       category_filter: Optional[str] = None) -> list[TestSample]:
     """
-    Load test samples from testing_samples.csv.
+    Load test samples from testing_60s_samples.csv.
 
     Args:
-        testing_csv: Path to testing_samples.csv.
+        testing_csv: Path to testing_60s_samples.csv.
         max_samples: Maximum number of samples to load. If None, load all samples.
         category_filter: If specified, only load samples matching this category.
                         If None, load samples from all categories.
@@ -507,7 +507,7 @@ def print_summary(results: list[ModelResult]) -> None:
     print("  [R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class")
     print("  [R|T|H]FN%   = among actual samples of that class, fraction predicted as another class")
     print("  Avg Time     = average time spent in model predict() per 60-second WAV file")
-    print("  Note         = compares end-to-end 60-second inference on testing_samples.csv")
+    print("  Note         = compares end-to-end 60-second inference on testing_60s_samples.csv")
 
     for r in results:
         print()
@@ -522,15 +522,15 @@ def main() -> int:
     """
     parser = argparse.ArgumentParser(
         description=(
-            "Compare model predictions on a test set loaded from testing_samples.csv. "
+            "Compare model predictions on a test set loaded from testing_60s_samples.csv. "
             "Runs each enabled model against the corresponding 60-second WAV files "
             "and reports correct identifications, false positives, and false negatives."
         )
     )
     parser.add_argument(
         "--testing-csv",
-        default="output/csv/testing_samples.csv",
-        help="Path to testing_samples.csv (default: output/csv/testing_samples.csv).",
+        default="output/csv/testing_60s_samples.csv",
+        help="Path to testing_60s_samples.csv (default: output/csv/testing_60s_samples.csv).",
     )
     parser.add_argument(
         "--wav-dir",
@@ -604,7 +604,7 @@ def main() -> int:
     if not testing_csv.exists():
         print(f"Error: testing CSV not found: {testing_csv}", file=sys.stderr)
         print(
-            "Run extract_training_samples.py first to generate testing_samples.csv.",
+            "Update output/csv/testing_60s_samples.csv before running compare_models.py.",
             file=sys.stderr,
         )
         return 1

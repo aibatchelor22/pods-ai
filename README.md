@@ -2,67 +2,37 @@
 
 This repository contains scripts for preparing training data for orca detection models.
 
+Bootstrap-only generation scripts and archived CSV inputs now live under [`bootstrap/`](bootstrap/README.md).
+
 ## Overview
 
-The `src` directory has the following scripts for different steps meant to be run in the order listed:
+The ongoing sample CSVs are:
 
-1. **make_csv.py**: Create a CSV file (`output/csv/detections.csv`) with a set of detections.
-   The CSV file has the following columns: Category, NodeName, Timestamp, URI, Description, and Notes.
-2. **process_humpback_wavs.py**: Process files from the humpback submodule into the humpback subdirectory under `output/wav`.
-   A custom segment duration can be specified with `--duration _seconds_` (default: 3 seconds).
-3. **extract_training_samples.py**: Use an input CSV file (`output/csv/detections.csv` by default)
-   to create `output/csv/initial_training_samples.csv` and `output/csv/testing_samples.csv`. An alternate input filename can be specified with
-   `--input _filename_`. A custom segment duration can be specified with `--duration _seconds_` (default: 3 seconds).
-   - `initial_training_samples.csv` uses detections-format rows for the auto-selected starting set
-   - `testing_samples.csv` uses detections-format rows, excludes training rows, and includes eligible samples per category:
-     - Up to 10 standard eligible samples per category (excludes samples with confidence 0.0)
-     - Additionally up to 10 `tp_machine_only` samples in the `resident` category
-     - Additionally up to 10 `tp_human_only` samples per negative category (water, human, vessel, jingle)
-4. **merge_training_samples.py**: Merge `output/csv/initial_training_samples.csv` with `output/csv/manual_samples.csv`
-   to create `output/csv/training_samples.csv`. For `tp_human_only` detections, it runs model inference on preceding
-   60 seconds to find the correct timestamp; for other detections, it subtracts the segment duration from the timestamp.
-5. **download_wavs.py**: Use `output/csv/training_samples.csv` and `output/csv/testing_samples.csv` to download wav files
-   - Training samples are written to subdirectories under `output/wav`
-   - Testing samples are written to subdirectories under `output/testing-wav`
-   - For testing samples, all rows download 60-second wav files (`tp_human_only` uses the row timestamp; others are centered on the row timestamp)
-6. **make_spectrograms.py**: Create a png file for each wav file in a subdirectory of `output/png`
-7. **train_podsai_model.py**: A script to train a PODS-AI model on the generated training samples. By default it now fine-tunes a spectrogram-based HuggingFace audio classifier (`MIT/ast-finetuned-audioset-10-10-0.4593`).
+- `output/csv/training_3s_samples.csv`
+- `output/csv/testing_60s_samples.csv`
+
+Both files can be updated manually by editing rows directly, or via scripts (for example
+`add_samples.py`, `process_false_positives.py`, and `process_false_negatives.py`).
+
+The active scripts in `src` include:
+
+1. **download_wavs.py**: Uses `output/csv/training_3s_samples.csv` and `output/csv/testing_60s_samples.csv` to download wav files.
+2. **make_spectrograms.py**: Creates a png file for each wav file in a subdirectory of `output/png`.
+3. **train_podsai_model.py**: Trains a PODS-AI model on the generated training samples.
+4. **compare_models.py**: Evaluates models on `output/csv/testing_60s_samples.csv`.
 
 ```mermaid
 flowchart TD;
-    orcaHello[(OrcaHello CosmosDB)];
     podsaiModel[(HuggingFace davethaler/whale-call-detector)];
     orcaHelloModel[(HuggingFace orcasound/orcahello-srkw-detector-v1)];
-    manualSamples@{ shape: doc, label: "manual_samples.csv" };
-    detections@{ shape: doc, label: "detections.csv" };
-    initialTrainingSamples@{ shape: doc, label: "initial_training_samples.csv" };
-    trainingSamples@{ shape: doc, label: "training_samples.csv" };
-    testingSamples@{ shape: doc, label: "testing_samples.csv" };
-    signalsHumpback@{ shape: doc, label: "signals-humpback" };
-    humpbackSignals@{ shape: docs, label: "wav/signals-humpback_*" };
-    manualTimestamps@{ shape: doc, label: "manual_timestamps.csv" };
+    trainingSamples@{ shape: doc, label: "training_3s_samples.csv" };
+    testingSamples@{ shape: doc, label: "testing_60s_samples.csv" };
     wav@{ shape: docs, label: "wav/*" };
     testingWav@{ shape: docs, label: "testing-wav/*" };
 
-    processHumpbackWavs@{ shape: rect, label: "processHumpbackWavs.py" };
-    makeCsv@{ shape: rect, label: "make_csv.py" };
-    extractTrainingSamples@{ shape: rect, label: "extract_training_samples.py" };
-    mergeTrainingSamples@{ shape: rect, label: "merge_training_samples.py" };
     downloadWavs@{ shape: rect, label: "download_wavs.py" };
     trainPodsaiModel@{ shape: rect, label: "train_podsai_model.py" };
     compareModels@{ shape: rect, label: "compare_models.py" };
-
-    orcaHello-->makeCsv-->detections;
-
-    signalsHumpback-->processHumpbackWavs-->humpbackSignals;
-
-    detections-->extractTrainingSamples-->initialTrainingSamples;
-    humpbackSignals-->extractTrainingSamples;
-    manualTimestamps-->extractTrainingSamples;
-    extractTrainingSamples-->testingSamples;
-    initialTrainingSamples-->mergeTrainingSamples-->trainingSamples;
-    manualSamples-->mergeTrainingSamples;
-    manualTimestamps-->mergeTrainingSamples;
 
     trainingSamples-->downloadWavs-->wav;
     testingSamples-->downloadWavs-->testingWav;
@@ -74,100 +44,6 @@ flowchart TD;
     testingWav-->compareModels;
     orcaHelloModel-->compareModels;
 ```
-
-## Model-Based Timestamp Correction for tp_human_only
-
-The `merge_training_samples.py` script implements intelligent timestamp correction for `tp_human_only` detections:
-
-### How it Works
-
-For detections marked as `tp_human_only`:
-1. Downloads 60 seconds of audio preceding the detection timestamp
-2. Runs model inference to score each segment
-3. Finds the highest scoring segment
-4. Adjusts the timestamp based on the offset of the highest scoring segment
-
-This matches the behavior described in the issue and follows the approach used in [aifororcas-livesystem's LiveInferenceOrchestratorV1.py](https://github.com/orcasound/aifororcas-livesystem/blob/main/InferenceSystem/src/LiveInferenceOrchestratorV1.py).
-
-### Using the FastAI Model
-
-By default, `merge_training_samples.py` uses the FastAI model with automatic download enabled.
-
-#### Option 1: Default behavior (recommended)
-
-Install dependencies and run the script:
-
-```bash
-pip install -r requirements.txt
-
-# For Python 3.11+, apply compatibility patch
-bash patch_fastai_audio.sh
-
-cd src
-python extract_training_samples.py
-python merge_training_samples.py
-```
-
-This will automatically download the default model from:
-https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-20.FastAI.R1-12.zip
-
-The model will be cached in `./model` directory for future runs.
-
-**Note**: Python 3.11+ requires a patch to fastai_audio for compatibility. The `patch_fastai_audio.sh` script applies this fix automatically.
-
-#### Option 2: Customize model version
-
-To use a different model version, set the `MODEL_URL` environment variable:
-
-```bash
-pip install -r requirements.txt
-bash patch_fastai_audio.sh  # For Python 3.11+
-export MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/YOUR-MODEL-VERSION.zip
-cd src
-python extract_training_samples.py
-python merge_training_samples.py
-```
-
-#### Option 3: Use pre-downloaded model
-
-If you've already downloaded the model manually:
-
-```bash
-pip install -r requirements.txt
-bash patch_fastai_audio.sh  # For Python 3.11+
-
-# Download and extract model
-mkdir -p model
-curl -o model.zip https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-20.FastAI.R1-12.zip
-unzip model.zip -d .
-
-# Run with pre-downloaded model (no auto-download needed)
-cd src
-export MODEL_AUTO_DOWNLOAD=false
-export MODEL_PATH=../model
-python merge_training_samples.py
-```
-
-#### Option 4: Use dummy model (for testing)
-
-For testing without FastAI dependencies or model download:
-
-```bash
-cd src
-export MODEL_TYPE=dummy
-python merge_training_samples.py
-```
-
-The dummy model will generate mock predictions suitable for testing the timestamp correction logic.
-
-### Model Configuration
-
-The model behavior can be configured using environment variables:
-
-- `MODEL_TYPE`: Type of model to use (`dummy` or `fastai`, default: `fastai`)
-- `MODEL_PATH`: Path to the model directory (default: `./model`)
-- `MODEL_AUTO_DOWNLOAD`: Whether to auto-download the model if not found (default: `true` for fastai, `false` for dummy)
-- `MODEL_URL`: Custom URL for model zip file (optional, default: `https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-20.FastAI.R1-12.zip`)
 
 ## Requirements
 
@@ -208,7 +84,7 @@ Key dependencies:
   [concatenate_wavs.py](#concatenate_wavspy) below.
 - **process_false_positives.py**: Re-checks rejected OrcaHello detections by
   downloading the 60-second WAV, re-running PODS-AI, and appending whale-class
-  sub-segments with corrected classes to `output/csv/manual_samples.csv`.
+  sub-segments with corrected classes to `output/csv/training_3s_samples.csv`.
   The corrected class is inferred from the human-authored portion of the moderation
   comments (auto-generated "AI: …" lines are ignored).  Explicit negations in the
   comments are understood: "No humpback" suppresses the humpback match, and
@@ -218,7 +94,7 @@ Key dependencies:
 - **process_false_negatives.py**: Re-checks confirmed OrcaHello detections by
   downloading the 60-second WAV, re-running PODS-AI and OrcaHello segment inference,
   and appending segments where OrcaHello predicts resident but PODS-AI does not to
-  `output/csv/manual_samples.csv` with corrected class `resident`. Supports
+  `output/csv/training_3s_samples.csv` with corrected class `resident`. Supports
   `--category CATEGORY` to process only detections whose PODS-AI predicted category
   matches the provided value.
 - **run_inference.py**: Runs a model on a wav file and prints the global prediction,
@@ -227,11 +103,8 @@ Key dependencies:
   PODS-AI model and can upload positive detections (resident/transient/humpback)
   to Azure Blob Storage and Cosmos DB.
 - **compare_models.py**: Evaluates and compares fastai, orcahello, podsai (AST), and oldpodsai (Wav2Vec2) models
-  on the test set loaded from `output/csv/testing_samples.csv` (generated by `extract_training_samples.py`
-  and downloaded by `download_wavs.py`).
+  on the test set loaded from `output/csv/testing_60s_samples.csv` and downloaded by `download_wavs.py`).
   Reports correct identifications, false positives, false negatives, and average prediction time for each model.
-- **get_best_timestamp.py**: Given a node slug and a detection timestamp, runs
-  `process_sample()` and prints the corrected URI with the best timestamp.
 
 ### add_samples.py
 
@@ -442,8 +315,7 @@ same file and comparing the output.
 ### compare_models.py
 
 Evaluate and compare fastai, orcahello, podsai (AST), and oldpodsai (Wav2Vec2) models on the same test set of
-60-second audio samples.  Loads the test set directly from `output/csv/testing_samples.csv`
-(generated by `extract_training_samples.py`), then runs each enabled model on the
+60-second audio samples.  Loads the test set directly from `output/csv/testing_60s_samples.csv`, then runs each enabled model on the
 corresponding WAV files under `output/testing-wav/`
 (downloaded by `download_wavs.py`), and reports a summary table
 with correct identifications, whale-class F1, per-whale-class false positive/false negative rates,
@@ -476,7 +348,7 @@ usage: python compare_models.py [--testing-csv PATH] [--max-samples N]
 
 | Argument | Description |
 |---|---|
-| `--testing-csv` | Path to `testing_samples.csv` (default: `output/csv/testing_samples.csv`) |
+| `--testing-csv` | Path to `testing_60s_samples.csv` (default: `output/csv/testing_60s_samples.csv`) |
 | `--max-samples` | Maximum number of test samples to process. If not specified, all samples are processed |
 | `--wav-dir` | Root directory of testing WAV files (default: `output/testing-wav`) |
 | `--models` | Comma-separated list of models to evaluate (default: `fastai,orcahello,podsai,oldpodsai`) |
@@ -496,7 +368,7 @@ python src/compare_models.py \
 
 Example output layout (actual metric values vary with the evaluated dataset):
 ```
-Loaded 160 test samples from output\csv\testing_samples.csv
+Loaded 160 test samples from output\csv\testing_60s_samples.csv
 WAV directory: output/testing-wav
 Models to evaluate: fastai, orcahello, podsai, oldpodsai
 
@@ -578,32 +450,6 @@ python src/compare_models.py --max-samples 10 --fastai-model-path model
 
 ```bash
 python src/compare_models.py --category resident --fastai-model-path model
-```
-
-### get_best_timestamp.py
-
-```
-usage: python get_best_timestamp.py <node_slug> <timestamp_str> [--no-model] [--duration N]
-```
-
-| Argument | Description |
-|---|---|
-| `node_slug` | Node URL slug, e.g. `orcasound-lab` |
-| `timestamp_str` | PST timestamp, e.g. `2023_08_18_00_59_53_PST` |
-| `--no-model` | Skip model inference; apply a fixed-offset correction instead |
-| `--duration N` | Segment duration in seconds (default: 3) |
-
-The script uses the same model-based timestamp correction logic as
-`extract_training_samples.py` (see [Model-Based Timestamp Correction](#model-based-timestamp-correction-for-tp_human_only)
-above).  The same `MODEL_TYPE`, `MODEL_PATH`, `MODEL_AUTO_DOWNLOAD`, and
-`MODEL_URL` environment variables apply.
-
-**Example**
-
-```bash
-cd src
-python get_best_timestamp.py orcasound-lab 2023_08_18_00_59_53_PST
-# https://live.orcasound.net/bouts/new/orcasound-lab?time=2023-08-18T07%3A59%3A50.000Z
 ```
 
 ## LiveInferenceSystem Container
@@ -709,7 +555,7 @@ from HuggingFace:
 
 or from portal.azure.com:
 
-* COSMOS_KEY — "aifororcasmetadatastore" CosmosDB account → "Keys" → "Read-only Keys" → primary key.  This is used by make_csv.py, check_csv.yml, and train_model.yml.
+* COSMOS_KEY — "aifororcasmetadatastore" CosmosDB account → "Keys" → "Read-only Keys" → primary key.  This is used by bootstrap make_csv.py and train_model.yml.
 * AZURE_COSMOSDB_PRIMARY_KEY — "aifororcasmetadatastore" CosmosDB account → "Keys" → "Read-write Keys" → primary key.  This is used by LiveInferenceOrchestrator.py.
 * AZURE_STORAGE_CONNECTION_STRING — "livemlaudiospecstorage" storage account. See the "Connection String" section in [these instructions](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-quickstart-blobs-python?tabs=connection-string%2Croles-azure-portal%2Csign-in-azure-cli&pivots=blob-storage-quickstart-scratch#authenticate-to-azure-and-authorize-access-to-blob-data).  This is used by LiveInferenceOrchestrator.py.
 * INFERENCESYSTEM_APPINSIGHTS_CONNECTION_STRING — "InferenceSystemInsights" Application Insights → "Overview" → connection string.  This is used by LiveInferenceOrchestrator.py.

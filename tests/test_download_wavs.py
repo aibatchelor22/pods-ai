@@ -6,7 +6,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import ANY, patch
 
-from download_wavs import CSVRow, add_seconds_to_timestamp_pst, download_testing_sample
+import pytest
+
+from download_wavs import (
+    CSVRow,
+    add_seconds_to_timestamp_pst,
+    download_testing_sample,
+    validate_no_overlaps,
+)
 
 
 class TestDownloadTestingSample:
@@ -73,3 +80,34 @@ class TestTimestampHelpers:
     def test_add_seconds_to_timestamp_pst_adds_30_seconds(self):
         """add_seconds_to_timestamp_pst should add requested seconds in PST format."""
         assert add_seconds_to_timestamp_pst("2025_01_01_00_00_03_PST", 30) == "2025_01_01_00_00_33_PST"
+
+
+class TestOverlapValidation:
+    def test_validate_no_overlaps_allows_non_overlapping_rows(self):
+        training_rows = [
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_01_00_00_PST", "", "", ""),
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_01_00_03_PST", "", "", ""),
+        ]
+        testing_rows = [
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_00_59_00_PST", "", "", "tp_human_only"),
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_01_01_06_PST", "", "", "tp_human_only"),
+        ]
+        validate_no_overlaps(training_rows, testing_rows)
+
+    def test_validate_no_overlaps_rejects_training_overlap(self):
+        training_rows = [
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_00_00_00_PST", "", "", ""),
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_00_00_02_PST", "", "", ""),
+        ]
+        with pytest.raises(ValueError, match="training overlap"):
+            validate_no_overlaps(training_rows, [])
+
+    def test_validate_no_overlaps_rejects_cross_file_overlap(self):
+        training_rows = [
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_00_00_00_PST", "", "", ""),
+        ]
+        testing_rows = [
+            CSVRow("resident", "rpi_andrews_bay", "2025_01_01_00_00_02_PST", "", "", "tp_machine_only"),
+        ]
+        with pytest.raises(ValueError, match="cross-file overlap"):
+            validate_no_overlaps(training_rows, testing_rows)

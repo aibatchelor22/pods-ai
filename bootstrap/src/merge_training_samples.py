@@ -10,7 +10,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from extract_training_samples import (
+from bootstrap.src.extract_training_samples import (
     REPO_ROOT,
     SEGMENT_DURATION_SECONDS,
     load_detections,
@@ -195,8 +195,8 @@ def main():
     parser.add_argument(
         '--input',
         type=str,
-        default='output/csv/initial_training_samples.csv',
-        help='Path to input initial training samples CSV file (default: output/csv/initial_training_samples.csv)',
+        default='bootstrap/csv/initial_training_samples.csv',
+        help='Path to input initial training samples CSV file (default: bootstrap/csv/initial_training_samples.csv)',
     )
     parser.add_argument(
         '--duration',
@@ -210,9 +210,9 @@ def main():
     if not input_path.is_absolute():
         input_path = REPO_ROOT / input_path
 
-    output_path = REPO_ROOT / 'output' / 'csv' / 'training_samples.csv'
-    manual_samples_path = REPO_ROOT / 'output' / 'csv' / 'manual_samples.csv'
-    manual_corrections_path = REPO_ROOT / 'output' / 'csv' / 'manual_timestamps.csv'
+    output_path = REPO_ROOT / 'bootstrap' / 'csv' / 'training_samples.csv'
+    manual_samples_path = REPO_ROOT / 'bootstrap' / 'csv' / 'manual_samples.csv'
+    manual_corrections_path = REPO_ROOT / 'bootstrap' / 'csv' / 'manual_timestamps.csv'
 
     manual_timestamps, manual_confidences = load_manual_corrections(manual_corrections_path)
 
@@ -231,7 +231,7 @@ def main():
 
     print("\nInitializing model inference for tp_human_only timestamp correction...")
 
-    from model_inference import get_model_inference
+    from src.model_inference import get_model_inference
 
     model_type = os.environ.get("MODEL_TYPE", "fastai")
     model_path = os.environ.get("MODEL_PATH", "./model")

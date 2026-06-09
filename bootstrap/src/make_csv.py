@@ -14,7 +14,7 @@ import requests
 from azure.cosmos import CosmosClient
 import os
 
-from orcasite_feeds import OrcasiteFeed, get_orcasite_feeds  # noqa: F401 – re-exported for callers
+from src.orcasite_feeds import OrcasiteFeed, get_orcasite_feeds  # noqa: F401 – re-exported for callers
 
 COSMOS_URL = os.environ.get("COSMOS_URL", "").strip() or "https://aifororcasmetadatastore.documents.azure.com:443/"
 COSMOS_KEY = os.environ.get("COSMOS_KEY", "<your-primary-key>")
@@ -601,5 +601,5 @@ if __name__ == "__main__":
     start_time = parse_pst_timestamp(args.start) if args.start else None
     end_time = None if (args.end or "").lower() == "now" else parse_pst_timestamp(args.end)
 
-    output_root = Path("output/csv")
+    output_root = Path("bootstrap/csv")
     process_all_feeds(output_root, feed_filter=args.feed, start_time=start_time, end_time=end_time)

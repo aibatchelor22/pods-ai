@@ -15,8 +15,8 @@ import ffmpeg
 import m3u8
 from pytz import timezone
 
-from extract_training_samples import download_60s_audio
 from audio_utils import (
+    download_60s_audio,
     get_cached_folders,
     get_folders_between_timestamp,
     get_difference_between_times_in_seconds,
@@ -26,6 +26,8 @@ from audio_utils import (
 
 PACIFIC_TZ = timezone('US/Pacific')
 N_SECONDS = 3  # Create 3-second wav files.
+TESTING_WINDOW_SECONDS = 60
+TESTING_CENTER_OFFSET_SECONDS = 30
 
 @dataclass
 class CSVRow:
@@ -104,6 +106,96 @@ def add_seconds_to_timestamp_pst(timestamp_str: str, seconds: int) -> str:
     """
     adjusted = parse_timestamp_pst(timestamp_str) + timedelta(seconds=seconds)
     return adjusted.strftime("%Y_%m_%d_%H_%M_%S_PST")
+
+
+def _training_window(row: CSVRow) -> tuple[datetime, datetime]:
+    start = parse_timestamp_pst(row.timestamp_pst)
+    return start, start + timedelta(seconds=N_SECONDS)
+
+
+def _testing_window(row: CSVRow) -> tuple[datetime, datetime]:
+    sample_time = parse_timestamp_pst(row.timestamp_pst)
+    download_time = (
+        sample_time
+        if row.notes == "tp_human_only"
+        else sample_time + timedelta(seconds=TESTING_CENTER_OFFSET_SECONDS)
+    )
+
+    # Mirror audio_utils.download_60s_audio() behavior: snap end time to the next 10-second boundary.
+    snapped_sec = ((download_time.second + 9) // 10) * 10
+    if snapped_sec == 60:
+        download_time = download_time + timedelta(minutes=1)
+        snapped_sec = 0
+    end_time = download_time.replace(second=snapped_sec, microsecond=0)
+
+    return end_time - timedelta(seconds=TESTING_WINDOW_SECONDS), end_time
+
+
+def _find_overlaps(rows: list[CSVRow], window_fn, label: str) -> list[str]:
+    overlaps = []
+    by_node: dict[str, list[tuple[datetime, datetime, CSVRow]]] = {}
+    for row in rows:
+        start, end = window_fn(row)
+        by_node.setdefault(row.node_name, []).append((start, end, row))
+
+    for node_name, windows in by_node.items():
+        windows.sort(key=lambda item: item[0])
+        prev_start, prev_end, prev_row = windows[0]
+        for curr_start, curr_end, curr_row in windows[1:]:
+            if curr_start < prev_end:
+                overlaps.append(
+                    f"{label} overlap at node {node_name}: "
+                    f"{prev_row.timestamp_pst} overlaps {curr_row.timestamp_pst}"
+                )
+            if curr_end > prev_end:
+                prev_start, prev_end, prev_row = curr_start, curr_end, curr_row
+    return overlaps
+
+
+def _find_cross_overlaps(training_rows: list[CSVRow], testing_rows: list[CSVRow]) -> list[str]:
+    overlaps = []
+    train_by_node: dict[str, list[tuple[datetime, datetime, CSVRow]]] = {}
+    test_by_node: dict[str, list[tuple[datetime, datetime, CSVRow]]] = {}
+
+    for row in training_rows:
+        start, end = _training_window(row)
+        train_by_node.setdefault(row.node_name, []).append((start, end, row))
+    for row in testing_rows:
+        start, end = _testing_window(row)
+        test_by_node.setdefault(row.node_name, []).append((start, end, row))
+
+    for node_name in set(train_by_node.keys()) & set(test_by_node.keys()):
+        train_windows = sorted(train_by_node[node_name], key=lambda item: item[0])
+        test_windows = sorted(test_by_node[node_name], key=lambda item: item[0])
+        i = 0
+        j = 0
+        while i < len(train_windows) and j < len(test_windows):
+            train_start, train_end, train_row = train_windows[i]
+            test_start, test_end, test_row = test_windows[j]
+            if train_start < test_end and test_start < train_end:
+                overlaps.append(
+                    f"cross-file overlap at node {node_name}: "
+                    f"training {train_row.timestamp_pst} overlaps testing {test_row.timestamp_pst}"
+                )
+            if train_end <= test_end:
+                i += 1
+            else:
+                j += 1
+    return overlaps
+
+
+def validate_no_overlaps(training_rows: list[CSVRow], testing_rows: list[CSVRow]) -> None:
+    overlaps = []
+    if training_rows:
+        overlaps.extend(_find_overlaps(training_rows, _training_window, "training"))
+    if testing_rows:
+        overlaps.extend(_find_overlaps(testing_rows, _testing_window, "testing"))
+    if training_rows and testing_rows:
+        overlaps.extend(_find_cross_overlaps(training_rows, testing_rows))
+
+    if overlaps:
+        details = "\n".join(f"  - {overlap}" for overlap in overlaps)
+        raise ValueError(f"Detected overlapping sample windows:\n{details}")
 
 
 def download_audio_segment(
@@ -272,7 +364,7 @@ def process_csv(csv_path: Path, output_root: Path):
     Read the training samples CSV file and download corresponding WAV files.
     
     Parameters:
-        csv_path (Path): Path to the training_samples.csv file.
+        csv_path (Path): Path to the training_3s_samples.csv file.
         output_root (Path): Root directory where audio files will be saved in label subdirectories.
     """
     rows = parse_csv(csv_path)
@@ -326,7 +418,7 @@ def process_testing_csv(csv_path: Path, output_root: Path):
     Read the testing samples CSV file and download corresponding WAV files.
 
     Args:
-        csv_path: Path to the testing_samples.csv file.
+        csv_path: Path to the testing_60s_samples.csv file.
         output_root: Root directory where testing WAV files are saved.
     """
     rows = parse_csv(csv_path)
@@ -345,8 +437,8 @@ def print_usage():
     print()
     print("This script downloads wav files for training and testing samples.")
     print("It reads from:")
-    print("  - output/csv/training_samples.csv")
-    print("  - output/csv/testing_samples.csv")
+    print("  - output/csv/training_3s_samples.csv")
+    print("  - output/csv/testing_60s_samples.csv")
     print()
     print("And saves wav files to:")
     print("  - output/wav/ (training samples)")
@@ -360,20 +452,27 @@ if __name__ == "__main__":
         print_usage()
         sys.exit(0)
 
-    training_csv_path = Path("output/csv/training_samples.csv")
+    training_csv_path = Path("output/csv/training_3s_samples.csv")
     training_output_root = Path("output/wav")
-    testing_csv_path = Path("output/csv/testing_samples.csv")
+    testing_csv_path = Path("output/csv/testing_60s_samples.csv")
     testing_output_root = Path("output/testing-wav")
 
     if not training_csv_path.exists():
         print(f"Error: CSV file not found at {training_csv_path}")
-        print("Please run merge_training_samples.py first to generate the training_samples.csv file.")
+        print("Please update output/csv/training_3s_samples.csv before running download_wavs.py.")
         sys.exit(1)
+
+    training_rows = parse_csv(training_csv_path)
+    testing_rows: list[CSVRow] = []
+    if not testing_csv_path.exists():
+        print(f"Warning: CSV file not found at {testing_csv_path}")
+        print("Skipping testing WAV downloads. Update output/csv/testing_60s_samples.csv to enable testing downloads.")
+    else:
+        testing_rows = parse_csv(testing_csv_path)
+
+    validate_no_overlaps(training_rows, testing_rows)
 
     process_csv(training_csv_path, training_output_root)
 
-    if not testing_csv_path.exists():
-        print(f"Warning: CSV file not found at {testing_csv_path}")
-        print("Skipping testing WAV downloads. Run extract_training_samples.py to generate testing_samples.csv.")
-    else:
+    if testing_rows:
         process_testing_csv(testing_csv_path, testing_output_root)

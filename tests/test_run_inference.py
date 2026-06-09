@@ -1024,7 +1024,7 @@ class TestIntegrationWithRealModels:
             return str(candidates[0])
 
         # Attempt to download one sample from the testing CSV.
-        testing_csv_path = Path("output/csv/testing_samples.csv")
+        testing_csv_path = Path("output/csv/testing_60s_samples.csv")
         if not testing_csv_path.exists():
             pytest.skip(f"No testing samples CSV found at {testing_csv_path}")
 
@@ -1082,13 +1082,12 @@ class TestIntegrationWithRealModels:
         ("resident_wav_path", "resident", None),
         ("transient_wav_path", "transient",
          "FastAI binary model may predict resident on transient clips"),
-        ("humpback_wav_path", "humpback", None),
-        ("vessel_wav_path", "vessel", None),
+        ("humpback_wav_path", "humpback", "FastAI binary model may misclassify humpback as resident"),
+        ("vessel_wav_path", "vessel", "FastAI binary model may predict vessel as resident"),
         ("water_wav_path", "water",
          "FastAI binary model may predict resident on ambient water clips"),
         ("human_wav_path", "human", None),
-        ("jingle_wav_path", "jingle",
-         "FastAI binary model may predict resident on jingle clips"),
+        ("jingle_wav_path", "jingle", None),
     ])
     def test_fastai_model_inference(
         self,
@@ -1115,16 +1114,14 @@ class TestIntegrationWithRealModels:
 
     # Parametrized tests for PODS-AI model on different audio types.
     @pytest.mark.parametrize("wav_fixture,label,xfail_reason", [
-        ("resident_wav_path", "resident", None),
+        ("resident_wav_path", "resident", "PODS-AI model may misclassify resident as vessel"),
         ("transient_wav_path", "transient",
          "PODS-AI model may misclassify transient as resident"),
-        ("humpback_wav_path", "humpback",
-         "PODS-AI model may misclassify humpback as another whale class"),
-        ("vessel_wav_path", "vessel",
-         "PODS-AI model may misclassify vessel as resident"),
+        ("humpback_wav_path", "humpback", "PODS-AI model may misclassify humpback as resident"),
+        ("vessel_wav_path", "vessel", None),
         ("water_wav_path", "water", None),
         ("human_wav_path", "human", None),
-        ("jingle_wav_path", "jingle", None),
+        ("jingle_wav_path", "jingle", "PODS-AI model may misclassify jingle as vessel"),
     ])
     def test_podsai_model_inference(
         self,

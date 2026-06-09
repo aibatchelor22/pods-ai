@@ -21,7 +21,7 @@ import ffmpeg
 
 DEFAULT_SEGMENT_DURATION_SECONDS = 3  # Default length of each output segment in seconds.
 FILENAME_SAFE_PATTERN = r"[^A-Za-z0-9_-]"  # Characters to replace when sanitizing filenames.
-EXTERNAL_HUMPBACK_DIR = Path(__file__).parents[1] / "external" / "signals-humpback"
+EXTERNAL_HUMPBACK_DIR = Path(__file__).parents[2] / "external" / "signals-humpback"
 
 
 def process_external_humpback_wavs(external_dir: Path, output_root: Path, segment_duration: int = DEFAULT_SEGMENT_DURATION_SECONDS):

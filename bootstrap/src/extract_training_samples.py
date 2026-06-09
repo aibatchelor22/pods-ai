@@ -20,25 +20,19 @@ from pathlib import Path
 from typing import Optional
 from pytz import timezone
 import os
-import math
-import shutil
 import sys
 from tempfile import TemporaryDirectory
 from urllib.parse import quote
 import glob
 
-import ffmpeg
-import m3u8
-from audio_utils import (
-    get_cached_folders,
-    get_folders_between_timestamp,
-    get_difference_between_times_in_seconds,
-    download_from_url,
-    load_m3u8_with_retry
-)
+# Ensure repository root is importable when this script is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-# Get repository root.
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from src.audio_utils import (
+    download_60s_audio,
+)
 
 # Offset, in seconds, between the detection end time and the start of the downloaded audio.
 AUDIO_OFFSET_SECONDS: int = 2
@@ -436,140 +430,6 @@ def get_aligned_end_time(timestamp_str: str) -> datetime:
        snapped_sec = 0
     end_time = raw_end.replace(second=snapped_sec, microsecond=0)
     return end_time
-
-
-def download_60s_audio(node_name: str, timestamp_str: str, tmp_dir: str) -> Optional[str]:
-    """
-    Download 60 seconds of audio, starting 51-60 seconds preceding the given timestamp.
-
-    Args:
-        node_name: The node name (e.g., "rpi_sunset_bay").
-        timestamp_str: The detection timestamp in Pacific time.
-        tmp_dir: Temporary directory to save the audio file.
-
-    Returns:
-        Path to the downloaded wav file, or None if download failed.
-    """
-    end_time = get_aligned_end_time(timestamp_str)
-    start_time = end_time - timedelta(seconds=60)
-
-    # Set up S3 bucket and folder information.
-    hydrophone_stream_url = 'https://s3-us-west-2.amazonaws.com/audio-orcasound-net/' + node_name
-    bucket_folder = hydrophone_stream_url.split("https://s3-us-west-2.amazonaws.com/")[1]
-    tokens = bucket_folder.split("/")
-    s3_bucket = tokens[0]
-    folder_name = tokens[1]
-    prefix = folder_name + "/hls/"
-
-    # Convert timestamps to unix time.
-    start_unix_time = int(start_time.timestamp())
-    end_unix_time = int(end_time.timestamp())
-
-    try:
-        # Use cached folders per node/bucket/prefix.
-        all_hydrophone_folders = get_cached_folders(s3_bucket, prefix=prefix)
-        print(f"  Found {len(all_hydrophone_folders)} folders in total for {node_name}")
-
-        valid_folders = get_folders_between_timestamp(all_hydrophone_folders, start_unix_time, end_unix_time)
-        print(f"  Found {len(valid_folders)} folders in date range")
-
-        if not valid_folders:
-            print(f"  Warning: No folders found for timestamp {start_time}")
-            return None
-
-        # Use the first valid folder.
-        current_folder = int(valid_folders[0])
-
-    except Exception as e:
-        print(f"  ERROR: Failed to query S3 bucket: {e}")
-        return None
-
-    # Read the m3u8 file for the current folder.
-    stream_url = f"{hydrophone_stream_url}/hls/{current_folder}/live.m3u8"
-
-    try:
-        stream_obj = load_m3u8_with_retry(stream_url)
-    except Exception as e:
-        print(f"  ERROR: Failed to load m3u8 file: {e}")
-        return None
-
-    num_total_segments = len(stream_obj.segments)
-    if num_total_segments == 0:
-        print(f"  ERROR: No segments found in m3u8 file")
-        return None
-
-    # Calculate target duration (average segment duration).
-    target_duration_exact = sum(item.duration for item in stream_obj.segments) / num_total_segments
-    target_duration = round(target_duration_exact, 1)
-
-    # Calculate start and end indices based on time since folder start.
-    # Note: there's typically a 2-second audio offset.
-    audio_offset = 2
-    time_since_folder_start_for_start = get_difference_between_times_in_seconds(start_unix_time, current_folder)
-    time_since_folder_start_for_start -= audio_offset
-
-    time_since_folder_start_for_end = get_difference_between_times_in_seconds(end_unix_time, current_folder)
-    time_since_folder_start_for_end -= audio_offset
-
-    segment_start_index = max(0, math.floor(time_since_folder_start_for_start / target_duration))
-    segment_end_index = min(num_total_segments, math.ceil(time_since_folder_start_for_end / target_duration))
-
-    if segment_end_index > num_total_segments:
-        print(f"  ERROR: Not enough segments available")
-        return None
-
-    # Download and process segments.
-    try:
-        file_names = []
-        for i in range(segment_start_index, segment_end_index):
-            audio_segment = stream_obj.segments[i]
-            base_path = audio_segment.base_uri
-            file_name = audio_segment.uri
-            audio_url = base_path + file_name
-            download_from_url(audio_url, tmp_dir)
-            file_names.append(file_name)
-
-        if not file_names:
-            print("  ERROR: No segments were successfully downloaded")
-            return None
-
-        # Concatenate all .ts files.
-        clipname = f"temp_60s_{node_name}_{timestamp_str}"
-        if len(file_names) > 1:
-            hls_file = os.path.join(tmp_dir, clipname + ".ts")
-            with open(hls_file, "wb") as wfd:
-                for f in file_names:
-                    with open(os.path.join(tmp_dir, f), "rb") as fd:
-                        shutil.copyfileobj(fd, wfd)
-        else:
-            hls_file = os.path.join(tmp_dir, file_names[0])
-
-        # Convert to wav using ffmpeg.
-        wav_file_path = os.path.join(tmp_dir, f"{clipname}.wav")
-
-        # Compute offset (seconds) into the concatenated .ts where the desired start occurs.
-        ss_offset = time_since_folder_start_for_start - (segment_start_index * target_duration)
-        if ss_offset < 0:
-            ss_offset = 0.0
-
-        # Use input seeking and limit duration to 60 seconds.
-        stream = ffmpeg.input(hls_file, ss=ss_offset)
-        stream = ffmpeg.output(
-            stream,
-            wav_file_path,
-            t=60,  # 60 seconds.
-            acodec="pcm_s16le",
-            ar=44100,
-            ac=1
-        )
-        ffmpeg.run(stream, overwrite_output=True, quiet=True)
-
-        print(f"  Downloaded 60s audio: {wav_file_path}")
-        return wav_file_path
-
-    except Exception as e:
-        print(f"  Warning: Unable to retrieve audio clip: {e}")
-        return None
 
 
 def compute_correct_timestamp_for_tp_human_only(
@@ -1001,8 +861,8 @@ def main():
     parser.add_argument(
         '--input',
         type=str,
-        default='output/csv/detections.csv',
-        help='Path to input detections CSV file (default: output/csv/detections.csv)'
+        default='bootstrap/csv/detections.csv',
+        help='Path to input detections CSV file (default: bootstrap/csv/detections.csv)'
     )
     parser.add_argument(
         '--duration',
@@ -1016,11 +876,11 @@ def main():
     input_path = Path(args.input)
     if not input_path.is_absolute():
         input_path = REPO_ROOT / input_path
-    initial_training_output_path = REPO_ROOT / 'output' / 'csv' / 'initial_training_samples.csv'
-    testing_output_path = REPO_ROOT / 'output' / 'csv' / 'testing_samples.csv'
+    initial_training_output_path = REPO_ROOT / 'bootstrap' / 'csv' / 'initial_training_samples.csv'
+    testing_output_path = REPO_ROOT / 'bootstrap' / 'csv' / 'testing_samples.csv'
 
     # Load manual confidences for sorting.
-    manual_corrections_path = REPO_ROOT / 'output' / 'csv' / 'manual_timestamps.csv'
+    manual_corrections_path = REPO_ROOT / 'bootstrap' / 'csv' / 'manual_timestamps.csv'
     manual_timestamps, manual_confidences = load_manual_corrections(manual_corrections_path)
 
     print(f"Loading detections from {input_path}...")

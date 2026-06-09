@@ -34,7 +34,7 @@ If a corrected class is provided, rows whose predicted class already matches the
 corrected class are omitted from the printed output.
 
 URI/Description/Notes Lookup:
-- The script looks up the detection in detections.csv (default: output/csv/detections.csv)
+- The script looks up the detection in detections.csv (default: bootstrap/csv/detections.csv)
   by matching NodeName and Timestamp, and uses the URI, Description, and Notes from that row
 - If not found in detections.csv, generates a URI from the timestamp and uses
   fallback_description when provided (otherwise empty Description), with Notes="manual"
@@ -63,7 +63,7 @@ from pytz import timezone
 
 from model_inference import get_model_inference
 from orcasite_feeds import get_orcasite_feeds, OrcasiteFeed
-from extract_training_samples import download_60s_audio
+from audio_utils import download_60s_audio
 
 SEGMENT_DURATION = 3  # Duration of each segment in seconds.
 HOP_DURATION = 2  # Hop size between segments in seconds.
@@ -71,7 +71,7 @@ DEFAULT_OUTPUT_DIR = "new"  # Default output directory for segments.
 DEFAULT_MODEL_PATH = "davethaler/whale-call-detector"  # Default HuggingFace model ID.
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
 DEFAULT_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"  # Pinned Hub model revision.
-DEFAULT_DETECTIONS_CSV = "output/csv/detections.csv"  # Default path to detections.csv
+DEFAULT_DETECTIONS_CSV = "bootstrap/csv/detections.csv"  # Default path to detections.csv
 PACIFIC_TZ = timezone("US/Pacific")  # Pacific timezone for timestamp formatting.
 UTC_TZ = timezone("UTC")  # UTC timezone for URI generation.
 
@@ -502,7 +502,7 @@ def add_samples(
             (default: DEFAULT_MODEL_PATH).
         model_revision: Git commit hash to pin the HuggingFace Hub model revision.
             Ignored when model_path is a local directory (default: DEFAULT_MODEL_REVISION).
-        detections_csv: Path to detections.csv for detection lookup (default: "output/csv/detections.csv").
+        detections_csv: Path to detections.csv for detection lookup (default: "bootstrap/csv/detections.csv").
         model: Optional preloaded PODS-AI inference model to reuse instead of
             loading from model_path.
         corrected_class: Optional corrected class. When provided, rows whose

@@ -4,15 +4,7 @@
 name: Check CSV
 
 on:
-  pull_request:
-    paths:
-      - 'src/make_csv.py'
-      - 'src/extract_training_samples.py'
-      - 'src/merge_training_samples.py'
-      - 'src/process_humpback_wavs.py'
-      - 'output/csv/**'
-      - 'requirements.txt'
-      - '.github/workflows/check_csv.yml'
+  workflow_dispatch:
 
 concurrency:
   # Cancel any CI/CD workflow currently in progress for the same PR.
@@ -46,32 +38,38 @@ jobs:
       - id: detect
         name: Detect CSV workflow changes
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "should_run_base_csv=true" >> "$GITHUB_OUTPUT"
+            echo "should_run_make_csv=true" >> "$GITHUB_OUTPUT"
+            echo "should_run_merge=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" > changed_files.txt
           cat changed_files.txt
           base_csv_inputs=(
-            '^src/make_csv.py$'
-            '^src/extract_training_samples.py$'
-            '^src/process_humpback_wavs.py$'
-            '^output/csv/detections.csv$'
-            '^output/csv/manual_timestamps.csv$'
-            '^output/csv/initial_training_samples.csv$'
-            '^output/csv/testing_samples.csv$'
+            '^bootstrap/src/make_csv.py$'
+            '^bootstrap/src/extract_training_samples.py$'
+            '^bootstrap/src/process_humpback_wavs.py$'
+            '^bootstrap/csv/detections.csv$'
+            '^bootstrap/csv/manual_timestamps.csv$'
+            '^bootstrap/csv/initial_training_samples.csv$'
+            '^bootstrap/csv/testing_samples.csv$'
             '^requirements.txt$'
             '^\.github/workflows/check_csv.yml$'
           )
           make_csv_inputs=(
-            '^src/make_csv.py$'
-            '^output/csv/detections.csv$'
+            '^bootstrap/src/make_csv.py$'
+            '^bootstrap/csv/detections.csv$'
             '^requirements.txt$'
             '^\.github/workflows/check_csv.yml$'
           )
           merge_inputs=(
-            '^src/extract_training_samples.py$'
-            '^src/merge_training_samples.py$'
-            '^output/csv/initial_training_samples.csv$'
-            '^output/csv/manual_samples.csv$'
-            '^output/csv/manual_timestamps.csv$'
-            '^output/csv/training_samples.csv$'
+            '^bootstrap/src/extract_training_samples.py$'
+            '^bootstrap/src/merge_training_samples.py$'
+            '^bootstrap/csv/initial_training_samples.csv$'
+            '^bootstrap/csv/manual_samples.csv$'
+            '^bootstrap/csv/manual_timestamps.csv$'
+            '^bootstrap/csv/training_samples.csv$'
             '^requirements.txt$'
             '^\.github/workflows/check_csv.yml$'
           )
@@ -164,7 +162,7 @@ jobs:
       - name: Make CSV
         if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true' && env.COSMOS_KEY != ''
         run: |
-          python src/make_csv.py --end 2026_03_17_00_00_00_PST
+          python bootstrap/src/make_csv.py --end 2026_03_17_00_00_00_PST
 
       - name: Verify there are no changes in detections.csv
         if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true'
@@ -174,12 +172,12 @@ jobs:
       - name: Process humpback wavs
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
-          python src/process_humpback_wavs.py
+          python bootstrap/src/process_humpback_wavs.py
 
       - name: Extract training samples
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
-          python src/extract_training_samples.py
+          python bootstrap/src/extract_training_samples.py
 
       - name: Verify there are no changes in initial_training_samples.csv or testing_samples.csv
         if: steps.skip_check.outputs.should_skip != 'true'
@@ -259,7 +257,7 @@ jobs:
       - name: Make CSV
         if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true' && env.COSMOS_KEY != ''
         run: |
-          python src/make_csv.py --end 2026_03_17_00_00_00_PST
+          python bootstrap/src/make_csv.py --end 2026_03_17_00_00_00_PST
 
       - name: Verify there are no changes in detections.csv
         if: steps.skip_check.outputs.should_skip != 'true' && needs.detect_merge_inputs.outputs.should_run_make_csv == 'true'
@@ -269,12 +267,12 @@ jobs:
       - name: Process humpback wavs
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
-          python src/process_humpback_wavs.py
+          python bootstrap/src/process_humpback_wavs.py
 
       - name: Extract training samples
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
-          python src/extract_training_samples.py
+          python bootstrap/src/extract_training_samples.py
 
       - name: Verify there are no changes in initial_training_samples.csv or testing_samples.csv
         if: steps.skip_check.outputs.should_skip != 'true'
@@ -340,7 +338,7 @@ jobs:
       - name: Merge training samples
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
-          python src/merge_training_samples.py
+          python bootstrap/src/merge_training_samples.py
 
       - name: Verify there are no changes in training_samples.csv
         if: steps.skip_check.outputs.should_skip != 'true'
@@ -413,7 +411,7 @@ jobs:
       - name: Merge training samples
         if: steps.skip_check.outputs.should_skip != 'true'
         run: |
-          python src/merge_training_samples.py
+          python bootstrap/src/merge_training_samples.py
 
       - name: Verify there are no changes in training_samples.csv
         if: steps.skip_check.outputs.should_skip != 'true'

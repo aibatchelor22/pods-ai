@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Ensure src/ is on the path before any test module is imported.
+# Ensure src/ and bootstrap/src are on the path before any test module is imported.
+sys.path.insert(0, str(Path(__file__).parent.parent / 'bootstrap' / 'src'))
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 # Packages that are either heavy (torch/fastai) or optional (numpy/pandas) in

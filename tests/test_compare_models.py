@@ -78,11 +78,11 @@ class TestLoadTestSamples:
     """Tests for load_test_samples()."""
 
     def test_loads_all_samples(self, tmp_path):
-        """load_test_samples loads all rows from testing_samples.csv."""
+        """load_test_samples loads all rows from testing_60s_samples.csv."""
         from compare_models import load_test_samples
         testing_rows = _make_testing_rows()
 
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, testing_rows)
 
         samples = load_test_samples(testing_csv)
@@ -97,7 +97,7 @@ class TestLoadTestSamples:
         from compare_models import load_test_samples
         testing_rows = _make_testing_rows()
 
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, testing_rows)
 
         samples = load_test_samples(testing_csv)
@@ -109,10 +109,10 @@ class TestLoadTestSamples:
         assert first.notes == "tp_human_only"
 
     def test_returns_empty_list_for_missing_file(self, tmp_path):
-        """load_test_samples returns [] when testing_samples.csv is missing."""
+        """load_test_samples returns [] when testing_60s_samples.csv is missing."""
         from compare_models import load_test_samples
 
-        samples = load_test_samples(Path("/nonexistent/testing_samples.csv"))
+        samples = load_test_samples(Path("/nonexistent/testing_60s_samples.csv"))
         assert samples == []
 
     def test_respects_max_samples_limit(self, tmp_path):
@@ -120,7 +120,7 @@ class TestLoadTestSamples:
         from compare_models import load_test_samples
         testing_rows = _make_testing_rows()
 
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, testing_rows)
 
         samples = load_test_samples(testing_csv, max_samples=2)
@@ -131,7 +131,7 @@ class TestLoadTestSamples:
         from compare_models import load_test_samples
         testing_rows = _make_testing_rows()
 
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, testing_rows)
 
         samples = load_test_samples(testing_csv, category_filter="resident")
@@ -143,7 +143,7 @@ class TestLoadTestSamples:
         from compare_models import load_test_samples
         testing_rows = _make_testing_rows()
 
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, testing_rows)
 
         samples = load_test_samples(testing_csv, category_filter="transient")
@@ -161,7 +161,7 @@ class TestLoadTestSamples:
             {"Category": "humpback", "NodeName": "rpi_c", "Timestamp": "2024_01_01_00_02_00_PST",
              "URI": "https://example.com/3", "Description": "", "Notes": "tp_machine_only", "Confidence": ""},
         ]
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, rows)
 
         samples = load_test_samples(testing_csv, max_samples=2, category_filter="humpback")
@@ -174,7 +174,7 @@ class TestLoadTestSamples:
         from unittest.mock import patch
         from compare_models import load_test_samples
 
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         testing_csv.write_text("Category,NodeName,Timestamp,URI,Description,Notes\n")
 
         # Patch DictReader iteration to raise csv.Error mid-read.
@@ -190,7 +190,7 @@ class TestLoadTestSamples:
         """load_test_samples returns [] for files with encoding issues."""
         from compare_models import load_test_samples
         
-        testing_csv = tmp_path / "testing_samples.csv"
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         # Write file with invalid UTF-8
         with open(testing_csv, "wb") as f:
             f.write(b"Category,NodeName,Timestamp,URI,Description,Notes\n")
@@ -742,7 +742,7 @@ class TestPrintSummary:
         assert "Definitions:" in captured
         assert "Accuracy     = Correct / Evaluated" in captured
         assert "[R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class" in captured
-        assert "compares end-to-end 60-second inference on testing_samples.csv" in captured
+        assert "compares end-to-end 60-second inference on testing_60s_samples.csv" in captured
 
     def test_prints_avg_time(self, capsys):
         """print_summary includes average time column."""
@@ -813,13 +813,13 @@ class TestMainCLI:
     """Tests for the main() entry point."""
 
     def _write_testing_csv(self, tmp_path, testing_rows):
-        """Write testing_samples.csv to tmp_path."""
-        testing_csv = tmp_path / "testing_samples.csv"
+        """Write testing_60s_samples.csv to tmp_path."""
+        testing_csv = tmp_path / "testing_60s_samples.csv"
         _write_csv(testing_csv, testing_rows)
         return testing_csv
 
     def test_returns_1_for_missing_testing_csv(self, tmp_path):
-        """main() returns 1 when testing_samples.csv does not exist."""
+        """main() returns 1 when testing_60s_samples.csv does not exist."""
         from compare_models import main
         wav_dir = tmp_path / "testing-wav"
         wav_dir.mkdir()
@@ -953,7 +953,7 @@ class TestMainCLI:
         assert result == 0
 
     def test_returns_1_when_no_test_samples(self, tmp_path):
-        """main() returns 1 when testing_samples.csv is empty."""
+        """main() returns 1 when testing_60s_samples.csv is empty."""
         from compare_models import main
 
         testing_csv = self._write_testing_csv(tmp_path, [])
@@ -1048,7 +1048,7 @@ class TestMainCLI:
         assert result == 0
 
     def test_returns_1_for_category_with_no_samples(self, tmp_path):
-        """main() returns 1 when --category matches no rows in testing_samples.csv."""
+        """main() returns 1 when --category matches no rows in testing_60s_samples.csv."""
         from compare_models import main
 
         testing_csv = self._write_testing_csv(tmp_path, _make_testing_rows())

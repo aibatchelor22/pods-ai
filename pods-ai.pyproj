@@ -37,20 +37,20 @@ MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-2
     <Compile Include="src\audio_utils.py" />
     <Compile Include="src\compare_models.py" />
     <Compile Include="src\download_wavs.py" />
-    <Compile Include="src\extract_training_samples.py" />
-    <Compile Include="src\get_best_timestamp.py" />
+    <Compile Include="bootstrap\src\extract_training_samples.py" />
+    <Compile Include="bootstrap\src\get_best_timestamp.py" />
     <Compile Include="src\LiveInferenceOrchestrator.py" />
-    <Compile Include="src\make_csv.py" />
+    <Compile Include="bootstrap\src\make_csv.py" />
     <Compile Include="src\make_spectrograms.py" />
     <Compile Include="src\manual_samples_utils.py" />
-    <Compile Include="src\merge_training_samples.py" />
+    <Compile Include="bootstrap\src\merge_training_samples.py" />
     <Compile Include="src\model_inference.py" />
     <Compile Include="src\orcahello_inference.py" />
     <Compile Include="src\orcasite_feeds.py" />
     <Compile Include="src\podsai_inference.py" />
     <Compile Include="src\process_false_negatives.py" />
     <Compile Include="src\process_false_positives.py" />
-    <Compile Include="src\process_humpback_wavs.py" />
+    <Compile Include="bootstrap\src\process_humpback_wavs.py" />
     <Compile Include="src\run_inference.py" />
     <Compile Include="src\spectrogram_visualizer.py" />
     <Compile Include="src\train_podsai_model.py" />
@@ -72,6 +72,8 @@ MODEL_URL=https://trainedproductionmodels.blob.core.windows.net/dnnmodel/11-15-2
   <ItemGroup>
     <Folder Include="tests\" />
     <Folder Include="src\" />
+    <Folder Include="bootstrap\" />
+    <Folder Include="bootstrap\src\" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="README.md" />

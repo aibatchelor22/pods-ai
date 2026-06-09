@@ -6,11 +6,11 @@ Given a combined node_timestamp string, compute and output the best corrected
 timestamp URI by running process_sample().
 
 Usage:
-    python get_best_timestamp.py <node_timestamp> [--no-model] [--duration N]
+    python bootstrap/src/get_best_timestamp.py <node_timestamp> [--no-model] [--duration N]
 
 Example:
-    python get_best_timestamp.py rpi-orcasound-lab_2023_08_18_00_59_53_PST
-    python get_best_timestamp.py orcasound-lab 2023_08_18_00_59_53_PST  # Legacy format still supported
+    python bootstrap/src/get_best_timestamp.py rpi-orcasound-lab_2023_08_18_00_59_53_PST
+    python bootstrap/src/get_best_timestamp.py orcasound-lab 2023_08_18_00_59_53_PST  # Legacy format still supported
 """
 
 import argparse
@@ -19,14 +19,17 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+# Ensure repository root is importable when this script is run directly.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from extract_training_samples import (
+    SEGMENT_DURATION_SECONDS,
     generate_uri,
     load_manual_corrections,
     process_sample,
-    REPO_ROOT,
-    SEGMENT_DURATION_SECONDS,
 )
-from model_inference import get_model_inference
 
 
 def node_slug_to_name(node_slug: str) -> str:
@@ -170,7 +173,7 @@ def main():
     sample = build_sample(node_slug, timestamp_str)
 
     # Load manual timestamp corrections.
-    manual_corrections_path = REPO_ROOT / 'output' / 'csv' / 'manual_timestamps.csv'
+    manual_corrections_path = REPO_ROOT / 'bootstrap' / 'csv' / 'manual_timestamps.csv'
     manual_timestamps, manual_confidences = load_manual_corrections(manual_corrections_path)
 
     # Initialise model inference unless --no-model was requested.
@@ -182,6 +185,7 @@ def main():
         auto_download_default = "true" if model_type == "fastai" else "false"
         auto_download = os.environ.get("MODEL_AUTO_DOWNLOAD", auto_download_default).lower() == "true"
         try:
+            from src.model_inference import get_model_inference
             model_inference = get_model_inference(
                 model_path=model_path if model_type == "fastai" else None,
                 model_type=model_type,
