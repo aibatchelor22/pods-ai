@@ -29,10 +29,12 @@ flowchart TD;
     testingSamples@{ shape: doc, label: "testing_60s_samples.csv" };
     wav@{ shape: docs, label: "wav/*" };
     testingWav@{ shape: docs, label: "testing-wav/*" };
+    concatenated@{ shape: docs, label: "concatenated.wav" };
 
     downloadWavs@{ shape: rect, label: "download_wavs.py" };
     trainPodsaiModel@{ shape: rect, label: "train_podsai_model.py" };
     compareModels@{ shape: rect, label: "compare_models.py" };
+    concatenateWavs@{ shape: rect, label: "concatenate_wavs.py" };
 
     trainingSamples-->downloadWavs-->wav;
     testingSamples-->downloadWavs-->testingWav;
@@ -43,6 +45,8 @@ flowchart TD;
     testingSamples-->compareModels;
     testingWav-->compareModels;
     orcaHelloModel-->compareModels;
+
+    wav-->concatenateWavs-->concatenated;
 ```
 
 ## Requirements
