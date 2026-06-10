@@ -316,6 +316,7 @@ vessel,rpi_andrews_bay,2026_03_19_18_29_19_PST,https://live.orcasound.net/bouts/
 vessel,rpi_andrews_bay,2026_03_19_18_29_29_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-03-20T01%3A29%3A29.000Z,,manual,57.8
 vessel,rpi_andrews_bay,2026_03_19_18_29_41_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-03-20T01%3A29%3A41.000Z,,manual,68.1
 vessel,rpi_andrews_bay,2026_03_19_18_29_49_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-03-20T01%3A29%3A49.000Z,,manual,55.8
+vessel,rpi_andrews_bay,2026_05_22_16_15_42_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-22T23%3A15%3A42.000Z,Moderate ship noise and water slosh,fp_machine,67.8
 vessel,rpi_bush_point,2024_07_02_12_00_01_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-07-02T19%3A00%3A01.000Z,Squeaky ship,fp_machine_only,66.9
 vessel,rpi_bush_point,2024_07_13_16_00_58_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-07-13T23%3A00%3A58.000Z,Tonal boat noise with some swishing and lots of contact noise.,fp_machine_only,56.9
 vessel,rpi_bush_point,2025_06_07_02_09_13_PST,https://live.orcasound.net/bouts/new/bush-point?time=2025-06-07T09%3A09%3A13.000Z,Water slosh and ship noise,fp_machine_only,54.2
@@ -360,8 +361,10 @@ vessel,rpi_sunset_bay,2026_01_05_23_38_31_PST,https://live.orcasound.net/bouts/n
 vessel,rpi_sunset_bay,2026_01_05_23_38_41_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2026-01-06T07%3A38%3A41.000Z,Train,fp_machine,76.6
 vessel,rpi_sunset_bay,2026_01_05_23_38_45_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2026-01-06T07%3A38%3A45.000Z,Train,fp_machine,80.9
 vessel,rpi_sunset_bay,2026_01_05_23_39_05_PST,https://live.orcasound.net/bouts/new/sunset-bay?time=2026-01-06T07%3A39%3A05.000Z,Train,fp_machine,80.0
+water,rpi_andrews_bay,2026_05_22_00_03_14_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-22T07%3A03%3A14.000Z,"Water slosh, electrical noise",fp_machine,51.2
 water,rpi_andrews_bay,2026_05_25_19_24_10_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T02%3A24%3A10.000Z,Electrical noise,fp_machine_only,100.0
 water,rpi_andrews_bay,2026_05_26_14_08_43_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T21%3A08%3A43.000Z,Electrical noise,fp_machine_only,100.0
+water,rpi_andrews_bay,2026_05_26_14_09_37_PST,https://live.orcasound.net/bouts/new/andrews-bay?time=2026-05-26T21%3A09%3A37.000Z,No humpback nor vessel,fp_machine_only,100.0
 water,rpi_bush_point,2024_06_28_18_57_00_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-06-29T01%3A57%3A00.000Z,Water slosh,fp_machine_only,61.9
 water,rpi_bush_point,2024_07_04_13_56_41_PST,https://live.orcasound.net/bouts/new/bush-point?time=2024-07-04T20%3A56%3A41.000Z,Watery sounds.,fp_machine_only,65.2
 water,rpi_bush_point,2025_06_07_01_03_15_PST,https://live.orcasound.net/bouts/new/bush-point?time=2025-06-07T08%3A03%3A15.000Z,Water slosh,fp_machine_only,70.4
