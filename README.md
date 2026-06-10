@@ -375,22 +375,22 @@ python src/compare_models.py \
 
 Example output layout (actual metric values vary with the evaluated dataset):
 ```
-Loaded 160 test samples from output\csv\testing_60s_samples.csv
+Loaded 134 test samples from output\csv\testing_60s_samples.csv
 WAV directory: output/testing-wav
 Models to evaluate: fastai, orcahello, podsai, oldpodsai
 
   ...
 
-==============================================================================================================================================
+================================================================================================================
 Model Comparison Summary
-==============================================================================================================================================
+================================================================================================================
 Model           Evaluated   Correct  Accuracy      F1    RFP%    RFN%    TFP%    TFN%    HFP%    HFN%   Avg Time
-----------------------------------------------------------------------------------------------------------------------------------------------
-fastai                160        68     42.5%   0.129   61.0%   51.7%    0.0%  100.0%    0.0%  100.0%     11.40s
-orcahello             160        41     25.6%   0.128   96.0%   38.3%    0.0%  100.0%    0.0%  100.0%      4.97s
-oldpodsai             160        88     55.0%   0.492   21.0%   45.0%   14.6%   63.3%   15.4%   40.0%      4.49s
-podsai                160       104     65.0%   0.581   20.0%   35.0%    0.0%   73.3%    6.2%   36.7%      6.77s
-==============================================================================================================================================
+----------------------------------------------------------------------------------------------------------------
+fastai                134        52     38.8%   0.120   64.6%   55.8%    0.0%  100.0%    0.0%  100.0%     11.84s
+orcahello             134        34     25.4%   0.125   95.1%   42.3%    0.0%  100.0%    0.0%  100.0%      4.59s
+oldpodsai             134        72     53.7%   0.477   19.5%   46.2%   16.3%   63.3%   15.5%   38.9%      4.47s
+podsai                134        66     49.3%   0.414   29.3%   38.5%    1.0%   70.0%    0.0%   88.9%      6.49s
+================================================================================================================
 
 Definitions:
   Accuracy     = Correct / Evaluated
@@ -399,46 +399,88 @@ Definitions:
   [R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class
   [R|T|H]FN%   = among actual samples of that class, fraction predicted as another class
   Avg Time     = average time spent in model predict() per 60-second WAV file
+  Note         = compares end-to-end 60-second inference on testing_60s_samples.csv
 
 Confusion Matrix for fastai (rows=actual, cols=predicted):
-                 other   resident      total
-      human          6          4         10
-   humpback         17         13         30
-     jingle          8          2         10
-   resident         31         29         60
-  transient          4         26         30
-     vessel          4          6         10
-      water          0         10         10
+                other  resident     total
+      human         6         4        10
+   humpback        10         8        18
+     jingle         7         0         7
+   resident        29        23        52
+  transient         4        26        30
+     vessel         2         5         7
+      water         0        10        10
 
 Confusion Matrix for orcahello (rows=actual, cols=predicted):
-                 other   resident      total
-      human          0         10         10
-   humpback          5         25         30
-     jingle          0         10         10
-   resident         23         37         60
-  transient          0         30         30
-     vessel          0         10         10
-      water          0         10         10
+                other  resident     total
+      human         0        10        10
+   humpback         4        14        18
+     jingle         0         7         7
+   resident        22        30        52
+  transient         0        30        30
+     vessel         0         7         7
+      water         0        10        10
 
 Confusion Matrix for oldpodsai (rows=actual, cols=predicted):
-                 human   humpback     jingle   resident  transient     vessel      water      total
-      human          7          1          0          1          1          0          0         10
-   humpback          1         18          0          8          3          0          0         30
-     jingle          0          8          2          0          0          0          0         10
-   resident          6          2          0         33         15          1          3         60
-  transient          1          9          0          9         11          0          0         30
-     vessel          0          0          0          3          0          7          0         10
-      water          0          0          0          0          0          0         10         10
+                 human   humpback   resident  transient     vessel      water      total
+      human          7          1          1          1          0          0         10
+   humpback          1         11          4          2          0          0         18
+     jingle          0          7          0          0          0          0          7
+   resident          5          1         28         14          1          3         52
+  transient          1          9          9         11          0          0         30
+     vessel          0          0          2          0          5          0          7
+      water          0          0          0          0          0         10         10
 
 Confusion Matrix for podsai (rows=actual, cols=predicted):
                  human   humpback     jingle   resident  transient     vessel      water      total
-      human          9          1          0          0          0          0          0         10
-   humpback          0         19          0          3          0          7          1         30
-     jingle          0          0          9          0          0          1          0         10
-   resident          1          3          0         39          0         12          5         60
-  transient          0          4          0         17          8          1          0         30
-     vessel          0          0          0          0          0         10          0         10
-      water          0          0          0          0          0          0         10         10
+      human          8          0          0          0          1          1          0         10
+   humpback          0          2          0          5          0         10          1         18
+     jingle          0          0          6          0          0          1          0          7
+   resident          0          0          0         32          0         17          3         52
+  transient          0          0          0         19          9          2          0         30
+     vessel          0          0          0          0          0          7          0          7
+      water          0          0          0          0          0          8          2         10
+```
+
+Note: the potential of the podsai model is greater than shown above.  The same version used in the
+podsai matrix above showed the above when trained:
+
+```
+============================================================
+DETAILED EVALUATION METRICS
+============================================================
+Dataset: trainer test split from output/wav (80/20 split of training samples).
+
+Class Distribution:
+  water        - True:   8, Predicted:   7
+  resident     - True:  23, Predicted:  23
+  transient    - True:  12, Predicted:  12
+  humpback     - True:  12, Predicted:  12
+  vessel       - True:  11, Predicted:  13
+  jingle       - True:   6, Predicted:   6
+  human        - True:   9, Predicted:   8
+
+Per-Class Performance:
+Class        Precision    Recall       F1          
+------------------------------------------------
+water        0.857        0.750        0.800       
+resident     0.957        0.957        0.957       
+transient    0.917        0.917        0.917       
+humpback     0.917        0.917        0.917       
+vessel       0.692        0.818        0.750       
+jingle       0.833        0.833        0.833       
+human        1.000        0.889        0.941       
+
+Confusion Matrix (rows=true, cols=predicted):
+                 water  resident  transien  humpback    vessel    jingle     human
+       water         6         0         0         0         2         0         0
+    resident         0        22         0         0         1         0         0
+   transient         0         1        11         0         0         0         0
+    humpback         0         0         1        11         0         0         0
+      vessel         0         0         0         1         9         1         0
+      jingle         1         0         0         0         0         5         0
+       human         0         0         0         0         1         0         8
+============================================================
 ```
 
 **Example - compare only fastai and orcahello**

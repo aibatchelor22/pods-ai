@@ -41,7 +41,7 @@ SUMMARY_LABELS = [
 MATRIX_CELL_PADDING = 2
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"
+PODSAI_MODEL_REVISION = "db51f75da131de0e53e8080a1f2c5f4b534810aa"
 OLD_PODSAI_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
 # Maps user-facing model names to inference backends. oldpodsai reuses podsai
 # inference with a different pinned model revision.

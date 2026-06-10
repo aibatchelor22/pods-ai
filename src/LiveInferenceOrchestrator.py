@@ -32,7 +32,7 @@ NEGATIVE_LABELS = {"other", "water", "vessel", "jingle", "human"}
 
 PODSAI_MODEL_ID = "davethaler/whale-call-detector"
 # renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
-PODSAI_MODEL_REVISION = "d1eedf5c614268da7551039a84dfc35d317168b9"
+PODSAI_MODEL_REVISION = "db51f75da131de0e53e8080a1f2c5f4b534810aa"
 
 
 # TODO: get this data from https://live.orcasound.net/api/json/feeds.
