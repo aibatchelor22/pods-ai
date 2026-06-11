@@ -80,20 +80,8 @@ pods-ai/
 
 ## Coding Conventions
 
-- **Language**: Python 3.11+
-- **License header** (required at the top of every new source file):
-  ```python
-  # Copyright (c) PODS-AI contributors
-  # SPDX-License-Identifier: MIT
-  ```
-- **Typing**: Use `dataclasses`, built-in generic types (`list`, `tuple`), and `typing` utilities (`Optional`) with type annotations throughout.
-- **Docstrings**: All public functions and classes must have Google-style or plain docstrings describing parameters and return values.
-- **Error handling**: Catch exceptions at I/O boundaries (network, file), print a descriptive error message, and return an empty list or `None` as appropriate—do not let exceptions propagate silently.
-- **Constants**: Define module-level constants for magic values (e.g., `NEAR_MIN`, `MAX_DETECTION_PAGES`).
-- **Comments**: Comments should end in punctuation (typically a period).
-- **Project metadata**: Keep `pods-ai.pyproj` updated so every `.py` file in the repository is listed there.
-- **Documentation**: Update `README.md` when behavior or usage changes, especially when adding a new script.
-- **Copilot instructions**: Update `.github/copilot-instructions.md` when repository structure, workflows, or contributor guidance changes.
+Follow the coding conventions documented in [CONTRIBUTING.md](../CONTRIBUTING.md).
+When reviewing code, ensure it follows those coding conventions.
 
 ## pods-ai Pipeline
 
