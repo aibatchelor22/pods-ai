@@ -45,5 +45,6 @@
       ],
       "dependencyDashboardApproval": true
     }
-  ]
+  ],
+  "onboarding": true
 }
