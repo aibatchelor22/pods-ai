@@ -10,6 +10,9 @@ on:
     paths:
       - output/csv/training_3s_samples.csv
       - output/csv/testing_60s_samples.csv
+      - .github/workflows/download_wavs.yml
+      - src/download_wavs.py
+      - audio_utils.py
   workflow_dispatch:
 
 concurrency:
@@ -63,13 +66,24 @@ jobs:
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
 
+      - id: cache_ref
+        name: Determine WAV cache source ref
+        if: steps.detect.outputs.should_run == 'true'
+        run: |
+          if git ls-remote --exit-code --heads origin "${WAV_CACHE_BRANCH}" > /dev/null 2>&1; then
+            echo "ref=${WAV_CACHE_BRANCH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "WAV cache branch '${WAV_CACHE_BRANCH}' not found. Seeding from ${GITHUB_SHA}."
+            echo "ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout WAV cache branch
         if: steps.detect.outputs.should_run == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           fetch-depth: 0
           path: ${{ env.WAV_CACHE_PATH }}
-          ref: ${{ env.WAV_CACHE_BRANCH }}
+          ref: ${{ steps.cache_ref.outputs.ref }}
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         if: steps.detect.outputs.should_run == 'true'
