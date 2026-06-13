@@ -22,7 +22,7 @@ torchvision>=0.16.0
 torchaudio>=2.1.0
 git+https://github.com/fastaudio/fastai_audio@0.1
 transformers>=5.0.0
-datasets==2.21.0
+datasets==5.0.0
 accelerate>=0.20.0
 evaluate>=0.4.0
 scikit-learn>=1.3.0
