@@ -6,7 +6,7 @@ ipython
 librosa>=0.10.0
 m3u8
 matplotlib
-numpy>=1.21.0,<2.0
+numpy>=2.4.6,<2.5
 opencv-python
 pandas>=3.0.3,<3.1; python_version < "3.12"
 pandas>=2.2.0; python_version >= "3.12"
