@@ -10,7 +10,7 @@ numpy>=1.21.0,<2.0
 opencv-python
 pandas>=1.1.0,<2.0; python_version < "3.12"
 pandas>=2.2.0; python_version >= "3.12"
-pydub==0.24.1
+pydub==0.25.1
 pytz
 requests
 scipy
