@@ -4,16 +4,28 @@
 name: Download WAVs
 
 on:
-  pull_request:
+  push:
+    branches:
+      - main
+    paths:
+      - output/csv/training_3s_samples.csv
+      - output/csv/testing_60s_samples.csv
   workflow_dispatch:
 
+concurrency:
+  group: download-wavs-cache-refresh
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   download_wavs:
     if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    env:
+      WAV_CACHE_BRANCH: wav-cache
+      WAV_CACHE_PATH: wav-cache
 
     steps:
       - name: Harden Runner
@@ -43,13 +55,21 @@ jobs:
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" > changed_files.txt
+          git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" > changed_files.txt
           cat changed_files.txt
           should_run=false
           if grep -Eq '^output/csv/training_3s_samples\.csv$|^output/csv/testing_60s_samples\.csv$' changed_files.txt; then
             should_run=true
           fi
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout WAV cache branch
+        if: steps.detect.outputs.should_run == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 0
+          path: ${{ env.WAV_CACHE_PATH }}
+          ref: ${{ env.WAV_CACHE_BRANCH }}
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         if: steps.detect.outputs.should_run == 'true'
@@ -68,7 +88,24 @@ jobs:
 
       - name: Run download_wavs.py
         if: steps.detect.outputs.should_run == 'true'
+        env:
+          WAV_WORKTREE_DIR: ${{ github.workspace }}/${{ env.WAV_CACHE_PATH }}
+          WAV_CACHE_DIR: ${{ github.workspace }}/${{ env.WAV_CACHE_PATH }}
         run: python src/download_wavs.py
+
+      - name: Commit and push WAV cache updates
+        if: steps.detect.outputs.should_run == 'true'
+        run: |
+          if [ -z "$(git -C "${WAV_CACHE_PATH}" status --porcelain output/wav output/testing-wav)" ]; then
+            echo "No WAV cache changes detected."
+            exit 0
+          fi
+
+          git -C "${WAV_CACHE_PATH}" config user.name "github-actions[bot]"
+          git -C "${WAV_CACHE_PATH}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "${WAV_CACHE_PATH}" add output/wav output/testing-wav
+          git -C "${WAV_CACHE_PATH}" commit -m "Update cached WAV files from ${GITHUB_SHA}"
+          git -C "${WAV_CACHE_PATH}" push origin "HEAD:${WAV_CACHE_BRANCH}"
 
       - name: Skip notice
         if: steps.detect.outputs.should_run != 'true'

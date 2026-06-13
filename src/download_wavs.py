@@ -184,6 +184,58 @@ def _find_cross_overlaps(training_rows: list[CSVRow], testing_rows: list[CSVRow]
     return overlaps
 
 
+def _get_wav_filename(node_name: str, timestamp_pst: str) -> str:
+    node_name_in_filename = node_name.replace("_", "-")
+    return f"{node_name_in_filename}_{timestamp_pst}.wav"
+
+
+def _get_relative_wav_path(row: CSVRow) -> Path:
+    return Path(row.category) / _get_wav_filename(row.node_name, row.timestamp_pst)
+
+
+def _copy_wav_from_cache_if_exists(expected_path: Path, output_root: Path, cache_root: Path | None) -> bool:
+    """
+    Copy a WAV file from cache_root into output_root if it exists there.
+
+    Returns True when a cached file is copied, otherwise False.
+    """
+    if cache_root is None:
+        return False
+    try:
+        relative_path = expected_path.relative_to(output_root)
+    except ValueError:
+        return False
+    source_path = cache_root / relative_path
+    if not source_path.exists():
+        return False
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, expected_path)
+    print(f"Copied from cache: {source_path} -> {expected_path}")
+    return True
+
+
+def delete_stale_wavs(output_root: Path, expected_relative_paths: set[Path]) -> None:
+    """Delete WAV files under output_root that are not expected by the current CSV rows."""
+    if not output_root.exists():
+        return
+
+    deleted_count = 0
+    for wav_path in output_root.rglob("*.wav"):
+        if wav_path.relative_to(output_root) not in expected_relative_paths:
+            wav_path.unlink()
+            print(f"Deleted stale wav: {wav_path}")
+            deleted_count += 1
+
+    for directory in sorted((path for path in output_root.rglob("*") if path.is_dir()), reverse=True):
+        if directory == output_root:
+            continue
+        if not any(directory.iterdir()):
+            directory.rmdir()
+
+    if deleted_count:
+        print(f"Deleted {deleted_count} stale wav file(s) from {output_root}")
+
+
 def validate_no_overlaps(training_rows: list[CSVRow], testing_rows: list[CSVRow]) -> None:
     overlaps = []
     if training_rows:
@@ -203,6 +255,7 @@ def download_audio_segment(
     node_name: str,
     timestamp_str: str,
     output_root: Path,
+    cache_root: Path | None = None,
 ):
     """
     Download a 3-second audio segment for a detection and save it to the appropriate label directory.
@@ -221,12 +274,13 @@ def download_audio_segment(
     timestamp_pst = parse_timestamp_pst(timestamp_str)
     
     # Check if the file already exists.
-    node_name_in_filename = node_name.replace("_", "-")
-    clipname = f"{node_name_in_filename}_{timestamp_str}"
-    wav_filename = f"{clipname}.wav"
+    wav_filename = _get_wav_filename(node_name, timestamp_str)
+    clipname = wav_filename.removesuffix(".wav")
     expected_path = label_dir / wav_filename
     if expected_path.exists():
         print(f"Skipping (already exists): {expected_path}")
+        return
+    if _copy_wav_from_cache_if_exists(expected_path, output_root, cache_root):
         return
     
     # Set up S3 bucket and folder information.
@@ -359,7 +413,7 @@ def download_audio_segment(
         print(f"Error details: {type(e).__name__}: {str(e)}")
         print(f"Hydrophone: {node_name}")
 
-def process_csv(csv_path: Path, output_root: Path):
+def process_csv(csv_path: Path, output_root: Path, cache_root: Path | None = None):
     """
     Read the training samples CSV file and download corresponding WAV files.
     
@@ -371,12 +425,22 @@ def process_csv(csv_path: Path, output_root: Path):
     
     print(f"Found {len(rows)} training samples to process")
     
+    expected_relative_paths: set[Path] = set()
     for row in rows:
+        expected_relative_paths.add(_get_relative_wav_path(row))
         print(f"Processing: {row.category} - {row.node_name} - {row.timestamp_pst}")
-        download_audio_segment(row.category, row.node_name, row.timestamp_pst, output_root)
+        download_audio_segment(
+            row.category,
+            row.node_name,
+            row.timestamp_pst,
+            output_root,
+            cache_root=cache_root,
+        )
+
+    delete_stale_wavs(output_root, expected_relative_paths)
 
 
-def download_testing_sample(row: CSVRow, output_root: Path):
+def download_testing_sample(row: CSVRow, output_root: Path, cache_root: Path | None = None):
     """
     Download audio for a testing sample.
 
@@ -392,11 +456,12 @@ def download_testing_sample(row: CSVRow, output_root: Path):
     """
     label_dir = output_root / row.category
     label_dir.mkdir(parents=True, exist_ok=True)
-    node_name_in_filename = row.node_name.replace("_", "-")
-    wav_filename = f"{node_name_in_filename}_{row.timestamp_pst}.wav"
+    wav_filename = _get_wav_filename(row.node_name, row.timestamp_pst)
     expected_path = label_dir / wav_filename
     if expected_path.exists():
         print(f"Skipping (already exists): {expected_path}")
+        return
+    if _copy_wav_from_cache_if_exists(expected_path, output_root, cache_root):
         return
 
     # For non-tp_human_only rows, shift by +30s so downloaded 60s clip is centered on row timestamp.
@@ -413,7 +478,7 @@ def download_testing_sample(row: CSVRow, output_root: Path):
         print(f"Downloaded: {expected_path}")
 
 
-def process_testing_csv(csv_path: Path, output_root: Path):
+def process_testing_csv(csv_path: Path, output_root: Path, cache_root: Path | None = None):
     """
     Read the testing samples CSV file and download corresponding WAV files.
 
@@ -424,16 +489,20 @@ def process_testing_csv(csv_path: Path, output_root: Path):
     rows = parse_csv(csv_path)
     print(f"Found {len(rows)} testing samples to process")
 
+    expected_relative_paths: set[Path] = set()
     for row in rows:
+        expected_relative_paths.add(_get_relative_wav_path(row))
         print(f"Processing testing sample: {row.category} - {row.node_name} - {row.timestamp_pst} ({row.notes})")
-        download_testing_sample(row, output_root)
+        download_testing_sample(row, output_root, cache_root=cache_root)
+
+    delete_stale_wavs(output_root, expected_relative_paths)
 
 
 def print_usage():
     """
     Display usage information for this script.
     """
-    print("Usage: python download_wavs.py")
+    print("Usage: python download_wavs.py [--validate-only]")
     print()
     print("This script downloads wav files for training and testing samples.")
     print("It reads from:")
@@ -444,18 +513,28 @@ def print_usage():
     print("  - output/wav/ (training samples)")
     print("  - output/testing-wav/ (testing samples)")
     print()
-    print("This script does not accept any command-line arguments.")
+    print("Optional argument:")
+    print("  --validate-only: validate CSV overlap rules without downloading WAV files")
+    print("Optional environment variables:")
+    print("  - WAV_WORKTREE_DIR: root directory containing output/ (default: current directory)")
+    print("  - WAV_CACHE_DIR: root directory to copy existing wav files from before downloading")
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        print_usage()
-        sys.exit(0)
-
+def run_download_wavs(validate_only: bool = False) -> None:
     training_csv_path = Path("output/csv/training_3s_samples.csv")
-    training_output_root = Path("output/wav")
     testing_csv_path = Path("output/csv/testing_60s_samples.csv")
-    testing_output_root = Path("output/testing-wav")
+
+    worktree_root = Path(os.getenv("WAV_WORKTREE_DIR", "."))
+    training_output_root = worktree_root / "output/wav"
+    testing_output_root = worktree_root / "output/testing-wav"
+
+    cache_root_env = os.getenv("WAV_CACHE_DIR")
+    training_cache_root = None
+    testing_cache_root = None
+    if cache_root_env:
+        cache_root = Path(cache_root_env)
+        training_cache_root = cache_root / "output/wav"
+        testing_cache_root = cache_root / "output/testing-wav"
 
     if not training_csv_path.exists():
         print(f"Error: CSV file not found at {training_csv_path}")
@@ -472,7 +551,19 @@ if __name__ == "__main__":
 
     validate_no_overlaps(training_rows, testing_rows)
 
-    process_csv(training_csv_path, training_output_root)
+    if validate_only:
+        print("Overlap validation completed successfully.")
+        return
+
+    process_csv(training_csv_path, training_output_root, cache_root=training_cache_root)
 
     if testing_rows:
-        process_testing_csv(testing_csv_path, testing_output_root)
+        process_testing_csv(testing_csv_path, testing_output_root, cache_root=testing_cache_root)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] != "--validate-only"):
+        print_usage()
+        sys.exit(1)
+
+    run_download_wavs(validate_only=(len(sys.argv) == 2))

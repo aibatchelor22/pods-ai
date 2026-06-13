@@ -1,0 +1,55 @@
+# Copyright (c) PODS-AI contributors
+# SPDX-License-Identifier: MIT
+---
+name: Validate WAV sample overlap
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate_wav_overlap:
+    permissions:
+      actions: write  # for fkirc/skip-duplicate-actions to skip or stop workflow runs
+      contents: read  # for actions/checkout to fetch code
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            *.archive.ubuntu.com:80
+            *.microsoft.com:443
+            api.github.com:443
+            dl.google.com:443
+            esm.ubuntu.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            pypi.org:443
+
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf  # v5.3.1
+        with:
+          cancel_others: 'false'
+          paths: '["output/csv/training_3s_samples.csv", "output/csv/testing_60s_samples.csv", "src/download_wavs.py", ".github/workflows/validate_wav_overlap.yml"]'
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        if: steps.skip_check.outputs.should_skip != 'true'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        if: steps.skip_check.outputs.should_skip != 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Validate CSV overlap rules
+        if: steps.skip_check.outputs.should_skip != 'true'
+        run: python src/download_wavs.py --validate-only
