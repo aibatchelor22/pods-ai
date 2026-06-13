@@ -521,8 +521,8 @@ def print_usage():
 
 
 def run_download_wavs(validate_only: bool = False) -> None:
-    training_csv_path = Path("output/csv/training_3s_samples.csv")
-    testing_csv_path = Path("output/csv/testing_60s_samples.csv")
+    training_csv_path = Path("../output/csv/training_3s_samples.csv")
+    testing_csv_path = Path("../output/csv/testing_60s_samples.csv")
 
     worktree_root = Path(os.getenv("WAV_WORKTREE_DIR", "."))
     training_output_root = worktree_root / "output/wav"
