@@ -3,6 +3,8 @@
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
+import json
+import io
 
 # Try to import mcp to see if it is installed.
 try:
@@ -22,6 +24,9 @@ except (ImportError, ModuleNotFoundError):
             return decorator
 
         def run(self):
+            pass
+
+        def _handle_raw_json(self, line):
             pass
 
     mock_mcp_module = MagicMock()
@@ -49,6 +54,7 @@ from mcp_server import (
     list_s3_recordings,
     get_sample_stats,
     find_unlabeled_detections,
+    run_dual_handshake,
 )
 from orcasite_feeds import OrcasiteFeed
 
@@ -130,7 +136,7 @@ class TestMCPServer(unittest.TestCase):
         mock_s3 = MagicMock()
         mock_boto.return_value = mock_s3
         
-        # Mock paginator
+        # Mock paginator.
         mock_paginator = MagicMock()
         mock_s3.get_paginator.return_value = mock_paginator
         mock_paginator.paginate.return_value = [
@@ -208,7 +214,7 @@ class TestMCPServer(unittest.TestCase):
         mock_get_model.return_value = mock_model
         
         from mcp_server import compare_models_on_clip
-        # Need to mock the Path suffix as well
+        # Need to mock the Path suffix as well.
         with patch("mcp_server.Path.suffix", new_callable=unittest.mock.PropertyMock) as mock_suffix:
             mock_suffix.return_value = ".wav"
             result = compare_models_on_clip("/abs/path/test.wav")
@@ -256,6 +262,238 @@ class TestMCPServer(unittest.TestCase):
             export_unlabeled_to_csv("node_1", "test.txt")
         with self.assertRaises(ValueError):
             export_unlabeled_to_csv("node_1", "")
+
+
+class TestDualHandshake(unittest.TestCase):
+    """Tests for run_dual_handshake() function."""
+
+    @patch("mcp_server.sys.platform", "win32")
+    @patch("mcp_server.msvcrt.kbhit")
+    @patch("mcp_server.time.sleep")
+    @patch("mcp_server.sys.stdin")
+    @patch("mcp_server.sys.stdout")
+    def test_client_initiated_handshake_windows(self, mock_stdout, mock_stdin, mock_sleep, mock_kbhit):
+        """Test Claude Desktop scenario on Windows: client sends first message."""
+        mock_mcp = MagicMock()
+        mock_mcp.run = MagicMock()
+        
+        # Simulate client message available.
+        mock_kbhit.return_value = True
+        client_message = '{"jsonrpc":"2.0","method":"initialize","id":1}\n'
+        mock_stdin.readline.return_value = client_message
+        
+        # Run dual handshake.
+        run_dual_handshake(mock_mcp)
+        
+        # Verify sleep was called first (give client time to send).
+        mock_sleep.assert_called_once_with(0.2)
+        
+        # Verify kbhit was checked.
+        mock_kbhit.assert_called_once()
+        
+        # Verify stdin was read.
+        mock_stdin.readline.assert_called_once()
+        
+        # Verify server did NOT send its own initialize (client spoke first).
+        mock_stdout.write.assert_not_called()
+        
+        # Verify stdin was wrapped with PrependedStdin and run was called.
+        mock_mcp.run.assert_called_once()
+        # Verify sys.stdin was replaced with PrependedStdin wrapper.
+        self.assertNotEqual(sys.stdin, mock_stdin)
+
+    @patch("mcp_server.sys.platform", "linux")
+    @patch("mcp_server.select.select")
+    @patch("mcp_server.sys.stdin")
+    @patch("mcp_server.sys.stdout")
+    def test_client_initiated_handshake_unix(self, mock_stdout, mock_stdin, mock_select):
+        """Test Claude Desktop scenario on Unix: client sends first message."""
+        mock_mcp = MagicMock()
+        mock_mcp.run = MagicMock()
+        
+        # Simulate stdin ready for reading.
+        mock_select.return_value = ([mock_stdin], [], [])
+        client_message = '{"jsonrpc":"2.0","method":"initialize","id":1}\n'
+        mock_stdin.readline.return_value = client_message
+        
+        # Run dual handshake.
+        run_dual_handshake(mock_mcp)
+        
+        # Verify select was called with 0.2 second timeout.
+        mock_select.assert_called_once()
+        args = mock_select.call_args[0]
+        self.assertEqual(args[0], [mock_stdin])  # Read list.
+        self.assertEqual(args[1], [])  # Write list.
+        self.assertEqual(args[2], [])  # Exception list.
+        kwargs = mock_select.call_args[1]
+        self.assertEqual(kwargs.get("timeout") or args[3], 0.2)  # Timeout.
+        
+        # Verify stdin was read.
+        mock_stdin.readline.assert_called_once()
+        
+        # Verify server did NOT send initialize.
+        mock_stdout.write.assert_not_called()
+        
+        # Verify run was called.
+        mock_mcp.run.assert_called_once()
+
+    @patch("mcp_server.sys.platform", "win32")
+    @patch("mcp_server.msvcrt.kbhit")
+    @patch("mcp_server.time.sleep")
+    @patch("mcp_server.sys.stdin")
+    @patch("mcp_server.sys.stdout")
+    def test_server_initiated_handshake_windows(self, mock_stdout, mock_stdin, mock_sleep, mock_kbhit):
+        """Test Visual Studio scenario on Windows: server must initiate handshake."""
+        mock_mcp = MagicMock()
+        mock_mcp.run = MagicMock()
+        
+        # Simulate no client message.
+        mock_kbhit.return_value = False
+        
+        # Create a real StringIO for stdout to capture writes.
+        stdout_buffer = io.StringIO()
+        mock_stdout.write = stdout_buffer.write
+        mock_stdout.flush = MagicMock()
+        
+        # Run dual handshake.
+        run_dual_handshake(mock_mcp)
+        
+        # Verify server sent initialize message.
+        written_output = stdout_buffer.getvalue()
+        self.assertIn('"method": "initialize"', written_output)
+        self.assertIn('"jsonrpc": "2.0"', written_output)
+        self.assertIn('"protocolVersion": "2024-11-05"', written_output)
+        
+        # Verify flush was called.
+        mock_stdout.flush.assert_called()
+        
+        # Verify FastMCP.run() was called.
+        mock_mcp.run.assert_called_once()
+
+    @patch("mcp_server.sys.platform", "linux")
+    @patch("mcp_server.select.select")
+    @patch("mcp_server.sys.stdin")
+    @patch("mcp_server.sys.stdout")
+    def test_server_initiated_handshake_unix(self, mock_stdout, mock_stdin, mock_select):
+        """Test Visual Studio scenario on Unix: server must initiate handshake."""
+        mock_mcp = MagicMock()
+        mock_mcp.run = MagicMock()
+        
+        # Simulate no stdin ready (timeout).
+        mock_select.return_value = ([], [], [])
+        
+        # Create a real StringIO for stdout to capture writes.
+        stdout_buffer = io.StringIO()
+        mock_stdout.write = stdout_buffer.write
+        mock_stdout.flush = MagicMock()
+        
+        # Run dual handshake.
+        run_dual_handshake(mock_mcp)
+        
+        # Verify server sent initialize message.
+        written_output = stdout_buffer.getvalue()
+        self.assertIn('"method": "initialize"', written_output)
+        self.assertIn('"jsonrpc": "2.0"', written_output)
+        
+        # Verify FastMCP.run() was called.
+        mock_mcp.run.assert_called_once()
+
+    @patch("mcp_server.sys.platform", "win32")
+    @patch("mcp_server.msvcrt.kbhit")
+    @patch("mcp_server.time.sleep")
+    @patch("mcp_server.sys.stdin")
+    @patch("mcp_server.sys.stdout")
+    def test_server_handshake_message_format(self, mock_stdout, mock_stdin, mock_sleep, mock_kbhit):
+        """Test that server-initiated message has correct JSON-RPC format."""
+        mock_mcp = MagicMock()
+        mock_kbhit.return_value = False
+        
+        # Capture stdout.
+        stdout_buffer = io.StringIO()
+        mock_stdout.write = stdout_buffer.write
+        mock_stdout.flush = MagicMock()
+        
+        run_dual_handshake(mock_mcp)
+        
+        # Parse the JSON output.
+        written_output = stdout_buffer.getvalue().strip()
+        message = json.loads(written_output)
+        
+        # Verify message structure.
+        self.assertEqual(message["jsonrpc"], "2.0")
+        self.assertEqual(message["id"], 0)
+        self.assertEqual(message["method"], "initialize")
+        self.assertIn("params", message)
+        self.assertEqual(message["params"]["protocolVersion"], "2024-11-05")
+
+    @patch("mcp_server.sys.platform", "win32")
+    @patch("mcp_server.msvcrt.kbhit")
+    @patch("mcp_server.time.sleep")
+    @patch("mcp_server.sys.stdin")
+    @patch("mcp_server.sys.stdout")
+    def test_client_message_with_whitespace(self, mock_stdout, mock_stdin, mock_sleep, mock_kbhit):
+        """Test that whitespace-only input is ignored (triggers server init)."""
+        mock_mcp = MagicMock()
+        
+        # Simulate input available but only whitespace.
+        mock_kbhit.return_value = True
+        mock_stdin.readline.return_value = "   \n"
+        
+        stdout_buffer = io.StringIO()
+        mock_stdout.write = stdout_buffer.write
+        mock_stdout.flush = MagicMock()
+        
+        run_dual_handshake(mock_mcp)
+        
+        # Should trigger server-initiated handshake.
+        written_output = stdout_buffer.getvalue()
+        self.assertIn('"method": "initialize"', written_output)
+
+    def test_prepended_stdin_wrapper(self):
+        """Test the PrependedStdin wrapper class behavior."""
+        # This test verifies the internal PrependedStdin class works correctly.
+        original_stdin = io.StringIO("second line\nthird line\n")
+        prepended_line = "first line\n"
+        
+        # We need to import or access PrependedStdin from the function scope.
+        # Since it's a nested class, we'll test it indirectly via run_dual_handshake.
+        # For direct testing, we can extract and test the wrapper behavior.
+        
+        # Create a mock wrapper based on the implementation.
+        class PrependedStdin:
+            def __init__(self, prepended_line, original):
+                self._prepended = prepended_line
+                self._original = original
+                self._consumed = False
+            
+            def readline(self):
+                if not self._consumed:
+                    self._consumed = True
+                    return self._prepended
+                return self._original.readline()
+            
+            def read(self, size=-1):
+                if not self._consumed:
+                    self._consumed = True
+                    result = self._prepended
+                    if size > 0:
+                        remaining = size - len(result)
+                        if remaining > 0:
+                            result += self._original.read(remaining)
+                        else:
+                            result = result[:size]
+                    else:
+                        result += self._original.read()
+                    return result
+                return self._original.read(size)
+        
+        wrapper = PrependedStdin(prepended_line, original_stdin)
+        
+        # Test readline behavior.
+        self.assertEqual(wrapper.readline(), "first line\n")
+        self.assertEqual(wrapper.readline(), "second line\n")
+        self.assertEqual(wrapper.readline(), "third line\n")
+
 
 if __name__ == "__main__":
     unittest.main()

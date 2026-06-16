@@ -1,19 +1,21 @@
-# Copyright (c) PODS-AI contributors            
+# Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
 """
 Read-only MCP Server for Orcasound data interrogation (stdio transport).
-Tools — all usable without AKS access:          
-1. list_hydrophones — active stations from the Orcasite feeds API.             
-2. get_recent_detections — latest sound detections from the Orcasite API.                 
-3. list_s3_recordings — available HLS timestamp folders in S3 for a node.               
-4. get_sample_stats — category distribution in local training / testing CSVs.    
-5. find_unlabeled_detections — Orcasite detections not yet present in local CSVs.         
-6. compare_models_on_clip — run OrcaHello (HuggingFace) + PODS-AI on a local WAV.           
-7. export_unlabeled_to_csv — extract unlabeled remote data and save directly to disk.  
-"""                                             
+Tools — all usable without AKS access:
+1. list_hydrophones — active stations from the Orcasite feeds API.
+2. get_recent_detections — latest sound detections from the Orcasite API.
+3. list_s3_recordings — available HLS timestamp folders in S3 for a node.
+4. get_sample_stats — category distribution in local training / testing CSVs.
+5. find_unlabeled_detections — Orcasite detections not yet present in local CSVs.
+6. compare_models_on_clip — run OrcaHello (HuggingFace) + PODS-AI on a local WAV.
+7. export_unlabeled_to_csv — extract unlabeled remote data and save directly to disk.
+"""
 
 import csv
+import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +25,20 @@ from botocore.config import Config
 from mcp.server.fastmcp import FastMCP
 import requests
 import structlog
+
+# Platform-specific imports for non-blocking stdin check.
+# Both are imported unconditionally so they are always patchable in tests.
+try:
+    import msvcrt  # Windows only
+except ImportError:
+    # Provide a stub on non-Windows so the name is always patchable in tests.
+    class _MsvcrtStub:  # noqa: N801
+        @staticmethod
+        def kbhit() -> bool:
+            return False  # pragma: no cover
+    msvcrt = _MsvcrtStub()  # type: ignore[assignment]
+
+import select  # Unix/Linux/macOS (and Windows with sockets)
 
 structlog.configure(
     processors=[
@@ -432,10 +448,86 @@ def export_unlabeled_to_csv(
     return f"Successfully created dataset! Saved {len(unlabeled_items)} rows to {output_path}"
 
 
+def run_dual_handshake(mcp):
+    """
+    Allow both Claude Desktop (client-initiated) and Visual Studio (server-initiated)
+    MCP handshakes.
+
+    Checks for client input without blocking, avoiding stdin race conditions.
+    """
+    client_message = None
+
+    # Platform-specific non-blocking check for available stdin.
+    if sys.platform == "win32":
+        # Windows: Use msvcrt.kbhit() to check without blocking.
+        time.sleep(0.2)  # Give client a moment to send data.
+
+        if msvcrt.kbhit():
+            # Client sent something — read one line and save it.
+            client_message = sys.stdin.readline()
+    else:
+        # Unix/Linux/macOS: Use select to check stdin readiness.
+        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if ready:
+            # Client sent something — read one line and save it.
+            client_message = sys.stdin.readline()
+
+    if not client_message or not client_message.strip():
+        # No client message within timeout — server-initiated handshake (Visual Studio).
+        init_msg = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05"}
+        }
+        sys.stdout.write(json.dumps(init_msg) + "\n")
+        sys.stdout.flush()
+    else:
+        # Client-initiated handshake (Claude Desktop) — prepend message back to stdin.
+        # Create a wrapper that yields the saved message first, then normal stdin.
+        original_stdin = sys.stdin
+
+        class PrependedStdin:
+            """Wrapper that returns one prepended line, then delegates to original stdin."""
+            def __init__(self, prepended_line, original):
+                self._prepended = prepended_line
+                self._original = original
+                self._consumed = False
+
+            def readline(self):
+                if not self._consumed:
+                    self._consumed = True
+                    return self._prepended
+                return self._original.readline()
+
+            def read(self, size=-1):
+                if not self._consumed:
+                    self._consumed = True
+                    result = self._prepended
+                    if size > 0:
+                        remaining = size - len(result)
+                        if remaining > 0:
+                            result += self._original.read(remaining)
+                        else:
+                            result = result[:size]
+                    else:
+                        result += self._original.read()
+                    return result
+                return self._original.read(size)
+
+            def __getattr__(self, name):
+                return getattr(self._original, name)
+
+        sys.stdin = PrependedStdin(client_message, original_stdin)
+
+    # Hand control to FastMCP — it is now the sole stdin consumer.
+    mcp.run()
+
+
 # ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     logger.info("mcp_server_starting", transport="stdio")
-    mcp.run()
+    run_dual_handshake(mcp)

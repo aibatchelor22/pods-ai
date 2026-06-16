@@ -21,20 +21,15 @@ Because the tool names (like `get_recent_detections`) and their instructions are
 
 ---
 
-## Quick Start 
+## Quick Start
 
-We use `uv` because it's the fastest way to set everything up.
+<details>
+<summary><strong>For Unix</strong></summary>
 
 1. **Install uv**:
-   For Unix:
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
    export PATH="$HOME/.local/bin:$PATH"
-   ```
-
-   For Windows:
-   ```powershell
-   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
    ```
 
 2. **Set up the tools**:
@@ -51,7 +46,38 @@ We use `uv` because it's the fastest way to set everything up.
    export DANGEROUSLY_OMIT_AUTH=true
    npx -y @modelcontextprotocol/inspector .venv/bin/python src/mcp_server.py
    ```
+
    Open [http://localhost:6274](http://localhost:6274) and click **Connect**.
+
+</details>
+
+<details>
+<summary><strong>For Windows</strong></summary>
+
+1. **Install uv**:
+
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+2. **Set up the tools**:
+   ```powershell
+   uv venv .venv
+   .venv\Scripts\activate
+   uv pip install -r requirements-mcp.txt
+   ```
+
+3. **Test it (The "Inspector")**:
+   Run this to see a web page with all the tools:
+   ```powershell
+   $env:PYTHONPATH="src"
+   $env:DANGEROUSLY_OMIT_AUTH="true"
+   npx -y @modelcontextprotocol/inspector .venv\Scripts\python.exe src\mcp_server.py
+   ```
+
+   Open [http://localhost:6274](http://localhost:6274) and click **Connect**.
+
+</details>
 
 ---
 
@@ -100,3 +126,47 @@ To use these tools inside Claude, add this to your `claude_desktop_config.json`:
 ```
 
 Now you can just ask Claude: *"Find me new whale calls at Orcasound Lab and save them to a CSV."*
+
+---
+
+## Using it with Visual Studio
+
+Visual Studio 2022 supports MCP servers through GitHub Copilot Chat.
+
+1. **Configure GitHub Copilot Chat** to use the MCP server:
+
+Create or edit `.github/copilot-instructions.md` in your repository to include MCP server information, or configure it through Visual Studio settings if MCP configuration UI is available.
+
+Alternatively, if your Visual Studio version supports MCP configuration files, create `.vscode/settings.json` (for VS Code compatibility) or wait for native Visual Studio MCP configuration support.
+
+2. Open **Copilot Chat** (View > GitHub Copilot Chat, or `Ctrl+Alt+/`).
+
+3. Now you can just ask Copilot: *"Find me new whale calls at Orcasound Lab and save them to a CSV."*
+
+### Troubleshooting
+
+- **Connection Issues**: Check that `requirements-mcp.txt` dependencies are installed.
+- **Path Problems**: Ensure `PYTHONPATH` includes the `src` directory.
+- **Server Not Responding**: Verify the virtual environment is activated and Python version is 3.11+.
+- **Logs**: Check Visual Studio's Output window for MCP server logs.
+
+### Current Limitations
+
+> [!NOTE]
+> As of 2026, native Visual Studio MCP support is still evolving. The dual-handshake implementation ensures forward compatibility. If you encounter issues, use the MCP Inspector or Claude Desktop for testing while waiting for full Visual Studio integration.
+
+---
+
+## Available Tools
+
+The MCP server exposes these tools to AI assistants:
+
+1. **`list_hydrophones`** - Get all active Orcasound hydrophone stations
+2. **`get_recent_detections`** - Fetch latest detections from a specific station
+3. **`list_s3_recordings`** - Browse available audio recordings in S3
+4. **`get_sample_stats`** - Check training/testing data distribution
+5. **`find_unlabeled_detections`** - Find new detections not in training data
+6. **`compare_models_on_clip`** - Test OrcaHello and PODS-AI models on audio
+7. **`export_unlabeled_to_csv`** - Save new detections directly to CSV
+
+All tools work without AWS credentials (public data) except model comparison which requires ML dependencies from `requirements.txt`.
