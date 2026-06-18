@@ -115,6 +115,7 @@ jobs:
           egress-policy: block
           allowed-endpoints: >
             *.archive.ubuntu.com:80
+            security.ubuntu.com:443
             *.microsoft.com:443
             aifororcasmetadatastore-westus2.documents.azure.com:443
             aifororcasmetadatastore.documents.azure.com:443
@@ -295,6 +296,7 @@ jobs:
           egress-policy: block
           allowed-endpoints: >
             *.archive.ubuntu.com:80
+            security.ubuntu.com:443
             *.microsoft.com:443
             api.github.com:443
             audio-orcasound-net.s3.amazonaws.com:443
