@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     # PyTorch stack — CPU-only build is sufficient for AKS inference nodes;
     # GPU is not required and would increase image size significantly.
-    "torch>=2.1.0",
+    "torch>=2.12.1",
     "torchaudio>=2.1.0",
     # HuggingFace
     "transformers>=5.0.0",
