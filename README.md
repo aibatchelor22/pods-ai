@@ -352,6 +352,16 @@ usage: python generate_embeddings.py
        [--model-revision REVISION]
        [--category CATEGORY]
        [--max-samples N]
+```
+| Argument | Description |
+|---|---|
+| `--testing-csv` | Path to `testing_60s_samples.csv` (default: `../output/csv/testing_60s_samples.csv`) |
+| `--wav-dir` | Root directory containing downloaded testing WAV files (default: `output/testing-wav`) |
+| `--output-csv` | Output CSV file containing embeddings and metadata (default: `output/csv/embeddings.csv`) |
+| `--model-path` | HuggingFace Hub model ID or local PODS-AI model directory (default: `davethaler/whale-call-detector`) |
+| `--model-revision` | Specific model revision to load from HuggingFace. Defaults to the pinned AST model revision used by the repository. |
+| `--category` | Only process samples from the specified category (e.g. `resident`, `transient`, `humpback`, `water`) |
+| `--max-samples` | Maximum number of samples to process. If omitted, all matching samples are processed. |  
 
 ### compare_models.py
 
