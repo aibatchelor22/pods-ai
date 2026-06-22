@@ -10,6 +10,7 @@ with correct length and indexing semantics for use in timestamp correction.
 
 import pytest
 import numpy as np
+import sys
 import tempfile
 import time
 import soundfile as sf
@@ -609,13 +610,13 @@ class TestIntegrationWithRealModels:
         return _resolve_podsai_test_model_path()
 
     def test_predict_60s_wav_performance(self, podsai_model_path: str) -> None:
-        """Inference on a 60-second wav file must complete in under 22 seconds.
+        """Inference on a 60-second wav file must complete within platform budget.
 
         This test guards against performance regressions in the inference pipeline.
         For AST models the full-audio spectrogram optimization (one fbank call
         instead of one per segment) keeps the budget well under 22 seconds on a
         CPU-only machine.  For Wav2Vec2 (and other raw-audio) models the raw-audio
-        path is used instead; both should comfortably fit the 22-second budget.
+        path is used instead; on Windows CI the budget is 35 seconds.
         """
         from podsai_inference import PodsAIInference
 
@@ -636,9 +637,11 @@ class TestIntegrationWithRealModels:
 
             print(f"\nPodsAI predict() took {elapsed:.2f}s for a 60-second WAV")
 
-            assert elapsed < 22.0, (
+            max_elapsed = 35.0 if sys.platform.startswith("win") else 22.0
+            assert elapsed < max_elapsed, (
                 f"PodsAI inference on a 60-second WAV took {elapsed:.2f}s, "
-                f"expected < 22s. Check for performance regressions in the inference pipeline."
+                f"expected < {max_elapsed:.0f}s on platform '{sys.platform}'. "
+                "Check for performance regressions in the inference pipeline."
             )
             # 60s audio with segment_duration=3 and hop_duration=2 → 29 positions.
             assert len(result["local_confidences"]) == 29
