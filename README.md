@@ -106,6 +106,7 @@ Key dependencies:
   matches the provided value.
 - **run_inference.py**: Runs a model on a wav file and prints the global prediction,
   confidence, and per-class probabilities.
+- **generate_embeddings.py**: Runs the PODS-AI AST model on a set of test WAV files and extracts the AST class token embeddings for each analyzed segment. Outputs a CSV containing embeddings, predictions, confidence scores, and metadata that can be used to generate UMAP visualizations of the model's learned audio representation. See [generate_embeddings.py](#generate_embeddingspy) below.
 - **LiveInferenceOrchestrator.py**: Runs live/date-range HLS inference with the multiclass
   PODS-AI model and can upload positive detections (resident/transient/humpback)
   to Azure Blob Storage and Cosmos DB.
@@ -318,6 +319,39 @@ Per-class probabilities:
 
 You can compare results between models by running each on the
 same file and comparing the output.
+
+### generate_embeddings.py
+
+Generate AST embeddings for a collection of WAV files and save them to a CSV file for
+visualization and analysis. The script loads samples from
+`output/csv/testing_60s_samples.csv`, runs PODS-AI AST inference on each corresponding
+60-second WAV file, extracts the CLS-token embedding from the Audio Spectrogram
+Transformer (AST), and writes one row per analyzed segment.
+
+The output CSV contains:
+
+- Original sample metadata (category, node name, timestamp, URI, notes, etc.)
+- Segment timing information
+- Local and global model predictions
+- Confidence scores
+- AST embedding dimensions (`embedding_0`, `embedding_1`, ...)
+
+These embeddings can be used with dimensionality-reduction techniques such as UMAP
+or t-SNE to visualize how the AST model organizes different whale call classes and
+background sounds in embedding space.
+
+Inference uses the PODS-AI AST model (`davethaler/whale-call-detector`) by default,
+but a different model or local checkpoint can be specified with `--model-path`.
+
+```bash
+usage: python generate_embeddings.py
+       [--testing-csv PATH]
+       [--wav-dir PATH]
+       [--output-csv PATH]
+       [--model-path PATH]
+       [--model-revision REVISION]
+       [--category CATEGORY]
+       [--max-samples N]
 
 ### compare_models.py
 
