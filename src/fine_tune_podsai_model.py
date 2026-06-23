@@ -489,10 +489,10 @@ def main() -> None:
     parser.add_argument(
         "--model_name",
         type=str,
-        default="MIT/ast-finetuned-audioset-10-10-0.4593",
+        default="davethaler/whale-call-detector",
         help=(
             "Base model to fine-tune "
-            "(default: MIT/ast-finetuned-audioset-10-10-0.4593)"
+            "(default: davethaler/whale-call-detector)"
         ),
     )
     parser.add_argument(
