@@ -555,20 +555,25 @@ def main() -> None:
     # print(f"Dataset: {dataset}")
 
     print(f"Loading manifests...")
+    
     train_dataset = load_manifest(
         args.train_manifest,
         args.num_classes,
     )
-    print("\nTraining manifest:")
-    print(df["Category"].value_counts())
 
+    train_df = pd.read_csv(args.train_manifest)
+    print("\nTraining manifest:")
+    print(train_df["Category"].value_counts())
+
+    
     val_dataset = load_manifest(
         args.val_manifest,
         args.num_classes,
     )
 
+    val_df = pd.read_csv(args.val_manifest)
     print("\nValidation manifest:")
-    print(df["Category"].value_counts())
+    print(val_df["Category"].value_counts())
 
     dataset = DatasetDict(
         {
@@ -576,10 +581,6 @@ def main() -> None:
             "test": val_dataset,
         }
     )
-
-
-    # Analyze dataset distribution.
-    analyze_dataset(dataset)
 
     # Load feature extractor and model.
     print(f"Loading feature extractor and model: {args.model_name}")
@@ -600,6 +601,31 @@ def main() -> None:
             id2label=ID2LABEL,
             ignore_mismatched_sizes=True,
         )
+        if args.freeze_backbone:
+
+            print("Freezing backbone and training classifier head only...")
+
+            for param in model.parameters():
+                param.requires_grad = False
+
+            for param in model.classifier.parameters():
+                param.requires_grad = True
+
+            trainable = sum(
+                p.numel()
+                for p in model.parameters()
+                if p.requires_grad
+            )
+
+            total = sum(
+                p.numel()
+                for p in model.parameters()
+            )
+
+            print(
+                f"Trainable parameters: "
+                f"{trainable:,} / {total:,}"
+            )
     except Exception as e:
         error_msg = f"Error loading model from {args.model_name}: {type(e).__name__}: {e}"
         print(error_msg)
