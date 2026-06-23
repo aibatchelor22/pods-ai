@@ -705,9 +705,9 @@ def main() -> None:
         feature_extractor.push_to_hub(args.hub_model_id)
         print(f"Model pushed to HuggingFace Hub: {args.hub_model_id}")
 
-    trainer.train(
-        resume_from_checkpoint=args.resume_from_checkpoint
-    )
+    # trainer.train(
+    #     resume_from_checkpoint=args.resume_from_checkpoint
+    # )
 
     save_loss_plot(
         trainer,
