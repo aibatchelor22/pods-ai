@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 from typing import Protocol
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import numpy as np
 import torch
@@ -162,7 +163,7 @@ def setup_label_mappings(num_classes: int) -> None:
 def load_manifest(
     manifest_path: str,
     num_classes: int,
-) -> Dataset:
+    ) -> Dataset:
     import pandas as pd
 
     df = pd.read_csv(manifest_path)
