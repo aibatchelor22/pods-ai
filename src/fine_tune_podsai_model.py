@@ -717,7 +717,7 @@ def main() -> None:
 
     save_loss_plot(
         trainer,
-        /kaggle/working/,
+        "/kaggle/working/",
     )
 
 if __name__ == "__main__":
