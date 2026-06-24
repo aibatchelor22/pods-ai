@@ -709,11 +709,16 @@ def main() -> None:
     #     resume_from_checkpoint=args.resume_from_checkpoint
     # )
 
+    # save_loss_plot(
+    #     trainer,
+    #     args.output_dir,
+    # )
+
+
     save_loss_plot(
         trainer,
-        args.output_dir,
+        /kaggle/working/,
     )
-
 
 if __name__ == "__main__":
     main()
