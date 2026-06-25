@@ -39,7 +39,7 @@ jobs:
         uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d  # v5.1.0
 
       - name: Set Kubernetes context
-        uses: azure/k8s-set-context@89b837d75b40a7bd2ddafde837473c212db8b313  # v5.0.0
+        uses: azure/k8s-set-context@8698eba2499e9012f0d5085f8798077cce4bc526  # v5.0.1
         with:
           method: kubeconfig
           kubeconfig: ${{ secrets.KUBE_CONFIG }}
