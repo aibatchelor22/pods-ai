@@ -7,8 +7,8 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": [
-        "^tests/test_run_inference\\.py$"
+      "managerFilePatterns": [
+        "/^tests/test_run_inference\\.py$/"
       ],
       "matchStrings": [
         "PODSAI_TEST_MODEL_REVISION = \"(?<currentValue>[a-f0-9]{7,64})\""
@@ -19,11 +19,11 @@
     },
     {
       "customType": "regex",
-      "fileMatch": [
-        "^src/run_inference\\.py$",
-        "^src/compare_models\\.py$",
-        "^src/add_samples\\.py$",
-        "^src/LiveInferenceOrchestrator\\.py$"
+      "managerFilePatterns": [
+        "/^src/run_inference\\.py$/",
+        "/^src/compare_models\\.py$/",
+        "/^src/add_samples\\.py$/",
+        "/^src/LiveInferenceOrchestrator\\.py$/"
       ],
       "matchStrings": [
         "PODSAI_MODEL_REVISION = \"(?<currentValue>[a-f0-9]{7,64})\"",
