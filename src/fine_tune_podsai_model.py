@@ -28,6 +28,7 @@ import pandas as pd
 
 import numpy as np
 import torch
+import torchaudio
 
 # Configure datasets to use soundfile for audio decoding BEFORE importing datasets components.
 import datasets.config
@@ -455,6 +456,26 @@ def save_loss_plot(trainer, output_dir):
 
     print(f"Saved loss plot to {output_path}")
 
+class SpecAugment:
+    def __init__(self,
+                 time_mask_width=30,
+                 freq_mask_width=12):
+        self.time_mask = torchaudio.transforms.TimeMasking(
+            time_mask_param=time_mask_width
+        )
+
+        self.freq_mask = torchaudio.transforms.FrequencyMasking(
+            freq_mask_param=freq_mask_width
+        )
+
+    def __call__(self, features):
+        x = torch.tensor(features)
+
+        x = self.time_mask(x)
+        x = self.freq_mask(x)
+
+        return x.numpy()
+
 
 def main() -> None:
     """Main training function."""
@@ -539,6 +560,21 @@ def main() -> None:
         "--freeze_backbone",
         action="store_true",
         help="Freeze AST backbone and train classifier head only",
+    )
+    parser.add_argument(
+        "--specaugment",
+        action="store_true",
+        help="Enable SpecAugment during training",
+    )
+    parser.add_argument(
+        "--time_mask_width",
+        type=int,
+        default=30,
+    )
+    parser.add_argument(
+        "--freq_mask_width",
+        type=int,
+        default=12,
     )
 
     args = parser.parse_args()
@@ -715,10 +751,10 @@ def main() -> None:
     # )
 
 
-    save_loss_plot(
-        trainer,
-        "/kaggle/working/",
-    )
+    # save_loss_plot(
+    #     trainer,
+    #     "/kaggle/working/",
+    # )
 
 if __name__ == "__main__":
     main()
