@@ -638,6 +638,8 @@ def main() -> None:
             id2label=ID2LABEL,
             ignore_mismatched_sizes=True,
         )
+        print(type(model))
+        print(model.config)
         if args.freeze_backbone:
 
             print("Freezing backbone and training classifier head only...")
