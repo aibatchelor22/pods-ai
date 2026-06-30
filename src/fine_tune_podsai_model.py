@@ -693,22 +693,22 @@ def main() -> None:
     args = parser.parse_args()
 
     # Create augmenter
-augmenter = None
+    augmenter = None
 
-if (
-    args.random_gain
-    or args.time_shift
-    or args.gaussian_noise
-):
-    augmenter = WaveformAugmenter(
-    sample_rate=args.sample_rate,
-    random_gain=args.random_gain,
-    gain_db=args.gain_db,
-    time_shift=args.time_shift,
-    max_shift_ms=args.max_shift_ms,
-    gaussian_noise=args.gaussian_noise,
-    noise_std=args.noise_std,
-)
+    if (
+        args.random_gain
+        or args.time_shift
+        or args.gaussian_noise
+    ):
+        augmenter = WaveformAugmenter(
+        sample_rate=args.sample_rate,
+        random_gain=args.random_gain,
+        gain_db=args.gain_db,
+        time_shift=args.time_shift,
+        max_shift_ms=args.max_shift_ms,
+        gaussian_noise=args.gaussian_noise,
+        noise_std=args.noise_std,
+    )
 
     # Set up label mappings based on num_classes.
     setup_label_mappings(args.num_classes)
