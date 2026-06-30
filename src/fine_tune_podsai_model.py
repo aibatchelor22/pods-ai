@@ -213,7 +213,7 @@ def load_manifest(
 
     return dataset
 
-def preprocess_function(examples: dict, feature_extractor: FeatureExtractorProtocol, max_duration: float = 3.0) -> dict:
+def preprocess_function(examples: dict, feature_extractor: FeatureExtractorProtocol, max_duration: float = 3.0, augmenter = None) -> dict:
     """
     Preprocess audio files for the model.
 
@@ -236,6 +236,8 @@ def preprocess_function(examples: dict, feature_extractor: FeatureExtractorProto
         elif len(audio) < target_length:
             padding = target_length - len(audio)
             audio = np.pad(audio, (0, padding), mode='constant')
+        if augmenter is not None:
+            audio = augmenter(audio)
         processed_audio.append(audio)
 
     # The audio is already padded/truncated above, so we only need the extractor's
@@ -372,13 +374,13 @@ def analyze_dataset(dataset: DatasetDict) -> None:
     Analyze dataset statistics and distribution.
 
     Args:
-        dataset: DatasetDict with train and test splits
+        dataset: DatasetDict with train and validation splits
     """
     print("\n" + "="*60)
     print("DATASET ANALYSIS")
     print("="*60)
 
-    for split_name in ["train", "test"]:
+    for split_name in ["train", "validation"]:
         split_data = dataset[split_name]
         labels = split_data["label"]
 
@@ -475,6 +477,78 @@ class SpecAugment:
         x = self.freq_mask(x)
 
         return x.numpy()
+
+class WaveformAugmenter:
+
+    def __init__(
+        self,
+        sample_rate,
+        random_gain=False,
+        gain_db=6.0,
+        time_shift=False,
+        max_shift_ms=250,
+        gaussian_noise=False,
+        noise_std=0.002,
+    ):
+
+        self.sample_rate = sample_rate
+
+        self.random_gain = random_gain
+        self.gain_db = gain_db
+
+        self.time_shift = time_shift
+        self.max_shift = int(
+            sample_rate * max_shift_ms / 1000
+        )
+
+        self.gaussian_noise = gaussian_noise
+        self.noise_std = noise_std
+
+    def __call__(self, audio):
+
+        #
+        # Random gain
+        #
+        if self.random_gain:
+
+            gain = random.uniform(
+                -self.gain_db,
+                self.gain_db,
+            )
+
+            audio *= 10 ** (gain / 20)
+
+        #
+        # Time shift
+        #
+        if self.time_shift:
+
+            shift = random.randint(
+                -self.max_shift,
+                self.max_shift,
+            )
+
+            audio = np.roll(audio, shift)
+
+        #
+        # Gaussian noise
+        #
+        if self.gaussian_noise:
+
+            noise = np.random.normal(
+                0,
+                self.noise_std,
+                size=audio.shape,
+            )
+
+            audio = audio + noise
+
+        #
+        # Prevent clipping
+        #
+        audio = np.clip(audio, -1.0, 1.0)
+
+        return audio.astype(np.float32)
 
 
 def main() -> None:
@@ -576,8 +650,65 @@ def main() -> None:
         type=int,
         default=12,
     )
+    parser.add_argument(
+        "--random_gain",
+        action="store_true",
+        help="Apply random gain augmentation",
+    )
+
+    parser.add_argument(
+        "--gain_db",
+        type=float,
+        default=6.0,
+        help="Maximum gain in dB (+/-)",
+    )
+    parser.add_argument(
+        "--time_shift",
+        action="store_true",
+        help="Apply random time shift",
+    )
+    parser.add_argument(
+        "--max_shift_ms",
+        type=float,
+        default=250.0,
+        help="Maximum time shift in milliseconds",
+    )
+    parser.add_argument(
+        "--gaussian_noise",
+        action="store_true",
+        help="Add Gaussian noise",
+    )
+    parser.add_argument(
+        "--noise_std",
+        type=float,
+        default=0.002,
+    )
+    parser.add_argument(
+        "--sample_rate",
+        type=int,
+        default=16000,
+        help="Audio sample rate in Hz",
+    )
 
     args = parser.parse_args()
+
+    # Create augmenter
+augmenter = None
+
+if (
+    args.random_gain
+    or args.time_shift
+    or args.gaussian_noise
+):
+    augmenter = WaveformAugmenter(
+    sample_rate=args.sample_rate,
+    random_gain=args.random_gain,
+    gain_db=args.gain_db,
+    time_shift=args.time_shift,
+    max_shift_ms=args.max_shift_ms,
+    gaussian_noise=args.gaussian_noise,
+    noise_std=args.noise_std,
+)
 
     # Set up label mappings based on num_classes.
     setup_label_mappings(args.num_classes)
@@ -615,7 +746,7 @@ def main() -> None:
     dataset = DatasetDict(
         {
             "train": train_dataset,
-            "test": val_dataset,
+            "validation": val_dataset,
         }
     )
 
@@ -678,10 +809,27 @@ def main() -> None:
     }
     if preprocessing_workers > 1:
         map_kwargs["num_proc"] = preprocessing_workers
-    dataset = dataset.map(
-        partial(preprocess_function, feature_extractor=feature_extractor),
+    # dataset = dataset.map(
+    #     partial(preprocess_function, feature_extractor=feature_extractor),
+    #     **map_kwargs,
+    # )
+    dataset["train"] = dataset["train"].map(
+        partial(
+            preprocess_function,
+            feature_extractor=feature_extractor,
+            augmenter=augmenter,
+        ),
         **map_kwargs,
     )
+
+    dataset["validation"] = dataset["validation"].map(
+        partial(
+            preprocess_function,
+            feature_extractor=feature_extractor,
+            augmenter=None,
+        ),
+        **map_kwargs,
+    )    
 
     # Training arguments.
     training_args = TrainingArguments(
@@ -708,7 +856,7 @@ def main() -> None:
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        eval_dataset=dataset["validation"],
         compute_metrics=compute_metrics,
     )
 
