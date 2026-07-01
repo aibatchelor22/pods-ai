@@ -167,7 +167,7 @@ def main():
 
             result = {
                 "clip_path": row["clip_path"],
-                "ground_truth_label": row["label"],
+                "ground_truth_label": row["Category"],
                 "predicted_label":
                     model.config.id2label[
                         int(prediction[i])
