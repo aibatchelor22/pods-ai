@@ -6,12 +6,12 @@ Fine-tune a shared AST backbone with DCLDE multi-task classification heads.
 
 Tasks:
   - KW detection: KW vs not-KW
-  - Species: background, KW, HB, AB
+  - Species: background, KW, HW, AB
   - KW ecotype: NRKW, SRKW, OKW, SAR, TKW
 
 The species labels are read from ClassSpecies:
   KW     -> killer whale
-  HB     -> humpback whale
+  HW     -> humpback whale
   AB     -> Pacific white-sided dolphin
   UndBio -> background
   BKG    -> background
@@ -60,7 +60,7 @@ DEFAULT_MAX_PREPROCESSING_WORKERS = 8
 
 KW_LABELS = {"not_kw": 0, "kw": 1}
 KW_ID2LABEL = {v: k for k, v in KW_LABELS.items()}
-SPECIES_LABELS = {"background": 0, "KW": 1, "HB": 2, "AB": 3}
+SPECIES_LABELS = {"background": 0, "KW": 1, "HW": 2, "AB": 3}
 SPECIES_ID2LABEL = {v: k for k, v in SPECIES_LABELS.items()}
 ECOTYPE_LABELS = {"NRKW": 0, "SRKW": 1, "OKW": 2, "SAR": 3, "TKW": 4}
 ECOTYPE_ID2LABEL = {v: k for k, v in ECOTYPE_LABELS.items()}
