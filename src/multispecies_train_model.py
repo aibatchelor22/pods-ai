@@ -24,25 +24,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 from collections import Counter
-from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
+import librosa
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
-
-import datasets.config
-
-datasets.config.AUDIO_BACKENDS_USE_TORCH = False
-datasets.config.AUDIOCODEC_DEFAULT_DECODER = "soundfile"
-
-from datasets import Audio, Dataset, DatasetDict  # noqa: E402
+from torch.utils.data import DataLoader, Dataset
 from transformers import (  # noqa: E402
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
@@ -56,7 +49,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_RATE = 16000
 DEFAULT_MAX_DURATION = 3.0
 CHECKPOINT_SAVE_LIMIT = 6
-DEFAULT_MAX_PREPROCESSING_WORKERS = 8
+DEFAULT_DATALOADER_WORKERS = 2
 
 KW_LABELS = {"not_kw": 0, "kw": 1}
 KW_ID2LABEL = {v: k for k, v in KW_LABELS.items()}
@@ -112,8 +105,36 @@ def map_ecotype_label(class_species: str, ecotype: str) -> int:
     return ECOTYPE_LABELS[ecotype]
 
 
-def load_manifest(manifest_path: str, drop_unknown_labels: bool = False) -> Dataset:
-    """Load a DCLDE manifest into a Hugging Face Dataset."""
+class DCLDEAudioDataset(Dataset):
+    """Lightweight manifest-backed dataset.
+
+    Audio is intentionally loaded later by the collator so preprocessing does
+    not materialize AST feature tensors for the whole training set in RAM.
+    """
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        self.clip_paths = frame["clip_path"].astype(str).tolist()
+        self.kw_labels = frame["kw_labels"].astype(int).tolist()
+        self.species_labels = frame["species_labels"].astype(int).tolist()
+        self.ecotype_labels = frame["ecotype_labels"].astype(int).tolist()
+
+    def __len__(self) -> int:
+        return len(self.clip_paths)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return {
+            "clip_path": self.clip_paths[index],
+            "kw_labels": self.kw_labels[index],
+            "species_labels": self.species_labels[index],
+            "ecotype_labels": self.ecotype_labels[index],
+        }
+
+    def label_values(self, label_column: str) -> list[int]:
+        return list(getattr(self, label_column))
+
+
+def load_manifest(manifest_path: str, drop_unknown_labels: bool = False) -> DCLDEAudioDataset:
+    """Load a DCLDE manifest into a lightweight PyTorch Dataset."""
     path = resolve_path(manifest_path)
     df = pd.read_csv(path, low_memory=False)
 
@@ -159,15 +180,7 @@ def load_manifest(manifest_path: str, drop_unknown_labels: bool = False) -> Data
         for class_species, ecotype in zip(df["ClassSpecies"], df["Ecotype"])
     ]
 
-    dataset = Dataset.from_dict(
-        {
-            "audio": df["clip_path"].tolist(),
-            "kw_labels": df["kw_labels"].astype(int).tolist(),
-            "species_labels": df["species_labels"].astype(int).tolist(),
-            "ecotype_labels": df["ecotype_labels"].astype(int).tolist(),
-        }
-    )
-    return dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+    return DCLDEAudioDataset(df.reset_index(drop=True))
 
 
 class WaveformAugmenter:
@@ -203,30 +216,57 @@ class WaveformAugmenter:
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
 
-def preprocess_function(
-    examples: dict[str, Any],
-    feature_extractor: Any,
-    max_duration: float,
-    augmenter: Optional[WaveformAugmenter] = None,
-) -> dict[str, Any]:
-    """Pad/truncate audio, optionally augment it, and run the AST feature extractor."""
-    target_length = int(max_duration * SAMPLE_RATE)
-    processed_audio = []
-    for item in examples["audio"]:
-        audio = item["array"]
-        if len(audio) > target_length:
-            audio = audio[:target_length]
-        elif len(audio) < target_length:
-            audio = np.pad(audio, (0, target_length - len(audio)), mode="constant")
-        if augmenter is not None:
-            audio = augmenter(audio)
-        processed_audio.append(audio)
+class DCLDEAudioCollator:
+    """Load audio and build AST inputs lazily for one batch."""
 
-    inputs = feature_extractor(processed_audio, sampling_rate=SAMPLE_RATE, padding=True)
-    inputs["kw_labels"] = examples["kw_labels"]
-    inputs["species_labels"] = examples["species_labels"]
-    inputs["ecotype_labels"] = examples["ecotype_labels"]
-    return inputs
+    def __init__(
+        self,
+        feature_extractor: Any,
+        max_duration: float,
+        augmenter: Optional[WaveformAugmenter] = None,
+    ) -> None:
+        self.feature_extractor = feature_extractor
+        self.target_length = int(max_duration * SAMPLE_RATE)
+        self.augmenter = augmenter
+
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        processed_audio = []
+        for example in examples:
+            clip_path = example["clip_path"]
+            try:
+                audio, _ = librosa.load(clip_path, sr=SAMPLE_RATE, mono=True)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load audio clip: {clip_path}") from exc
+
+            if len(audio) > self.target_length:
+                audio = audio[: self.target_length]
+            elif len(audio) < self.target_length:
+                audio = np.pad(audio, (0, self.target_length - len(audio)), mode="constant")
+
+            audio = audio.astype(np.float32, copy=False)
+            if self.augmenter is not None:
+                audio = self.augmenter(audio)
+            processed_audio.append(audio)
+
+        batch = self.feature_extractor(
+            processed_audio,
+            sampling_rate=SAMPLE_RATE,
+            padding=True,
+            return_tensors="pt",
+        )
+        batch["kw_labels"] = torch.tensor(
+            [example["kw_labels"] for example in examples],
+            dtype=torch.long,
+        )
+        batch["species_labels"] = torch.tensor(
+            [example["species_labels"] for example in examples],
+            dtype=torch.long,
+        )
+        batch["ecotype_labels"] = torch.tensor(
+            [example["ecotype_labels"] for example in examples],
+            dtype=torch.long,
+        )
+        return batch
 
 
 class MultiTaskASTForDCLDE(nn.Module):
@@ -409,15 +449,54 @@ def compute_metrics(eval_pred: EvalPrediction) -> dict[str, float]:
     return metrics
 
 
-def get_preprocessing_workers(dataset: DatasetDict, requested_workers: int) -> int:
-    """Choose a safe number of dataset map workers."""
-    if requested_workers < 1:
-        raise ValueError(f"preprocessing_workers must be at least 1, got {requested_workers}")
-    split_sizes = [len(split_dataset) for split_dataset in dataset.values()]
-    return max(1, min(requested_workers, min(split_sizes)))
+class LazyAudioTrainer(Trainer):
+    """Trainer that uses different lazy collators for training and evaluation."""
+
+    def __init__(
+        self,
+        *args: Any,
+        train_collator: DCLDEAudioCollator,
+        eval_collator: DCLDEAudioCollator,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.train_collator = train_collator
+        self.eval_collator = eval_collator
+
+    def get_train_dataloader(self) -> DataLoader:
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+        sampler = self._get_train_sampler()
+        dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            sampler=sampler,
+            shuffle=sampler is None,
+            collate_fn=self.train_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=self.args.dataloader_drop_last,
+            persistent_workers=self.args.dataloader_num_workers > 0,
+        )
+        return self.accelerator.prepare(dataloader)
+
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+        dataloader = DataLoader(
+            eval_dataset,
+            batch_size=self.args.eval_batch_size,
+            sampler=self._get_eval_sampler(eval_dataset),
+            collate_fn=self.eval_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            persistent_workers=self.args.dataloader_num_workers > 0,
+        )
+        return self.accelerator.prepare(dataloader)
 
 
-def analyze_dataset(dataset: DatasetDict) -> None:
+def analyze_dataset(dataset: dict[str, DCLDEAudioDataset]) -> None:
     """Print target distributions for each split."""
     print("\n" + "=" * 72)
     print("DATASET ANALYSIS")
@@ -429,7 +508,11 @@ def analyze_dataset(dataset: DatasetDict) -> None:
             ("species_labels", SPECIES_ID2LABEL),
             ("ecotype_labels", ECOTYPE_ID2LABEL),
         ):
-            labels = [label for label in split_dataset[label_column] if label != IGNORE_INDEX]
+            labels = [
+                label
+                for label in split_dataset.label_values(label_column)
+                if label != IGNORE_INDEX
+            ]
             counts = Counter(labels)
             print(f"  {label_column}:")
             if not labels:
@@ -556,9 +639,16 @@ def main() -> int:
     parser.add_argument("--save-total-limit", type=int, default=CHECKPOINT_SAVE_LIMIT)
     parser.add_argument("--max-duration", type=float, default=DEFAULT_MAX_DURATION)
     parser.add_argument(
+        "--dataloader-workers",
+        type=int,
+        default=DEFAULT_DATALOADER_WORKERS,
+        help="Worker processes for lazy audio loading during training/eval.",
+    )
+    parser.add_argument(
         "--preprocessing-workers",
         type=int,
-        default=max(1, min(DEFAULT_MAX_PREPROCESSING_WORKERS, os.cpu_count() or 1)),
+        default=None,
+        help="Deprecated; kept for older commands. Lazy preprocessing now uses --dataloader-workers.",
     )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--kw-loss-weight", type=float, default=1.0)
@@ -585,7 +675,7 @@ def main() -> int:
     print("Loading manifests...")
     train_dataset = load_manifest(args.train_manifest, drop_unknown_labels=args.drop_unknown_labels)
     validation_dataset = load_manifest(args.val_manifest, drop_unknown_labels=args.drop_unknown_labels)
-    dataset = DatasetDict({"train": train_dataset, "validation": validation_dataset})
+    dataset = {"train": train_dataset, "validation": validation_dataset}
     analyze_dataset(dataset)
 
     print(f"Loading feature extractor: {args.model_name}")
@@ -603,32 +693,21 @@ def main() -> int:
             noise_std=args.noise_std,
         )
 
-    preprocessing_workers = get_preprocessing_workers(dataset, args.preprocessing_workers)
-    print(f"Preprocessing dataset with {preprocessing_workers} worker(s)...")
-    map_kwargs: dict[str, Any] = {
-        "batched": True,
-        "remove_columns": ["audio"],
-    }
-    if preprocessing_workers > 1:
-        map_kwargs["num_proc"] = preprocessing_workers
-
-    dataset["train"] = dataset["train"].map(
-        partial(
-            preprocess_function,
-            feature_extractor=feature_extractor,
-            max_duration=args.max_duration,
-            augmenter=augmenter,
-        ),
-        **map_kwargs,
+    if args.preprocessing_workers is not None:
+        print("--preprocessing-workers is deprecated and ignored; use --dataloader-workers.")
+    print(
+        "Using lazy audio preprocessing: features are generated per batch "
+        f"with {args.dataloader_workers} dataloader worker(s)."
     )
-    dataset["validation"] = dataset["validation"].map(
-        partial(
-            preprocess_function,
-            feature_extractor=feature_extractor,
-            max_duration=args.max_duration,
-            augmenter=None,
-        ),
-        **map_kwargs,
+    train_collator = DCLDEAudioCollator(
+        feature_extractor=feature_extractor,
+        max_duration=args.max_duration,
+        augmenter=augmenter,
+    )
+    eval_collator = DCLDEAudioCollator(
+        feature_extractor=feature_extractor,
+        max_duration=args.max_duration,
+        augmenter=None,
     )
 
     print(f"Loading multi-task AST model from {args.model_name}")
@@ -665,16 +744,20 @@ def main() -> int:
         greater_is_better=True,
         gradient_checkpointing=args.gradient_checkpointing,
         label_names=["kw_labels", "species_labels", "ecotype_labels"],
+        remove_unused_columns=False,
+        dataloader_num_workers=args.dataloader_workers,
         push_to_hub=args.push_to_hub,
         hub_strategy="all_checkpoints" if args.push_to_hub else "end",
         hub_model_id=args.hub_model_id if args.push_to_hub else None,
     )
 
-    trainer = Trainer(
+    trainer = LazyAudioTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"],
+        train_collator=train_collator,
+        eval_collator=eval_collator,
         compute_metrics=compute_metrics,
     )
 
