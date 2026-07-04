@@ -2,954 +2,674 @@
 # Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
 """
-Train a PODS-AI audio classification model for orca call detection.
+Fine-tune a shared AST backbone with DCLDE multi-task classification heads.
 
-This script fine-tunes a HuggingFace audio classification model on orca call
-audio. The default base model uses spectrogram features rather than raw-audio
-Wav2Vec2 embeddings. The trained model can be pushed to HuggingFace Hub or
-saved locally.
+Tasks:
+  - KW detection: KW vs not-KW
+  - Species: background, KW, HB, AB
+  - KW ecotype: NRKW, SRKW, OKW, SAR, TKW
 
+The species labels are read from ClassSpecies:
+  KW     -> killer whale
+  HB     -> humpback whale
+  AB     -> Pacific white-sided dolphin
+  UndBio -> background
+  BKG    -> background
+
+The ecotype loss is only computed for rows whose ClassSpecies is KW and whose
+Ecotype value is one of NRKW, SRKW, OKW, SAR, or TKW.
 """
 
+from __future__ import annotations
+
 import argparse
+import json
+import os
+import random
 from collections import Counter
 from functools import partial
-import os
 from pathlib import Path
-from typing import Protocol
-import matplotlib.pyplot as plt
-import pandas as pd
+from typing import Any, Optional
 
 import numpy as np
-import random
+import pandas as pd
 import torch
-import torchaudio
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from torch import nn
 
-from datasets import Dataset, Audio
-
-# Configure datasets to use soundfile for audio decoding BEFORE importing datasets components.
 import datasets.config
+
 datasets.config.AUDIO_BACKENDS_USE_TORCH = False
 datasets.config.AUDIOCODEC_DEFAULT_DECODER = "soundfile"
 
-from datasets import Dataset, Audio, DatasetDict, ClassLabel
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from transformers import (
+from datasets import Audio, Dataset, DatasetDict  # noqa: E402
+from transformers import (  # noqa: E402
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
     EvalPrediction,
     Trainer,
     TrainingArguments,
 )
-import evaluate
 
-# Verify audio decoding dependencies are available.
-try:
-    import librosa
-    import soundfile
-except ImportError as e:
-    print("Error: Missing required audio decoding libraries.")
-    print("Please install the required dependencies:")
-    print("  pip install -r requirements.txt")
-    print(f"\nSpecific error: {e}")
-    raise
 
-# Get repository root.
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-# ============================================================
-# LABEL DEFINITIONS
-# ============================================================
-
-# ------------------------------------------------------------
-# Species labels
-#
-# We merge:
-#     BKG
-#     UndBio
-#
-# into a single training class.
-# ------------------------------------------------------------
-
-SPECIES_MAP = {
-    "BKG": "BKG",
-    "UndBio": "BKG",
-    "AB": "AB",
-    "HW": "HW",
-    "KW": "KW",
-}
-
-SPECIES_TO_ID = {
-    "BKG": 0,
-    "AB": 1,
-    "HW": 2,
-    "KW": 3,
-}
-
-ID_TO_SPECIES = {
-    v: k for k, v in SPECIES_TO_ID.items()
-}
-
-NUM_SPECIES = len(SPECIES_TO_ID)
-
-# ------------------------------------------------------------
-# Killer whale ecotypes
-# ------------------------------------------------------------
-
-ECOTYPE_TO_ID = {
-    "SRKW": 0,
-    "NRKW": 1,
-    "TKW": 2,
-    "OKW": 3,
-    "SAR": 4,
-}
-
-ID_TO_ECOTYPE = {
-    v: k for k, v in ECOTYPE_TO_ID.items()
-}
-
-NUM_ECOTYPES = len(ECOTYPE_TO_ID)
-
-# PyTorch CrossEntropyLoss ignores this label automatically.
-
-IGNORE_ECOTYPE = -100
-
-
-
-
-class _SklearnMetricFallback:
-    """Fallback metric implementation used when evaluate metrics are unavailable."""
-
-    def __init__(self, metric_name: str):
-        self.metric_name = metric_name
-
-    def compute(
-        self,
-        predictions: list[int] | np.ndarray,
-        references: list[int] | np.ndarray,
-        average: str | None = None,
-        labels: list[int] | None = None,
-    ) -> dict:
-        predictions = np.asarray(predictions)
-        references = np.asarray(references)
-
-        if self.metric_name == "accuracy":
-            return {"accuracy": float(accuracy_score(references, predictions))}
-
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            references,
-            predictions,
-            average=average,
-            labels=labels,
-            zero_division=0,
-        )
-        metric_value = {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-        }[self.metric_name]
-        return {self.metric_name: metric_value}
-
-
-def _load_metric(metric_name: str):
-    """Load an evaluate metric with sklearn fallback if unavailable."""
-    try:
-        return evaluate.load(metric_name)
-    except FileNotFoundError:
-        print(
-            f"Warning: evaluate metric '{metric_name}' unavailable; using sklearn fallback.",
-        )
-        return _SklearnMetricFallback(metric_name)
-
-
-# Load metrics once at module scope.
-ACCURACY_METRIC = _load_metric("accuracy")
-PRECISION_METRIC = _load_metric("precision")
-RECALL_METRIC = _load_metric("recall")
-F1_METRIC = _load_metric("f1")
-
-# Whale classes for optimization in multi-class mode.
-WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
+SAMPLE_RATE = 16000
+DEFAULT_MAX_DURATION = 3.0
 CHECKPOINT_SAVE_LIMIT = 6
 DEFAULT_MAX_PREPROCESSING_WORKERS = 8
 
+KW_LABELS = {"not_kw": 0, "kw": 1}
+KW_ID2LABEL = {v: k for k, v in KW_LABELS.items()}
+SPECIES_LABELS = {"background": 0, "KW": 1, "HB": 2, "AB": 3}
+SPECIES_ID2LABEL = {v: k for k, v in SPECIES_LABELS.items()}
+ECOTYPE_LABELS = {"NRKW": 0, "SRKW": 1, "OKW": 2, "SAR": 3, "TKW": 4}
+ECOTYPE_ID2LABEL = {v: k for k, v in ECOTYPE_LABELS.items()}
+BACKGROUND_SPECIES = {"UndBio", "BKG"}
+KNOWN_SPECIES = set(SPECIES_LABELS) | BACKGROUND_SPECIES
+IGNORE_INDEX = -100
 
-class FeatureExtractorProtocol(Protocol):
-    """Protocol for audio feature extractors used during PODS-AI training."""
 
-    def __call__(self, processed_audio: list[np.ndarray], *, sampling_rate: int, padding: bool) -> dict:
-        """Convert audio arrays into model inputs.
+def resolve_path(path: str) -> Path:
+    """Resolve absolute paths as-is and repo-relative paths under REPO_ROOT."""
+    path_obj = Path(path)
+    if path_obj.is_absolute():
+        return path_obj
+    return REPO_ROOT / path_obj
 
-        Args:
-            processed_audio: Fixed-length audio clips for the current batch.
-            sampling_rate: Sampling rate of the provided clips.
-            padding: Whether the extractor should apply its batch padding logic.
 
-        Returns:
-            Dictionary of model-ready features such as input_values or attention_mask.
-        """
+def normalize_label(value: Any) -> str:
+    """Normalize CSV label values to stable strings."""
+    if pd.isna(value):
+        return ""
+    normalized = str(value).strip()
+    if normalized.lower() in {"", "nan", "none", "null", "na", "n/a"}:
+        return ""
+    return normalized
 
-def load_manifest(manifest_path):
-    """
-    Load a training manifest.
 
-    Returns
-    -------
-    HuggingFace Dataset
+def map_species_label(class_species: str) -> int:
+    """Map ClassSpecies to the species-head target."""
+    if class_species in BACKGROUND_SPECIES:
+        return SPECIES_LABELS["background"]
+    if class_species in SPECIES_LABELS:
+        return SPECIES_LABELS[class_species]
+    raise ValueError(f"Unknown ClassSpecies label: {class_species!r}")
 
-    Additional columns created:
 
-        SpeciesLabel
-        species_id
-        is_kw
-        is_hard_negative
-        ecotype_id
-    """
+def map_kw_label(class_species: str) -> int:
+    """Map ClassSpecies to the KW-vs-not-KW target."""
+    return KW_LABELS["kw"] if class_species == "KW" else KW_LABELS["not_kw"]
 
-    print(f"\nLoading {manifest_path}")
 
-    df = pd.read_csv(manifest_path)
+def map_ecotype_label(class_species: str, ecotype: str) -> int:
+    """Map Ecotype to target ID, or IGNORE_INDEX when not applicable."""
+    if class_species != "KW":
+        return IGNORE_INDEX
+    if not ecotype:
+        return IGNORE_INDEX
+    if ecotype not in ECOTYPE_LABELS:
+        raise ValueError(f"Unknown KW Ecotype label: {ecotype!r}")
+    return ECOTYPE_LABELS[ecotype]
 
-    print(f"Rows: {len(df):,}")
 
-    # --------------------------------------------------------
-    # Normalize species labels
-    # --------------------------------------------------------
+def load_manifest(manifest_path: str, drop_unknown_labels: bool = False) -> Dataset:
+    """Load a DCLDE manifest into a Hugging Face Dataset."""
+    path = resolve_path(manifest_path)
+    df = pd.read_csv(path, low_memory=False)
 
-    df["SpeciesLabel"] = df["ClassSpecies"].map(
-        SPECIES_MAP
+    required_columns = {"clip_path", "ClassSpecies", "Ecotype"}
+    missing = required_columns - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    df["ClassSpecies"] = df["ClassSpecies"].map(normalize_label)
+    df["Ecotype"] = df["Ecotype"].map(normalize_label)
+
+    known_species_mask = df["ClassSpecies"].isin(KNOWN_SPECIES)
+    if not known_species_mask.all():
+        unknown_counts = df.loc[~known_species_mask, "ClassSpecies"].value_counts(dropna=False)
+        if not drop_unknown_labels:
+            raise ValueError(
+                "Unknown ClassSpecies values found. Pass --drop-unknown-labels to skip them: "
+                f"{unknown_counts.to_dict()}"
+            )
+        print(f"Dropping unknown ClassSpecies rows: {unknown_counts.to_dict()}")
+        df = df.loc[known_species_mask].copy()
+
+    known_ecotype_mask = (
+        (df["ClassSpecies"] != "KW")
+        | (df["Ecotype"] == "")
+        | df["Ecotype"].isin(ECOTYPE_LABELS)
     )
+    if not known_ecotype_mask.all():
+        unknown_counts = df.loc[~known_ecotype_mask, "Ecotype"].value_counts(dropna=False)
+        if not drop_unknown_labels:
+            raise ValueError(
+                "Unknown KW Ecotype values found. Pass --drop-unknown-labels to skip them: "
+                f"{unknown_counts.to_dict()}"
+            )
+        print(f"Dropping unknown KW Ecotype rows: {unknown_counts.to_dict()}")
+        df = df.loc[known_ecotype_mask].copy()
 
-    unknown = df["SpeciesLabel"].isna()
+    df["kw_labels"] = df["ClassSpecies"].map(map_kw_label)
+    df["species_labels"] = df["ClassSpecies"].map(map_species_label)
+    df["ecotype_labels"] = [
+        map_ecotype_label(class_species, ecotype)
+        for class_species, ecotype in zip(df["ClassSpecies"], df["Ecotype"])
+    ]
 
-    if unknown.any():
-
-        raise ValueError(
-            "Unknown ClassSpecies values:\n"
-            f"{df.loc[unknown, 'ClassSpecies'].unique()}"
-        )
-
-    df["species_id"] = (
-        df["SpeciesLabel"]
-        .map(SPECIES_TO_ID)
-        .astype(int)
+    dataset = Dataset.from_dict(
+        {
+            "audio": df["clip_path"].tolist(),
+            "kw_labels": df["kw_labels"].astype(int).tolist(),
+            "species_labels": df["species_labels"].astype(int).tolist(),
+            "ecotype_labels": df["ecotype_labels"].astype(int).tolist(),
+        }
     )
-
-    # --------------------------------------------------------
-    # Killer whale flags
-    # --------------------------------------------------------
-
-    df["is_kw"] = (
-        df["ClassSpecies"] == "KW"
-    )
-
-    df["is_hard_negative"] = (
-        df["ClassSpecies"] == "UndBio"
-    )
-
-    # --------------------------------------------------------
-    # Ecotype labels
-    # --------------------------------------------------------
-
-    df["ecotype_id"] = IGNORE_ECOTYPE
-
-    kw_mask = df["is_kw"]
-
-    df.loc[
-        kw_mask,
-        "ecotype_id"
-    ] = (
-        df.loc[
-            kw_mask,
-            "Ecotype"
-        ]
-        .map(ECOTYPE_TO_ID)
-    )
-
-    unknown = (
-        kw_mask &
-        df["ecotype_id"].isna()
-    )
-
-    if unknown.any():
-
-        raise ValueError(
-            "Unknown killer whale ecotypes:\n"
-            f"{df.loc[unknown, 'Ecotype'].unique()}"
-        )
-
-    df["ecotype_id"] = (
-        df["ecotype_id"]
-        .fillna(IGNORE_ECOTYPE)
-        .astype(int)
-    )
-
-    # --------------------------------------------------------
-    # Print summary
-    # --------------------------------------------------------
-
-    print("\nSpecies distribution")
-
-    print(
-        df["SpeciesLabel"]
-        .value_counts()
-        .sort_index()
-    )
-
-    print("\nEcotype distribution")
-
-    print(
-        df.loc[
-            df["is_kw"],
-            "Ecotype"
-        ]
-        .value_counts()
-        .sort_index()
-    )
-
-    # --------------------------------------------------------
-    # Convert to HuggingFace Dataset
-    # --------------------------------------------------------
-
-    dataset = Dataset.from_pandas(
-        df,
-        preserve_index=False
-    )
-
-    dataset = dataset.cast_column(
-        "clip_path",
-        Audio(
-            sampling_rate=TARGET_SR
-        )
-    )
-
-    return dataset
+    return dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
 
 
-def preprocess_function(examples: dict, feature_extractor: FeatureExtractorProtocol, max_duration: float = 3.0, augmenter = None) -> dict:
-    """
-    Preprocess audio files for the model.
+class WaveformAugmenter:
+    """Simple waveform augmentations applied during preprocessing."""
 
-    Args:
-        examples: Batch of examples with audio data
-        feature_extractor: HuggingFace audio feature extractor instance
-        max_duration: Maximum audio duration in seconds
+    def __init__(
+        self,
+        sample_rate: int,
+        random_gain: bool = False,
+        gain_db: float = 6.0,
+        time_shift: bool = False,
+        max_shift_ms: float = 250.0,
+        gaussian_noise: bool = False,
+        noise_std: float = 0.002,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.random_gain = random_gain
+        self.gain_db = gain_db
+        self.time_shift = time_shift
+        self.max_shift = int(sample_rate * max_shift_ms / 1000)
+        self.gaussian_noise = gaussian_noise
+        self.noise_std = noise_std
 
-    Returns:
-        Processed inputs for the model (as NumPy arrays for serialization)
-    """
-    audio_arrays = [x["array"] for x in examples["audio"]]
+    def __call__(self, audio: np.ndarray) -> np.ndarray:
+        audio = audio.astype(np.float32, copy=True)
+        if self.random_gain:
+            gain = random.uniform(-self.gain_db, self.gain_db)
+            audio *= 10 ** (gain / 20)
+        if self.time_shift and self.max_shift > 0:
+            audio = np.roll(audio, random.randint(-self.max_shift, self.max_shift))
+        if self.gaussian_noise:
+            audio = audio + np.random.normal(0, self.noise_std, size=audio.shape)
+        return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
-    # Pad or truncate to max_duration so every training example has the same clip length.
-    target_length = int(max_duration * 16000)  # 16kHz sample rate.
+
+def preprocess_function(
+    examples: dict[str, Any],
+    feature_extractor: Any,
+    max_duration: float,
+    augmenter: Optional[WaveformAugmenter] = None,
+) -> dict[str, Any]:
+    """Pad/truncate audio, optionally augment it, and run the AST feature extractor."""
+    target_length = int(max_duration * SAMPLE_RATE)
     processed_audio = []
-    for audio in audio_arrays:
+    for item in examples["audio"]:
+        audio = item["array"]
         if len(audio) > target_length:
             audio = audio[:target_length]
         elif len(audio) < target_length:
-            padding = target_length - len(audio)
-            audio = np.pad(audio, (0, padding), mode='constant')
+            audio = np.pad(audio, (0, target_length - len(audio)), mode="constant")
         if augmenter is not None:
             audio = augmenter(audio)
         processed_audio.append(audio)
 
-    # The audio is already padded/truncated above, so we only need the extractor's
-    # feature conversion here.
-    inputs = feature_extractor(
-        processed_audio,
-        sampling_rate=16000,
-        padding=True,
-    )
-
-    # Ensure input_values is a NumPy array (feature_extractor returns this by default).
-    # Convert to list of arrays for proper serialization in datasets library.
-    inputs["labels"] = examples["label"]
-
+    inputs = feature_extractor(processed_audio, sampling_rate=SAMPLE_RATE, padding=True)
+    inputs["kw_labels"] = examples["kw_labels"]
+    inputs["species_labels"] = examples["species_labels"]
+    inputs["ecotype_labels"] = examples["ecotype_labels"]
     return inputs
 
 
-def get_preprocessing_workers(dataset: DatasetDict, requested_workers: int) -> int:
-    """Determine a safe number of dataset preprocessing workers.
-
-    Args:
-        dataset: Dataset splits that will be preprocessed.
-        requested_workers: User-requested worker count.
-
-    Returns:
-        Effective worker count capped by the smallest dataset split.
-    """
-    if requested_workers < 1:
-        raise ValueError(f"preprocessing_workers must be at least 1, got {requested_workers}")
-
-    split_sizes = [len(split_dataset) for split_dataset in dataset.values()]
-    if not split_sizes:
-        return 1
-
-    return max(1, min(requested_workers, min(split_sizes)))
-
-
-def compute_metrics(eval_pred: EvalPrediction) -> dict:
-    """
-    Compute evaluation metrics with per-class breakdown.
-
-    Args:
-        eval_pred: Predictions and labels
-
-    Returns:
-        Dictionary of metrics
-    """
-    predictions = np.argmax(eval_pred.predictions, axis=1)
-    labels = eval_pred.label_ids
-
-    # Overall metrics.
-    accuracy = ACCURACY_METRIC.compute(predictions=predictions, references=labels)
-    precision = PRECISION_METRIC.compute(predictions=predictions, references=labels, average="weighted")
-    recall = RECALL_METRIC.compute(predictions=predictions, references=labels, average="weighted")
-    f1 = F1_METRIC.compute(predictions=predictions, references=labels, average="weighted")
-
-    # Per-class metrics with explicit labels to ensure alignment with ID2LABEL ordering.
-    all_labels = list(ID2LABEL.keys())
-    precision_per_class = PRECISION_METRIC.compute(predictions=predictions, references=labels, average=None, labels=all_labels)
-    recall_per_class = RECALL_METRIC.compute(predictions=predictions, references=labels, average=None, labels=all_labels)
-    f1_per_class = F1_METRIC.compute(predictions=predictions, references=labels, average=None, labels=all_labels)
-
-    # Confusion matrix analysis.
-    print("\n" + "="*60)
-    print("DETAILED EVALUATION METRICS")
-    print("="*60)
-    print("Dataset: user-supplied validation manifest.")
-
-    # Class distribution in predictions vs ground truth.
-    print("\nClass Distribution:")
-    for class_id, class_name in ID2LABEL.items():
-        true_count = np.sum(labels == class_id)
-        pred_count = np.sum(predictions == class_id)
-        print(f"  {class_name:12s} - True: {true_count:3d}, Predicted: {pred_count:3d}")
-
-    # Per-class performance.
-    print("\nPer-Class Performance:")
-    print(f"{'Class':<12} {'Precision':<12} {'Recall':<12} {'F1':<12}")
-    print("-" * 48)
-    for class_id, class_name in ID2LABEL.items():
-        prec = precision_per_class['precision'][class_id] if len(precision_per_class['precision']) > class_id else 0
-        rec = recall_per_class['recall'][class_id] if len(recall_per_class['recall']) > class_id else 0
-        f1_score = f1_per_class['f1'][class_id] if len(f1_per_class['f1']) > class_id else 0
-        print(f"{class_name:<12} {prec:<12.3f} {rec:<12.3f} {f1_score:<12.3f}")
-
-    # Confusion matrix.
-    print("\nConfusion Matrix (rows=true, cols=predicted):")
-    print(f"{'':>12}", end="")
-    for class_name in ID2LABEL.values():
-        print(f"{class_name[:8]:>10}", end="")
-    print()
-
-    for true_class_id, true_class_name in ID2LABEL.items():
-        print(f"{true_class_name:>12}", end="")
-        for pred_class_id in range(len(ID2LABEL)):
-            count = np.sum((labels == true_class_id) & (predictions == pred_class_id))
-            print(f"{count:>10}", end="")
-        print()
-
-    print("="*60 + "\n")
-
-    # Optimize model selection for whale classes by using macro F1 over
-    # humpback, resident, and transient when those labels are present.
-    whale_class_ids = sorted(class_id for class_id, class_name in ID2LABEL.items() if class_name in WHALE_CLASS_NAMES)
-    if whale_class_ids:
-        f1_whale = F1_METRIC.compute(
-            predictions=predictions,
-            references=labels,
-            average="macro",
-            labels=whale_class_ids,
-        )
-        f1_for_training = f1_whale["f1"]
-    else:
-        f1_for_training = f1["f1"]
-
-    # Return metrics for training logs.
-    metrics = {
-        "accuracy": accuracy["accuracy"],
-        "precision": precision["precision"],
-        "recall": recall["recall"],
-        "f1": f1_for_training,
-    }
-
-    # Add per-class F1 to tracking.
-    for class_id, class_name in ID2LABEL.items():
-        if len(f1_per_class['f1']) > class_id:
-            metrics[f"f1_{class_name}"] = f1_per_class['f1'][class_id]
-
-    return metrics
-
-
-def analyze_dataset(dataset: DatasetDict) -> None:
-    """
-    Analyze dataset statistics and distribution.
-
-    Args:
-        dataset: DatasetDict with train and validation splits
-    """
-    print("\n" + "="*60)
-    print("DATASET ANALYSIS")
-    print("="*60)
-
-    for split_name in ["train", "validation"]:
-        split_data = dataset[split_name]
-        labels = split_data["label"]
-
-        print(f"\n{split_name.upper()} Split ({len(labels)} samples):")
-
-        # Count per class.
-        label_counts = Counter(labels)
-        for class_id in sorted(label_counts.keys()):
-            class_name = ID2LABEL[class_id]
-            count = label_counts[class_id]
-            percentage = 100 * count / len(labels)
-            print(f"  {class_name:12s}: {count:4d} samples ({percentage:5.1f}%)")
-
-        # Check for severe imbalance.
-        if len(label_counts) > 0:
-            max_count = max(label_counts.values())
-            min_count = min(label_counts.values())
-            imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
-            print(f"  Imbalance ratio: {imbalance_ratio:.1f}:1")
-            if imbalance_ratio > 10:
-                print("  WARNING: Severe class imbalance detected!")
-
-    print("="*60 + "\n")
-
-def save_loss_plot(trainer, output_dir):
-    """
-    Save training and validation loss curves from Trainer logs.
-    """
-
-    train_steps = []
-    train_losses = []
-
-    eval_steps = []
-    eval_losses = []
-
-    for entry in trainer.state.log_history:
-
-        if "loss" in entry and "eval_loss" not in entry:
-            train_steps.append(entry["step"])
-            train_losses.append(entry["loss"])
-
-        if "eval_loss" in entry:
-            eval_steps.append(entry["step"])
-            eval_losses.append(entry["eval_loss"])
-
-    if not train_losses:
-        print("No training loss data found.")
-        return
-
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(
-        train_steps,
-        train_losses,
-        label="Training Loss",
-    )
-
-    if eval_losses:
-        plt.plot(
-            eval_steps,
-            eval_losses,
-            label="Validation Loss",
-        )
-
-    plt.xlabel("Training Step")
-    plt.ylabel("Loss")
-    plt.title("Training and Validation Loss")
-    plt.legend()
-    plt.grid(True)
-
-    output_path = Path(output_dir) / "loss_curve.png"
-
-    plt.savefig(output_path, bbox_inches="tight")
-    plt.close()
-
-    print(f"Saved loss plot to {output_path}")
-
-class SpecAugment:
-    def __init__(self,
-                 time_mask_width=30,
-                 freq_mask_width=12):
-        self.time_mask = torchaudio.transforms.TimeMasking(
-            time_mask_param=time_mask_width
-        )
-
-        self.freq_mask = torchaudio.transforms.FrequencyMasking(
-            freq_mask_param=freq_mask_width
-        )
-
-    def __call__(self, features):
-        x = torch.tensor(features)
-
-        x = self.time_mask(x)
-        x = self.freq_mask(x)
-
-        return x.numpy()
-
-class WaveformAugmenter:
+class MultiTaskASTForDCLDE(nn.Module):
+    """AST backbone with KW, species, and ecotype classifier heads."""
 
     def __init__(
         self,
-        sample_rate,
-        random_gain=False,
-        gain_db=6.0,
-        time_shift=False,
-        max_shift_ms=250,
-        gaussian_noise=False,
-        noise_std=0.002,
-    ):
+        model_name: str,
+        dropout: float = 0.1,
+        kw_loss_weight: float = 1.0,
+        species_loss_weight: float = 1.0,
+        ecotype_loss_weight: float = 1.0,
+        freeze_backbone: bool = False,
+    ) -> None:
+        super().__init__()
+        base_model = AutoModelForAudioClassification.from_pretrained(model_name)
+        self.config = base_model.config
+        self.ast = base_model.audio_spectrogram_transformer
+        hidden_size = int(getattr(self.config, "hidden_size"))
+        self.dropout = nn.Dropout(dropout)
+        self.kw_classifier = nn.Linear(hidden_size, len(KW_LABELS))
+        self.species_classifier = nn.Linear(hidden_size, len(SPECIES_LABELS))
+        self.ecotype_classifier = nn.Linear(hidden_size, len(ECOTYPE_LABELS))
+        self.kw_loss_weight = kw_loss_weight
+        self.species_loss_weight = species_loss_weight
+        self.ecotype_loss_weight = ecotype_loss_weight
 
-        self.sample_rate = sample_rate
-
-        self.random_gain = random_gain
-        self.gain_db = gain_db
-
-        self.time_shift = time_shift
-        self.max_shift = int(
-            sample_rate * max_shift_ms / 1000
-        )
-
-        self.gaussian_noise = gaussian_noise
-        self.noise_std = noise_std
-
-    def __call__(self, audio):
-
-        #
-        # Random gain
-        #
-        if self.random_gain:
-
-            gain = random.uniform(
-                -self.gain_db,
-                self.gain_db,
-            )
-
-            audio *= 10 ** (gain / 20)
-
-        #
-        # Time shift
-        #
-        if self.time_shift:
-
-            shift = random.randint(
-                -self.max_shift,
-                self.max_shift,
-            )
-
-            audio = np.roll(audio, shift)
-
-        #
-        # Gaussian noise
-        #
-        if self.gaussian_noise:
-
-            noise = np.random.normal(
-                0,
-                self.noise_std,
-                size=audio.shape,
-            )
-
-            audio = audio + noise
-
-        #
-        # Prevent clipping
-        #
-        audio = np.clip(audio, -1.0, 1.0)
-
-        return audio.astype(np.float32)
-
-
-def main() -> None:
-    """Main training function."""
-    parser = argparse.ArgumentParser(
-        description="Train PODS-AI audio classification model for orca calls"
-    )
-    parser.add_argument(
-        "--train_manifest",
-        type=str,
-        required=True,
-        help="Training manifest CSV",
-    )
-    parser.add_argument(
-        "--val_manifest",
-        type=str,
-        required=True,
-        help="Validation manifest CSV",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="model/podsai",
-        help="Directory to save the trained model (default: model/podsai)",
-    )
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="davethaler/whale-call-detector",
-        help=(
-            "Base model to fine-tune "
-            "(default: davethaler/whale-call-detector)"
-        ),
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=10,
-        help="Number of training epochs (default: 10)",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=8,
-        help="Training batch size (default: 8)",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=3e-5,
-        help="Learning rate (default: 3e-5)",
-    )
-    parser.add_argument(
-        "--preprocessing_workers",
-        type=int,
-        default=max(1, min(DEFAULT_MAX_PREPROCESSING_WORKERS, os.cpu_count() or 1)),
-        help="Number of parallel workers for AST feature preprocessing (default: min of 8 or available CPU cores)",
-    )
-    parser.add_argument(
-        "--push_to_hub",
-        action="store_true",
-        help="Push trained model to HuggingFace Hub",
-    )
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default="orca-call-detector",
-        help="HuggingFace Hub model ID (default: orca-call-detector)",
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        help="Path to a specific checkpoint to resume training from",
-    )
-    parser.add_argument(
-        "--freeze_backbone",
-        action="store_true",
-        help="Freeze AST backbone and train classifier head only",
-    )
-    parser.add_argument(
-        "--specaugment",
-        action="store_true",
-        help="Enable SpecAugment during training",
-    )
-    parser.add_argument(
-        "--time_mask_width",
-        type=int,
-        default=30,
-    )
-    parser.add_argument(
-        "--freq_mask_width",
-        type=int,
-        default=12,
-    )
-    parser.add_argument(
-        "--random_gain",
-        action="store_true",
-        help="Apply random gain augmentation",
-    )
-
-    parser.add_argument(
-        "--gain_db",
-        type=float,
-        default=6.0,
-        help="Maximum gain in dB (+/-)",
-    )
-    parser.add_argument(
-        "--time_shift",
-        action="store_true",
-        help="Apply random time shift",
-    )
-    parser.add_argument(
-        "--max_shift_ms",
-        type=float,
-        default=250.0,
-        help="Maximum time shift in milliseconds",
-    )
-    parser.add_argument(
-        "--gaussian_noise",
-        action="store_true",
-        help="Add Gaussian noise",
-    )
-    parser.add_argument(
-        "--noise_std",
-        type=float,
-        default=0.002,
-    )
-    parser.add_argument(
-        "--sample_rate",
-        type=int,
-        default=16000,
-        help="Audio sample rate in Hz",
-    )
-
-    args = parser.parse_args()
-
-    # Create augmenter
-    augmenter = None
-
-    if (
-        args.random_gain
-        or args.time_shift
-        or args.gaussian_noise
-    ):
-        augmenter = WaveformAugmenter(
-        sample_rate=args.sample_rate,
-        random_gain=args.random_gain,
-        gain_db=args.gain_db,
-        time_shift=args.time_shift,
-        max_shift_ms=args.max_shift_ms,
-        gaussian_noise=args.gaussian_noise,
-        noise_std=args.noise_std,
-    )
-
-
-    # Set up paths.
-    # data_dir = REPO_ROOT / args.data_dir
-    output_dir = REPO_ROOT / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-
-    print(f"Loading manifests...")
-    
-    train_dataset = load_manifest(
-        args.train_manifest
-    )
-
-    train_df = pd.read_csv(args.train_manifest)
-    print("\nTraining manifest:")
-    print(train_df["Category"].value_counts())
-    
-    val_dataset = load_manifest(
-        args.val_manifest
-    )
-
-    val_df = pd.read_csv(args.val_manifest)
-    print("\nValidation manifest:")
-    print(val_df["Category"].value_counts())
-
-    dataset = DatasetDict(
-        {
-            "train": train_dataset,
-            "validation": val_dataset,
-        }
-    )
-
-    # Load feature extractor and model.
-    print(f"Loading feature extractor and model: {args.model_name}")
-
-    try:
-        feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_name)
-    except Exception as e:
-        error_msg = f"Error loading feature extractor from {args.model_name}: {type(e).__name__}: {e}"
-        print(error_msg)
-        print("Please ensure the model name is correct and you have internet connectivity.")
-        raise RuntimeError(error_msg) from e
-
-    try:
-        model = AutoModelForAudioClassification.from_pretrained(
-            args.model_name,
-            num_labels=len(LABEL2ID),
-            label2id=LABEL2ID,
-            id2label=ID2LABEL,
-            ignore_mismatched_sizes=True,
-        )
-        if args.freeze_backbone:
-
-            print("Freezing backbone and training classifier head only...")
-
-            for param in model.parameters():
+        if freeze_backbone:
+            print("Freezing AST backbone and training classification heads only.")
+            for param in self.ast.parameters():
                 param.requires_grad = False
 
-            for param in model.classifier.parameters():
-                param.requires_grad = True
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: Optional[dict] = None) -> None:
+        """Allow Trainer gradient checkpointing to reach the AST backbone when available."""
+        if hasattr(self.ast, "gradient_checkpointing_enable"):
+            self.ast.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
-            trainable = sum(
-                p.numel()
-                for p in model.parameters()
-                if p.requires_grad
+    def gradient_checkpointing_disable(self) -> None:
+        """Disable gradient checkpointing on the AST backbone when available."""
+        if hasattr(self.ast, "gradient_checkpointing_disable"):
+            self.ast.gradient_checkpointing_disable()
+
+    def _pool_ast_output(self, sequence_output: torch.Tensor) -> torch.Tensor:
+        """Use AST's CLS/distillation-token pooled embedding."""
+        if sequence_output.shape[1] >= 2:
+            return (sequence_output[:, 0] + sequence_output[:, 1]) / 2.0
+        return sequence_output[:, 0]
+
+    def forward(
+        self,
+        input_values: torch.Tensor,
+        kw_labels: Optional[torch.Tensor] = None,
+        species_labels: Optional[torch.Tensor] = None,
+        ecotype_labels: Optional[torch.Tensor] = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        outputs = self.ast(input_values=input_values, return_dict=True)
+        pooled = self.dropout(self._pool_ast_output(outputs.last_hidden_state))
+
+        kw_logits = self.kw_classifier(pooled)
+        species_logits = self.species_classifier(pooled)
+        ecotype_logits = self.ecotype_classifier(pooled)
+
+        loss = None
+        losses = []
+        if kw_labels is not None:
+            losses.append(
+                self.kw_loss_weight
+                * nn.functional.cross_entropy(kw_logits, kw_labels.long())
             )
-
-            total = sum(
-                p.numel()
-                for p in model.parameters()
+        if species_labels is not None:
+            losses.append(
+                self.species_loss_weight
+                * nn.functional.cross_entropy(species_logits, species_labels.long())
             )
+        if ecotype_labels is not None:
+            ecotype_mask = ecotype_labels != IGNORE_INDEX
+            if torch.any(ecotype_mask):
+                losses.append(
+                    self.ecotype_loss_weight
+                    * nn.functional.cross_entropy(
+                        ecotype_logits[ecotype_mask],
+                        ecotype_labels[ecotype_mask].long(),
+                    )
+                )
+        if losses:
+            loss = torch.stack(losses).sum()
 
-            print(
-                f"Trainable parameters: "
-                f"{trainable:,} / {total:,}"
+        return {
+            "loss": loss,
+            "logits": (kw_logits, species_logits, ecotype_logits),
+        }
+
+
+def _f1(labels: np.ndarray, predictions: np.ndarray, **kwargs: Any) -> float:
+    """Return an F1 score with sklearn's zero-division behavior fixed."""
+    return float(
+        precision_recall_fscore_support(
+            labels,
+            predictions,
+            zero_division=0,
+            **kwargs,
+        )[2]
+    )
+
+
+def _class_f1(labels: np.ndarray, predictions: np.ndarray, class_id: int) -> float:
+    """Return one-vs-rest F1 for a single class in a multiclass target."""
+    scores = precision_recall_fscore_support(
+        labels,
+        predictions,
+        labels=[class_id],
+        average=None,
+        zero_division=0,
+    )[2]
+    return float(scores[0]) if len(scores) else 0.0
+
+
+def _unpack_three(value: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Handle Trainer outputs as either (a, b, c) or ((a, b, c),)."""
+    if isinstance(value, tuple) and len(value) == 1 and isinstance(value[0], (tuple, list)):
+        value = value[0]
+    if not isinstance(value, (tuple, list)) or len(value) < 3:
+        raise ValueError(f"Expected three prediction/label arrays, got {type(value).__name__}")
+    return value[0], value[1], value[2]
+
+
+def compute_metrics(eval_pred: EvalPrediction) -> dict[str, float]:
+    """Compute metrics for all heads and a combined model-selection score."""
+    kw_logits, species_logits, ecotype_logits = _unpack_three(eval_pred.predictions)
+    kw_labels, species_labels, ecotype_labels = _unpack_three(eval_pred.label_ids)
+
+    kw_predictions = np.argmax(kw_logits, axis=1)
+    species_predictions = np.argmax(species_logits, axis=1)
+    ecotype_predictions = np.argmax(ecotype_logits, axis=1)
+
+    metrics: dict[str, float] = {
+        "kw_accuracy": float(accuracy_score(kw_labels, kw_predictions)),
+        "kw_f1": _f1(kw_labels, kw_predictions, average="binary", pos_label=KW_LABELS["kw"]),
+        "species_accuracy": float(accuracy_score(species_labels, species_predictions)),
+        "species_macro_f1": _f1(species_labels, species_predictions, average="macro"),
+    }
+
+    for class_id, class_name in SPECIES_ID2LABEL.items():
+        metrics[f"species_f1_{class_name}"] = _class_f1(
+            species_labels,
+            species_predictions,
+            class_id,
+        )
+
+    ecotype_mask = ecotype_labels != IGNORE_INDEX
+    if np.any(ecotype_mask):
+        ecotype_true = ecotype_labels[ecotype_mask]
+        ecotype_pred = ecotype_predictions[ecotype_mask]
+        metrics["ecotype_accuracy"] = float(accuracy_score(ecotype_true, ecotype_pred))
+        metrics["ecotype_macro_f1"] = _f1(ecotype_true, ecotype_pred, average="macro")
+        for class_id, class_name in ECOTYPE_ID2LABEL.items():
+            metrics[f"ecotype_f1_{class_name}"] = _class_f1(
+                ecotype_true,
+                ecotype_pred,
+                class_id,
             )
-    except Exception as e:
-        error_msg = f"Error loading model from {args.model_name}: {type(e).__name__}: {e}"
-        print(error_msg)
-        print("Please ensure the model name is correct and you have internet connectivity.")
-        raise RuntimeError(error_msg) from e
+        srkw_tkw_labels = [ECOTYPE_LABELS["SRKW"], ECOTYPE_LABELS["TKW"]]
+        metrics["ecotype_srkw_tkw_f1"] = _f1(
+            ecotype_true,
+            ecotype_pred,
+            average="macro",
+            labels=srkw_tkw_labels,
+        )
+    else:
+        metrics["ecotype_accuracy"] = 0.0
+        metrics["ecotype_macro_f1"] = 0.0
+        metrics["ecotype_srkw_tkw_f1"] = 0.0
 
-    # Preprocess dataset.
+    metrics["combined_score"] = (
+        0.4 * metrics["kw_f1"]
+        + 0.3 * metrics["species_macro_f1"]
+        + 0.3 * metrics["ecotype_srkw_tkw_f1"]
+    )
+    return metrics
+
+
+def get_preprocessing_workers(dataset: DatasetDict, requested_workers: int) -> int:
+    """Choose a safe number of dataset map workers."""
+    if requested_workers < 1:
+        raise ValueError(f"preprocessing_workers must be at least 1, got {requested_workers}")
+    split_sizes = [len(split_dataset) for split_dataset in dataset.values()]
+    return max(1, min(requested_workers, min(split_sizes)))
+
+
+def analyze_dataset(dataset: DatasetDict) -> None:
+    """Print target distributions for each split."""
+    print("\n" + "=" * 72)
+    print("DATASET ANALYSIS")
+    print("=" * 72)
+    for split_name, split_dataset in dataset.items():
+        print(f"\n{split_name.upper()} split: {len(split_dataset)} samples")
+        for label_column, id2label in (
+            ("kw_labels", KW_ID2LABEL),
+            ("species_labels", SPECIES_ID2LABEL),
+            ("ecotype_labels", ECOTYPE_ID2LABEL),
+        ):
+            labels = [label for label in split_dataset[label_column] if label != IGNORE_INDEX]
+            counts = Counter(labels)
+            print(f"  {label_column}:")
+            if not labels:
+                print("    no labeled rows")
+                continue
+            for label_id in sorted(counts):
+                print(f"    {id2label[label_id]:12s}: {counts[label_id]:7d}")
+    print("=" * 72 + "\n")
+
+
+def save_training_curves(trainer: Trainer, output_dir: Path) -> None:
+    """Save training and validation curves from Trainer logs."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not installed; skipping training curve plots.")
+        return
+
+    train_steps: list[int] = []
+    train_losses: list[float] = []
+    eval_steps: list[int] = []
+    eval_losses: list[float] = []
+    combined_steps: list[int] = []
+    combined_scores: list[float] = []
+
+    for entry in trainer.state.log_history:
+        if "loss" in entry and "eval_loss" not in entry:
+            train_steps.append(int(entry["step"]))
+            train_losses.append(float(entry["loss"]))
+        if "eval_loss" in entry:
+            eval_steps.append(int(entry["step"]))
+            eval_losses.append(float(entry["eval_loss"]))
+        if "eval_combined_score" in entry:
+            combined_steps.append(int(entry["step"]))
+            combined_scores.append(float(entry["eval_combined_score"]))
+
+    if train_losses or eval_losses:
+        plt.figure(figsize=(10, 6))
+        if train_losses:
+            plt.plot(train_steps, train_losses, label="Training loss")
+        if eval_losses:
+            plt.plot(eval_steps, eval_losses, label="Validation loss")
+        plt.xlabel("Training step")
+        plt.ylabel("Loss")
+        plt.title("Training and Validation Loss")
+        plt.legend()
+        plt.grid(True)
+        loss_path = output_dir / "loss_curve.png"
+        plt.savefig(loss_path, bbox_inches="tight")
+        plt.close()
+        print(f"Saved loss curve to {loss_path}")
+
+    if combined_scores:
+        plt.figure(figsize=(10, 6))
+        plt.plot(combined_steps, combined_scores, label="Combined validation score")
+        plt.xlabel("Training step")
+        plt.ylabel("Score")
+        plt.title("Validation Score")
+        plt.legend()
+        plt.grid(True)
+        score_path = output_dir / "validation_score_curve.png"
+        plt.savefig(score_path, bbox_inches="tight")
+        plt.close()
+        print(f"Saved validation score curve to {score_path}")
+
+
+def save_metadata(output_dir: Path, args: argparse.Namespace) -> None:
+    """Write label maps and training configuration next to model artifacts."""
+    metadata = {
+        "model_type": "podsai_dclde_multitask_ast",
+        "base_model": args.model_name,
+        "kw_label2id": KW_LABELS,
+        "kw_id2label": KW_ID2LABEL,
+        "species_label2id": SPECIES_LABELS,
+        "species_id2label": SPECIES_ID2LABEL,
+        "ecotype_label2id": ECOTYPE_LABELS,
+        "ecotype_id2label": ECOTYPE_ID2LABEL,
+        "ignore_index": IGNORE_INDEX,
+        "loss_weights": {
+            "kw": args.kw_loss_weight,
+            "species": args.species_loss_weight,
+            "ecotype": args.ecotype_loss_weight,
+        },
+    }
+    with (output_dir / "multitask_config.json").open("w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=2, sort_keys=True)
+
+
+def main() -> int:
+    """Train the DCLDE multi-task AST model."""
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a shared AST model for DCLDE KW/species/ecotype tasks."
+    )
+    parser.add_argument("--train-manifest", required=True, help="Training manifest CSV.")
+    parser.add_argument("--val-manifest", required=True, help="Validation manifest CSV.")
+    parser.add_argument(
+        "--output-dir",
+        default="model/dclde_multitask",
+        help="Directory to save checkpoints and final artifacts.",
+    )
+    parser.add_argument(
+        "--model-name",
+        default="davethaler/whale-call-detector",
+        help="Existing AST model or Hugging Face model ID to fine-tune.",
+    )
+    parser.add_argument("--epochs", type=float, default=3.0, help="Number of training epochs.")
+    parser.add_argument("--batch-size", type=int, default=8, help="Per-device batch size.")
+    parser.add_argument("--learning-rate", type=float, default=3e-5, help="Learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay.")
+    parser.add_argument("--warmup-ratio", type=float, default=0.1, help="Warmup ratio.")
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=20000,
+        help="Validate every N optimizer steps (default: 20000).",
+    )
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=None,
+        help="Save checkpoints every N optimizer steps (default: same as --eval-steps).",
+    )
+    parser.add_argument("--logging-steps", type=int, default=100, help="Log every N steps.")
+    parser.add_argument("--save-total-limit", type=int, default=CHECKPOINT_SAVE_LIMIT)
+    parser.add_argument("--max-duration", type=float, default=DEFAULT_MAX_DURATION)
+    parser.add_argument(
+        "--preprocessing-workers",
+        type=int,
+        default=max(1, min(DEFAULT_MAX_PREPROCESSING_WORKERS, os.cpu_count() or 1)),
+    )
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--kw-loss-weight", type=float, default=1.0)
+    parser.add_argument("--species-loss-weight", type=float, default=1.0)
+    parser.add_argument("--ecotype-loss-weight", type=float, default=1.0)
+    parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--drop-unknown-labels", action="store_true")
+    parser.add_argument("--random-gain", action="store_true")
+    parser.add_argument("--gain-db", type=float, default=6.0)
+    parser.add_argument("--time-shift", action="store_true")
+    parser.add_argument("--max-shift-ms", type=float, default=250.0)
+    parser.add_argument("--gaussian-noise", action="store_true")
+    parser.add_argument("--noise-std", type=float, default=0.002)
+    parser.add_argument("--resume-from-checkpoint", default=None)
+    parser.add_argument("--push-to-hub", action="store_true")
+    parser.add_argument("--hub-model-id", default=None)
+    args = parser.parse_args()
+
+    save_steps = args.save_steps if args.save_steps is not None else args.eval_steps
+    output_dir = resolve_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Loading manifests...")
+    train_dataset = load_manifest(args.train_manifest, drop_unknown_labels=args.drop_unknown_labels)
+    validation_dataset = load_manifest(args.val_manifest, drop_unknown_labels=args.drop_unknown_labels)
+    dataset = DatasetDict({"train": train_dataset, "validation": validation_dataset})
+    analyze_dataset(dataset)
+
+    print(f"Loading feature extractor: {args.model_name}")
+    feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_name)
+
+    augmenter = None
+    if args.random_gain or args.time_shift or args.gaussian_noise:
+        augmenter = WaveformAugmenter(
+            sample_rate=SAMPLE_RATE,
+            random_gain=args.random_gain,
+            gain_db=args.gain_db,
+            time_shift=args.time_shift,
+            max_shift_ms=args.max_shift_ms,
+            gaussian_noise=args.gaussian_noise,
+            noise_std=args.noise_std,
+        )
+
     preprocessing_workers = get_preprocessing_workers(dataset, args.preprocessing_workers)
     print(f"Preprocessing dataset with {preprocessing_workers} worker(s)...")
-    map_kwargs = {
+    map_kwargs: dict[str, Any] = {
         "batched": True,
         "remove_columns": ["audio"],
     }
     if preprocessing_workers > 1:
         map_kwargs["num_proc"] = preprocessing_workers
-    # dataset = dataset.map(
-    #     partial(preprocess_function, feature_extractor=feature_extractor),
-    #     **map_kwargs,
-    # )
+
     dataset["train"] = dataset["train"].map(
         partial(
             preprocess_function,
             feature_extractor=feature_extractor,
+            max_duration=args.max_duration,
             augmenter=augmenter,
         ),
         **map_kwargs,
     )
-
     dataset["validation"] = dataset["validation"].map(
         partial(
             preprocess_function,
             feature_extractor=feature_extractor,
+            max_duration=args.max_duration,
             augmenter=None,
         ),
         **map_kwargs,
-    )    
+    )
 
-    # Training arguments.
+    print(f"Loading multi-task AST model from {args.model_name}")
+    model = MultiTaskASTForDCLDE(
+        model_name=args.model_name,
+        dropout=args.dropout,
+        kw_loss_weight=args.kw_loss_weight,
+        species_loss_weight=args.species_loss_weight,
+        ecotype_loss_weight=args.ecotype_loss_weight,
+        freeze_backbone=args.freeze_backbone,
+    )
+
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    total = sum(param.numel() for param in model.parameters())
+    print(f"Trainable parameters: {trainable:,} / {total:,}")
+
     training_args = TrainingArguments(
         output_dir=str(output_dir),
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=CHECKPOINT_SAVE_LIMIT,
+        eval_strategy="steps",
+        eval_steps=args.eval_steps,
+        save_strategy="steps",
+        save_steps=save_steps,
+        save_total_limit=args.save_total_limit,
+        logging_steps=args.logging_steps,
         learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
-        warmup_ratio=0.1,
-        logging_steps=10,
+        warmup_ratio=args.warmup_ratio,
         fp16=torch.cuda.is_available(),
         load_best_model_at_end=True,
-        metric_for_best_model="f1",
+        metric_for_best_model="combined_score",
+        greater_is_better=True,
+        gradient_checkpointing=args.gradient_checkpointing,
+        label_names=["kw_labels", "species_labels", "ecotype_labels"],
         push_to_hub=args.push_to_hub,
         hub_strategy="all_checkpoints" if args.push_to_hub else "end",
         hub_model_id=args.hub_model_id if args.push_to_hub else None,
     )
 
-    # Create trainer.
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -958,49 +678,27 @@ def main() -> None:
         compute_metrics=compute_metrics,
     )
 
-    # Resume from checkpoint if provided.
-    if args.resume_from_checkpoint:
-        print(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
-        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
-    else:
-        # Train.
-        print("Starting training...")
-        trainer.train()
+    print("Starting training...")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    # Evaluate.
-    print("Evaluating model...")
+    print("Evaluating best/final model...")
     metrics = trainer.evaluate()
     print(f"Evaluation metrics: {metrics}")
 
-    # Save model and feature extractor.
-    print(f"Saving model to {output_dir}...")
+    print(f"Saving final model artifacts to {output_dir}")
     trainer.save_model(str(output_dir))
+    torch.save(model.state_dict(), output_dir / "pytorch_model.bin")
     feature_extractor.save_pretrained(str(output_dir))
-
-    print("Training complete!")
+    save_metadata(output_dir, args)
+    save_training_curves(trainer, output_dir)
 
     if args.push_to_hub:
-        # The Trainer already pushed the model weights; also push the feature extractor
-        # so that inference code can call AutoFeatureExtractor.from_pretrained()
-        # on the Hub model ID.
-        print(f"Pushing feature extractor to HuggingFace Hub: {args.hub_model_id}...")
+        print(f"Pushing feature extractor to Hugging Face Hub: {args.hub_model_id}")
         feature_extractor.push_to_hub(args.hub_model_id)
-        print(f"Model pushed to HuggingFace Hub: {args.hub_model_id}")
 
-    # trainer.train(
-    #     resume_from_checkpoint=args.resume_from_checkpoint
-    # )
+    print("Training complete.")
+    return 0
 
-    # save_loss_plot(
-    #     trainer,
-    #     args.output_dir,
-    # )
-
-
-    # save_loss_plot(
-    #     trainer,
-    #     "/kaggle/working/",
-    # )
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
