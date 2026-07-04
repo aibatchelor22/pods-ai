@@ -361,12 +361,12 @@ class MultiTaskASTForDCLDE(nn.Module):
         }
 
 
-def _f1(labels: np.ndarray, predictions: np.ndarray, **kwargs: Any) -> float:
+def _f1(y_true: np.ndarray, y_pred: np.ndarray, **kwargs: Any) -> float:
     """Return an F1 score with sklearn's zero-division behavior fixed."""
     return float(
         precision_recall_fscore_support(
-            labels,
-            predictions,
+            y_true,
+            y_pred,
             zero_division=0,
             **kwargs,
         )[2]
