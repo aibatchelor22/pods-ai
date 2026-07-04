@@ -36,6 +36,7 @@ import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from huggingface_hub import hf_hub_download
 from transformers import (  # noqa: E402
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
@@ -283,6 +284,7 @@ class MultiTaskASTForDCLDE(nn.Module):
     ) -> None:
         super().__init__()
         base_model = AutoModelForAudioClassification.from_pretrained(model_name)
+        self.base_model_name = model_name
         self.config = base_model.config
         self.ast = base_model.audio_spectrogram_transformer
         hidden_size = int(getattr(self.config, "hidden_size"))
@@ -359,6 +361,75 @@ class MultiTaskASTForDCLDE(nn.Module):
             "loss": loss,
             "logits": (kw_logits, species_logits, ecotype_logits),
         }
+
+
+def load_multitask_checkpoint_files(model_name: str) -> Optional[tuple[dict[str, Any], Path]]:
+    """Return saved multitask metadata/state paths for local dirs or Hub repos."""
+    local_path = Path(model_name)
+    if local_path.exists():
+        config_path = local_path / "multitask_config.json"
+        weights_path = local_path / "pytorch_model.bin"
+        if config_path.exists() and weights_path.exists():
+            with config_path.open("r", encoding="utf-8") as file:
+                return json.load(file), weights_path
+        return None
+
+    try:
+        config_path = Path(hf_hub_download(model_name, "multitask_config.json"))
+        weights_path = Path(hf_hub_download(model_name, "pytorch_model.bin"))
+    except Exception:
+        return None
+
+    with config_path.open("r", encoding="utf-8") as file:
+        return json.load(file), weights_path
+
+
+def load_training_model(
+    model_name: str,
+    dropout: float,
+    kw_loss_weight: float,
+    species_loss_weight: float,
+    ecotype_loss_weight: float,
+    freeze_backbone: bool,
+) -> MultiTaskASTForDCLDE:
+    """Load either a base AST model or a previously saved DCLDE multi-task model."""
+    checkpoint = load_multitask_checkpoint_files(model_name)
+    if checkpoint is None:
+        return MultiTaskASTForDCLDE(
+            model_name=model_name,
+            dropout=dropout,
+            kw_loss_weight=kw_loss_weight,
+            species_loss_weight=species_loss_weight,
+            ecotype_loss_weight=ecotype_loss_weight,
+            freeze_backbone=freeze_backbone,
+        )
+
+    metadata, weights_path = checkpoint
+    base_model = metadata.get("base_model")
+    if not base_model:
+        raise ValueError(
+            f"{model_name} has multitask weights but multitask_config.json is missing base_model."
+        )
+
+    print(f"Detected saved DCLDE multi-task checkpoint: {model_name}")
+    print(f"Rebuilding AST backbone from base model: {base_model}")
+    model = MultiTaskASTForDCLDE(
+        model_name=base_model,
+        dropout=dropout,
+        kw_loss_weight=kw_loss_weight,
+        species_loss_weight=species_loss_weight,
+        ecotype_loss_weight=ecotype_loss_weight,
+        freeze_backbone=freeze_backbone,
+    )
+    state_dict = torch.load(weights_path, map_location="cpu")
+    if isinstance(state_dict, dict) and "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        print(f"Warning: missing keys while loading checkpoint: {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: unexpected keys while loading checkpoint: {unexpected_keys}")
+    return model
 
 
 def _f1(y_true: np.ndarray, y_pred: np.ndarray, **kwargs: Any) -> float:
@@ -579,11 +650,17 @@ def save_training_curves(trainer: Trainer, output_dir: Path) -> None:
         print(f"Saved validation score curve to {score_path}")
 
 
-def save_metadata(output_dir: Path, args: argparse.Namespace) -> None:
+def save_metadata(
+    output_dir: Path,
+    args: argparse.Namespace,
+    model: Optional[MultiTaskASTForDCLDE] = None,
+) -> None:
     """Write label maps and training configuration next to model artifacts."""
+    base_model_name = getattr(model, "base_model_name", args.model_name)
     metadata = {
         "model_type": "podsai_dclde_multitask_ast",
-        "base_model": args.model_name,
+        "base_model": base_model_name,
+        "source_model": args.model_name,
         "kw_label2id": KW_LABELS,
         "kw_id2label": KW_ID2LABEL,
         "species_label2id": SPECIES_LABELS,
@@ -711,7 +788,7 @@ def main() -> int:
     )
 
     print(f"Loading multi-task AST model from {args.model_name}")
-    model = MultiTaskASTForDCLDE(
+    model = load_training_model(
         model_name=args.model_name,
         dropout=args.dropout,
         kw_loss_weight=args.kw_loss_weight,
@@ -772,7 +849,7 @@ def main() -> int:
     trainer.save_model(str(output_dir))
     torch.save(model.state_dict(), output_dir / "pytorch_model.bin")
     feature_extractor.save_pretrained(str(output_dir))
-    save_metadata(output_dir, args)
+    save_metadata(output_dir, args, model)
     save_training_curves(trainer, output_dir)
 
     if args.push_to_hub:
