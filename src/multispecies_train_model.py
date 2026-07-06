@@ -281,6 +281,9 @@ class MultiTaskASTForDCLDE(nn.Module):
         species_loss_weight: float = 1.0,
         ecotype_loss_weight: float = 1.0,
         freeze_backbone: bool = False,
+        kw_class_weights: Optional[list[float]] = None,
+        species_class_weights: Optional[list[float]] = None,
+        ecotype_class_weights: Optional[list[float]] = None,
     ) -> None:
         super().__init__()
         base_model = AutoModelForAudioClassification.from_pretrained(model_name)
@@ -295,11 +298,43 @@ class MultiTaskASTForDCLDE(nn.Module):
         self.kw_loss_weight = kw_loss_weight
         self.species_loss_weight = species_loss_weight
         self.ecotype_loss_weight = ecotype_loss_weight
+        self.register_buffer(
+            "kw_class_weights",
+            self._class_weight_tensor(kw_class_weights, len(KW_LABELS), "kw"),
+            persistent=False,
+        )
+        self.register_buffer(
+            "species_class_weights",
+            self._class_weight_tensor(species_class_weights, len(SPECIES_LABELS), "species"),
+            persistent=False,
+        )
+        self.register_buffer(
+            "ecotype_class_weights",
+            self._class_weight_tensor(ecotype_class_weights, len(ECOTYPE_LABELS), "ecotype"),
+            persistent=False,
+        )
 
         if freeze_backbone:
             print("Freezing AST backbone and training classification heads only.")
             for param in self.ast.parameters():
                 param.requires_grad = False
+
+    @staticmethod
+    def _class_weight_tensor(
+        weights: Optional[list[float]],
+        expected_length: int,
+        head_name: str,
+    ) -> Optional[torch.Tensor]:
+        """Validate and convert optional per-class loss weights."""
+        if weights is None:
+            return None
+        if len(weights) != expected_length:
+            raise ValueError(
+                f"{head_name} class weights must have {expected_length} values, got {len(weights)}"
+            )
+        if any(weight < 0 for weight in weights):
+            raise ValueError(f"{head_name} class weights must be non-negative: {weights}")
+        return torch.tensor(weights, dtype=torch.float32)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: Optional[dict] = None) -> None:
         """Allow Trainer gradient checkpointing to reach the AST backbone when available."""
@@ -337,12 +372,20 @@ class MultiTaskASTForDCLDE(nn.Module):
         if kw_labels is not None:
             losses.append(
                 self.kw_loss_weight
-                * nn.functional.cross_entropy(kw_logits, kw_labels.long())
+                * nn.functional.cross_entropy(
+                    kw_logits,
+                    kw_labels.long(),
+                    weight=self.kw_class_weights,
+                )
             )
         if species_labels is not None:
             losses.append(
                 self.species_loss_weight
-                * nn.functional.cross_entropy(species_logits, species_labels.long())
+                * nn.functional.cross_entropy(
+                    species_logits,
+                    species_labels.long(),
+                    weight=self.species_class_weights,
+                )
             )
         if ecotype_labels is not None:
             ecotype_mask = ecotype_labels != IGNORE_INDEX
@@ -352,6 +395,7 @@ class MultiTaskASTForDCLDE(nn.Module):
                     * nn.functional.cross_entropy(
                         ecotype_logits[ecotype_mask],
                         ecotype_labels[ecotype_mask].long(),
+                        weight=self.ecotype_class_weights,
                     )
                 )
         if losses:
@@ -391,6 +435,9 @@ def load_training_model(
     species_loss_weight: float,
     ecotype_loss_weight: float,
     freeze_backbone: bool,
+    kw_class_weights: Optional[list[float]] = None,
+    species_class_weights: Optional[list[float]] = None,
+    ecotype_class_weights: Optional[list[float]] = None,
 ) -> MultiTaskASTForDCLDE:
     """Load either a base AST model or a previously saved DCLDE multi-task model."""
     checkpoint = load_multitask_checkpoint_files(model_name)
@@ -402,6 +449,9 @@ def load_training_model(
             species_loss_weight=species_loss_weight,
             ecotype_loss_weight=ecotype_loss_weight,
             freeze_backbone=freeze_backbone,
+            kw_class_weights=kw_class_weights,
+            species_class_weights=species_class_weights,
+            ecotype_class_weights=ecotype_class_weights,
         )
 
     metadata, weights_path = checkpoint
@@ -420,6 +470,9 @@ def load_training_model(
         species_loss_weight=species_loss_weight,
         ecotype_loss_weight=ecotype_loss_weight,
         freeze_backbone=freeze_backbone,
+        kw_class_weights=kw_class_weights,
+        species_class_weights=species_class_weights,
+        ecotype_class_weights=ecotype_class_weights,
     )
     state_dict = torch.load(weights_path, map_location="cpu")
     if isinstance(state_dict, dict) and "state_dict" in state_dict:
@@ -430,6 +483,50 @@ def load_training_model(
     if unexpected_keys:
         print(f"Warning: unexpected keys while loading checkpoint: {unexpected_keys}")
     return model
+
+
+def parse_class_weights(
+    value: Optional[str],
+    label2id: dict[str, int],
+    argument_name: str,
+) -> Optional[list[float]]:
+    """Parse class weights as label=value pairs or full ID-order values."""
+    if value is None or not value.strip():
+        return None
+
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        return None
+
+    weights = [1.0] * len(label2id)
+    if all("=" not in part for part in parts):
+        if len(parts) != len(label2id):
+            raise ValueError(
+                f"{argument_name} expected {len(label2id)} comma-separated weights "
+                f"in class-ID order, got {len(parts)}"
+            )
+        weights = [float(part) for part in parts]
+    else:
+        for part in parts:
+            if "=" not in part:
+                raise ValueError(
+                    f"{argument_name} must use all label=value entries or all plain values: {value!r}"
+                )
+            label, weight_text = [piece.strip() for piece in part.split("=", 1)]
+            if label in label2id:
+                class_id = label2id[label]
+            elif label.isdigit() and int(label) in set(label2id.values()):
+                class_id = int(label)
+            else:
+                raise ValueError(
+                    f"{argument_name} has unknown class {label!r}. "
+                    f"Known classes: {sorted(label2id)}"
+                )
+            weights[class_id] = float(weight_text)
+
+    if any(weight < 0 for weight in weights):
+        raise ValueError(f"{argument_name} weights must be non-negative: {weights}")
+    return weights
 
 
 def _f1(y_true: np.ndarray, y_pred: np.ndarray, **kwargs: Any) -> float:
@@ -673,6 +770,19 @@ def save_metadata(
             "species": args.species_loss_weight,
             "ecotype": args.ecotype_loss_weight,
         },
+        "class_loss_weights": {
+            "kw": parse_class_weights(args.kw_class_weights, KW_LABELS, "--kw-class-weights"),
+            "species": parse_class_weights(
+                args.species_class_weights,
+                SPECIES_LABELS,
+                "--species-class-weights",
+            ),
+            "ecotype": parse_class_weights(
+                args.ecotype_class_weights,
+                ECOTYPE_LABELS,
+                "--ecotype-class-weights",
+            ),
+        },
     }
     with (output_dir / "multitask_config.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, sort_keys=True)
@@ -731,6 +841,30 @@ def main() -> int:
     parser.add_argument("--kw-loss-weight", type=float, default=1.0)
     parser.add_argument("--species-loss-weight", type=float, default=1.0)
     parser.add_argument("--ecotype-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--kw-class-weights",
+        default=None,
+        help=(
+            "Optional KW head class weights, e.g. 'kw=2.0' or 'not_kw=1,kw=2'. "
+            "Unspecified label=value classes default to 1."
+        ),
+    )
+    parser.add_argument(
+        "--species-class-weights",
+        default=None,
+        help=(
+            "Optional species head class weights, e.g. 'AB=3.0' or "
+            "'background=1,KW=1,HW=1,AB=3'. Unspecified label=value classes default to 1."
+        ),
+    )
+    parser.add_argument(
+        "--ecotype-class-weights",
+        default=None,
+        help=(
+            "Optional ecotype head class weights, e.g. 'SRKW=2,TKW=2'. "
+            "Unspecified label=value classes default to 1."
+        ),
+    )
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--drop-unknown-labels", action="store_true")
@@ -748,6 +882,24 @@ def main() -> int:
     save_steps = args.save_steps if args.save_steps is not None else args.eval_steps
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    kw_class_weights = parse_class_weights(args.kw_class_weights, KW_LABELS, "--kw-class-weights")
+    species_class_weights = parse_class_weights(
+        args.species_class_weights,
+        SPECIES_LABELS,
+        "--species-class-weights",
+    )
+    ecotype_class_weights = parse_class_weights(
+        args.ecotype_class_weights,
+        ECOTYPE_LABELS,
+        "--ecotype-class-weights",
+    )
+    if kw_class_weights is not None:
+        print(f"KW class loss weights: {kw_class_weights}")
+    if species_class_weights is not None:
+        print(f"Species class loss weights: {species_class_weights}")
+    if ecotype_class_weights is not None:
+        print(f"Ecotype class loss weights: {ecotype_class_weights}")
 
     print("Loading manifests...")
     train_dataset = load_manifest(args.train_manifest, drop_unknown_labels=args.drop_unknown_labels)
@@ -795,6 +947,9 @@ def main() -> int:
         species_loss_weight=args.species_loss_weight,
         ecotype_loss_weight=args.ecotype_loss_weight,
         freeze_backbone=args.freeze_backbone,
+        kw_class_weights=kw_class_weights,
+        species_class_weights=species_class_weights,
+        ecotype_class_weights=ecotype_class_weights,
     )
 
     trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
