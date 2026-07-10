@@ -191,28 +191,34 @@ class WaveformAugmenter:
         self,
         sample_rate: int,
         random_gain: bool = False,
+        random_gain_prob: float = 1.0,
         gain_db: float = 6.0,
         time_shift: bool = False,
+        time_shift_prob: float = 1.0,
         max_shift_ms: float = 250.0,
         gaussian_noise: bool = False,
+        gaussian_noise_prob: float = 1.0,
         noise_std: float = 0.002,
     ) -> None:
         self.sample_rate = sample_rate
         self.random_gain = random_gain
+        self.random_gain_prob = random_gain_prob
         self.gain_db = gain_db
         self.time_shift = time_shift
+        self.time_shift_prob = time_shift_prob
         self.max_shift = int(sample_rate * max_shift_ms / 1000)
         self.gaussian_noise = gaussian_noise
+        self.gaussian_noise_prob = gaussian_noise_prob
         self.noise_std = noise_std
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         audio = audio.astype(np.float32, copy=True)
-        if self.random_gain:
+        if self.random_gain and random.random() < self.random_gain_prob:
             gain = random.uniform(-self.gain_db, self.gain_db)
             audio *= 10 ** (gain / 20)
-        if self.time_shift and self.max_shift > 0:
+        if self.time_shift and self.max_shift > 0 and random.random() < self.time_shift_prob:
             audio = np.roll(audio, random.randint(-self.max_shift, self.max_shift))
-        if self.gaussian_noise:
+        if self.gaussian_noise and random.random() < self.gaussian_noise_prob:
             audio = audio + np.random.normal(0, self.noise_std, size=audio.shape)
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
@@ -529,6 +535,13 @@ def parse_class_weights(
     return weights
 
 
+def validate_probability(value: float, argument_name: str) -> float:
+    """Validate a command-line probability."""
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{argument_name} must be between 0 and 1, got {value}")
+    return value
+
+
 def _f1(y_true: np.ndarray, y_pred: np.ndarray, **kwargs: Any) -> float:
     """Return an F1 score with sklearn's zero-division behavior fixed."""
     return float(
@@ -783,6 +796,17 @@ def save_metadata(
                 "--ecotype-class-weights",
             ),
         },
+        "augmentation": {
+            "random_gain": args.random_gain,
+            "random_gain_prob": args.random_gain_prob,
+            "gain_db": args.gain_db,
+            "time_shift": args.time_shift,
+            "time_shift_prob": args.time_shift_prob,
+            "max_shift_ms": args.max_shift_ms,
+            "gaussian_noise": args.gaussian_noise,
+            "gaussian_noise_prob": args.gaussian_noise_prob,
+            "noise_std": args.noise_std,
+        },
     }
     with (output_dir / "multitask_config.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, sort_keys=True)
@@ -869,10 +893,28 @@ def main() -> int:
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--drop-unknown-labels", action="store_true")
     parser.add_argument("--random-gain", action="store_true")
+    parser.add_argument(
+        "--random-gain-prob",
+        type=float,
+        default=1.0,
+        help="Probability of applying random gain to each training clip when --random-gain is set.",
+    )
     parser.add_argument("--gain-db", type=float, default=6.0)
     parser.add_argument("--time-shift", action="store_true")
+    parser.add_argument(
+        "--time-shift-prob",
+        type=float,
+        default=1.0,
+        help="Probability of applying time shift to each training clip when --time-shift is set.",
+    )
     parser.add_argument("--max-shift-ms", type=float, default=250.0)
     parser.add_argument("--gaussian-noise", action="store_true")
+    parser.add_argument(
+        "--gaussian-noise-prob",
+        type=float,
+        default=1.0,
+        help="Probability of adding Gaussian noise to each training clip when --gaussian-noise is set.",
+    )
     parser.add_argument("--noise-std", type=float, default=0.002)
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--push-to-hub", action="store_true")
@@ -882,6 +924,13 @@ def main() -> int:
     save_steps = args.save_steps if args.save_steps is not None else args.eval_steps
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    args.random_gain_prob = validate_probability(args.random_gain_prob, "--random-gain-prob")
+    args.time_shift_prob = validate_probability(args.time_shift_prob, "--time-shift-prob")
+    args.gaussian_noise_prob = validate_probability(
+        args.gaussian_noise_prob,
+        "--gaussian-noise-prob",
+    )
 
     kw_class_weights = parse_class_weights(args.kw_class_weights, KW_LABELS, "--kw-class-weights")
     species_class_weights = parse_class_weights(
@@ -915,11 +964,20 @@ def main() -> int:
         augmenter = WaveformAugmenter(
             sample_rate=SAMPLE_RATE,
             random_gain=args.random_gain,
+            random_gain_prob=args.random_gain_prob,
             gain_db=args.gain_db,
             time_shift=args.time_shift,
+            time_shift_prob=args.time_shift_prob,
             max_shift_ms=args.max_shift_ms,
             gaussian_noise=args.gaussian_noise,
+            gaussian_noise_prob=args.gaussian_noise_prob,
             noise_std=args.noise_std,
+        )
+        print(
+            "Training augmentation probabilities: "
+            f"random_gain={args.random_gain_prob if args.random_gain else 0.0}, "
+            f"time_shift={args.time_shift_prob if args.time_shift else 0.0}, "
+            f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}"
         )
 
     if args.preprocessing_workers is not None:
