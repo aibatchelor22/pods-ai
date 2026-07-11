@@ -193,6 +193,7 @@ class WaveformAugmenter:
         random_gain: bool = False,
         random_gain_prob: float = 1.0,
         gain_db: float = 6.0,
+        gain_clipping_mode: str = "clip",
         time_shift: bool = False,
         time_shift_prob: float = 1.0,
         max_shift_ms: float = 250.0,
@@ -204,6 +205,7 @@ class WaveformAugmenter:
         self.random_gain = random_gain
         self.random_gain_prob = random_gain_prob
         self.gain_db = gain_db
+        self.gain_clipping_mode = gain_clipping_mode
         self.time_shift = time_shift
         self.time_shift_prob = time_shift_prob
         self.max_shift = int(sample_rate * max_shift_ms / 1000)
@@ -214,8 +216,19 @@ class WaveformAugmenter:
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         audio = audio.astype(np.float32, copy=True)
         if self.random_gain and random.random() < self.random_gain_prob:
-            gain = random.uniform(-self.gain_db, self.gain_db)
-            audio *= 10 ** (gain / 20)
+            gain_db = random.uniform(-self.gain_db, self.gain_db)
+            gain = 10 ** (gain_db / 20)
+            if self.gain_clipping_mode == "safe":
+                peak = float(np.max(np.abs(audio)))
+                if peak > 0:
+                    gain = min(gain, 1.0 / peak)
+            audio *= gain
+            if self.gain_clipping_mode == "normalize":
+                peak = float(np.max(np.abs(audio)))
+                if peak > 1.0:
+                    audio /= peak
+            elif self.gain_clipping_mode == "soft":
+                audio = np.tanh(audio)
         if self.time_shift and self.max_shift > 0 and random.random() < self.time_shift_prob:
             audio = np.roll(audio, random.randint(-self.max_shift, self.max_shift))
         if self.gaussian_noise and random.random() < self.gaussian_noise_prob:
@@ -800,6 +813,7 @@ def save_metadata(
             "random_gain": args.random_gain,
             "random_gain_prob": args.random_gain_prob,
             "gain_db": args.gain_db,
+            "gain_clipping_mode": args.gain_clipping_mode,
             "time_shift": args.time_shift,
             "time_shift_prob": args.time_shift_prob,
             "max_shift_ms": args.max_shift_ms,
@@ -900,6 +914,16 @@ def main() -> int:
         help="Probability of applying random gain to each training clip when --random-gain is set.",
     )
     parser.add_argument("--gain-db", type=float, default=6.0)
+    parser.add_argument(
+        "--gain-clipping-mode",
+        choices=("clip", "safe", "normalize", "soft"),
+        default="clip",
+        help=(
+            "How to handle random gain values that exceed [-1, 1]: "
+            "'clip' hard-clips, 'safe' caps gain before applying it, "
+            "'normalize' rescales only if needed, and 'soft' applies tanh limiting."
+        ),
+    )
     parser.add_argument("--time-shift", action="store_true")
     parser.add_argument(
         "--time-shift-prob",
@@ -966,6 +990,7 @@ def main() -> int:
             random_gain=args.random_gain,
             random_gain_prob=args.random_gain_prob,
             gain_db=args.gain_db,
+            gain_clipping_mode=args.gain_clipping_mode,
             time_shift=args.time_shift,
             time_shift_prob=args.time_shift_prob,
             max_shift_ms=args.max_shift_ms,
@@ -977,7 +1002,8 @@ def main() -> int:
             "Training augmentation probabilities: "
             f"random_gain={args.random_gain_prob if args.random_gain else 0.0}, "
             f"time_shift={args.time_shift_prob if args.time_shift else 0.0}, "
-            f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}"
+            f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}; "
+            f"gain_clipping_mode={args.gain_clipping_mode}"
         )
 
     if args.preprocessing_workers is not None:
