@@ -200,6 +200,7 @@ class WaveformAugmenter:
         gaussian_noise: bool = False,
         gaussian_noise_prob: float = 1.0,
         noise_std: float = 0.002,
+        noise_scale_mode: str = "absolute",
     ) -> None:
         self.sample_rate = sample_rate
         self.random_gain = random_gain
@@ -212,6 +213,7 @@ class WaveformAugmenter:
         self.gaussian_noise = gaussian_noise
         self.gaussian_noise_prob = gaussian_noise_prob
         self.noise_std = noise_std
+        self.noise_scale_mode = noise_scale_mode
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         audio = audio.astype(np.float32, copy=True)
@@ -232,7 +234,11 @@ class WaveformAugmenter:
         if self.time_shift and self.max_shift > 0 and random.random() < self.time_shift_prob:
             audio = np.roll(audio, random.randint(-self.max_shift, self.max_shift))
         if self.gaussian_noise and random.random() < self.gaussian_noise_prob:
-            audio = audio + np.random.normal(0, self.noise_std, size=audio.shape)
+            noise_std = self.noise_std
+            if self.noise_scale_mode == "rms":
+                rms = float(np.sqrt(np.mean(np.square(audio))))
+                noise_std *= rms
+            audio = audio + np.random.normal(0, noise_std, size=audio.shape)
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
 
@@ -820,6 +826,7 @@ def save_metadata(
             "gaussian_noise": args.gaussian_noise,
             "gaussian_noise_prob": args.gaussian_noise_prob,
             "noise_std": args.noise_std,
+            "noise_scale_mode": args.noise_scale_mode,
         },
     }
     with (output_dir / "multitask_config.json").open("w", encoding="utf-8") as file:
@@ -940,6 +947,15 @@ def main() -> int:
         help="Probability of adding Gaussian noise to each training clip when --gaussian-noise is set.",
     )
     parser.add_argument("--noise-std", type=float, default=0.002)
+    parser.add_argument(
+        "--noise-scale-mode",
+        choices=("absolute", "rms"),
+        default="absolute",
+        help=(
+            "How --noise-std is interpreted: 'absolute' uses the value as waveform "
+            "standard deviation; 'rms' multiplies it by the clip RMS."
+        ),
+    )
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hub-model-id", default=None)
@@ -997,13 +1013,15 @@ def main() -> int:
             gaussian_noise=args.gaussian_noise,
             gaussian_noise_prob=args.gaussian_noise_prob,
             noise_std=args.noise_std,
+            noise_scale_mode=args.noise_scale_mode,
         )
         print(
             "Training augmentation probabilities: "
             f"random_gain={args.random_gain_prob if args.random_gain else 0.0}, "
             f"time_shift={args.time_shift_prob if args.time_shift else 0.0}, "
             f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}; "
-            f"gain_clipping_mode={args.gain_clipping_mode}"
+            f"gain_clipping_mode={args.gain_clipping_mode}; "
+            f"noise_scale_mode={args.noise_scale_mode}"
         )
 
     if args.preprocessing_workers is not None:
