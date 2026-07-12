@@ -40,6 +40,7 @@ from huggingface_hub import hf_hub_download
 from transformers import (  # noqa: E402
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
+    EarlyStoppingCallback,
     EvalPrediction,
     Trainer,
     TrainingArguments,
@@ -662,6 +663,7 @@ class LazyAudioTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.train_collator = train_collator
         self.eval_collator = eval_collator
+        self._final_candidate_evaluated = False
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
@@ -679,6 +681,54 @@ class LazyAudioTrainer(Trainer):
             persistent_workers=self.args.dataloader_num_workers > 0,
         )
         return self.accelerator.prepare(dataloader)
+
+    def _metric_key_for_best_model(self) -> str:
+        """Return the evaluation metric key used by Trainer for best-model selection."""
+        metric_name = self.args.metric_for_best_model
+        if metric_name is None:
+            metric_name = "loss"
+        if not metric_name.startswith("eval_"):
+            metric_name = f"eval_{metric_name}"
+        return metric_name
+
+    def _is_better_metric(self, current_metric: float, best_metric: Optional[float]) -> bool:
+        """Compare a candidate metric against the current best metric."""
+        if best_metric is None:
+            return True
+        if self.args.greater_is_better:
+            return current_metric > best_metric
+        return current_metric < best_metric
+
+    def _load_best_model(self, *args: Any, **kwargs: Any) -> None:
+        """Evaluate the final training state as a best-checkpoint candidate before reload."""
+        if not self._final_candidate_evaluated and self.eval_dataset is not None:
+            self._final_candidate_evaluated = True
+            metric_key = self._metric_key_for_best_model()
+            print("Evaluating final training state as a best-model candidate...")
+            metrics = self.evaluate(metric_key_prefix="eval")
+            final_metric = metrics.get(metric_key)
+            if final_metric is None:
+                print(
+                    f"Warning: final evaluation did not return {metric_key}; "
+                    "final state cannot be compared against the best checkpoint."
+                )
+            elif self._is_better_metric(float(final_metric), self.state.best_metric):
+                final_checkpoint = Path(self.args.output_dir) / "checkpoint-final"
+                print(
+                    f"Final training state is the new best model: "
+                    f"{metric_key}={float(final_metric):.6f}"
+                )
+                self.save_model(str(final_checkpoint))
+                self.state.best_metric = float(final_metric)
+                self.state.best_model_checkpoint = str(final_checkpoint)
+            else:
+                print(
+                    f"Final training state did not beat best checkpoint: "
+                    f"{metric_key}={float(final_metric):.6f}, "
+                    f"best={self.state.best_metric:.6f}"
+                )
+
+        return super()._load_best_model(*args, **kwargs)
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -828,6 +878,13 @@ def save_metadata(
             "noise_std": args.noise_std,
             "noise_scale_mode": args.noise_scale_mode,
         },
+        "early_stopping": {
+            "enabled": args.early_stopping_patience is not None,
+            "patience": args.early_stopping_patience,
+            "threshold": args.early_stopping_threshold,
+            "metric": "combined_score",
+            "greater_is_better": True,
+        },
     }
     with (output_dir / "multitask_config.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, sort_keys=True)
@@ -866,6 +923,21 @@ def main() -> int:
         type=int,
         default=None,
         help="Save checkpoints every N optimizer steps (default: same as --eval-steps).",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help=(
+            "Stop training after this many evaluations without improving combined_score. "
+            "Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--early-stopping-threshold",
+        type=float,
+        default=0.0,
+        help="Minimum combined_score improvement required to reset early-stopping patience.",
     )
     parser.add_argument("--logging-steps", type=int, default=100, help="Log every N steps.")
     parser.add_argument("--save-total-limit", type=int, default=CHECKPOINT_SAVE_LIMIT)
@@ -971,6 +1043,8 @@ def main() -> int:
         args.gaussian_noise_prob,
         "--gaussian-noise-prob",
     )
+    if args.early_stopping_patience is not None and args.early_stopping_patience < 1:
+        raise ValueError("--early-stopping-patience must be at least 1 when provided")
 
     kw_class_weights = parse_class_weights(args.kw_class_weights, KW_LABELS, "--kw-class-weights")
     species_class_weights = parse_class_weights(
@@ -1085,6 +1159,20 @@ def main() -> int:
         hub_model_id=args.hub_model_id if args.push_to_hub else None,
     )
 
+    callbacks = []
+    if args.early_stopping_patience is not None:
+        print(
+            "Early stopping enabled: "
+            f"patience={args.early_stopping_patience} evaluations, "
+            f"threshold={args.early_stopping_threshold}, metric=combined_score"
+        )
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+            )
+        )
+
     trainer = LazyAudioTrainer(
         model=model,
         args=training_args,
@@ -1093,12 +1181,13 @@ def main() -> int:
         train_collator=train_collator,
         eval_collator=eval_collator,
         compute_metrics=compute_metrics,
+        callbacks=callbacks,
     )
 
     print("Starting training...")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    print("Evaluating best/final model...")
+    print("Evaluating selected best model...")
     metrics = trainer.evaluate()
     print(f"Evaluation metrics: {metrics}")
 
