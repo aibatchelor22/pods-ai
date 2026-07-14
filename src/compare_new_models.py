@@ -321,6 +321,12 @@ class MultiSpeciesWindowPredictor:
         print(f"Loading multi-species comparison model: {model_path}")
         print(f"Using device: {self.device}")
         self.feature_extractor = load_multispecies_feature_extractor(model_path)
+        if load_multitask_checkpoint_files(model_path) is None:
+            raise ValueError(
+                f"{model_path!r} does not look like a multispecies_train_model.py checkpoint. "
+                "Expected multitask_config.json plus pytorch_model.bin or model.safetensors. "
+                "If you used snapshot_download, pass --multispecies-model-path /path/to/local/snapshot."
+            )
         self.model = load_training_model(
             model_name=model_path,
             dropout=0.0,
