@@ -48,6 +48,7 @@ from multispecies_train_model import (
 
 RESIDENT_LABEL = "resident"
 WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
+BACKGROUND_COMPARISON_LABEL = "other/background"
 SUMMARY_LABELS = [
     ("resident", "R"),
     ("transient", "T"),
@@ -69,7 +70,7 @@ MODEL_TYPE_TO_INFERENCE_TYPE = {
     "multispecies": "multispecies",
 }
 SEGMENT_GROUP_SIZE = 10
-COMPARISON_LABELS = ("other", "humpback", "resident", "transient")
+COMPARISON_LABELS = ("humpback", "transient", "resident", BACKGROUND_COMPARISON_LABEL)
 
 
 @dataclass
@@ -475,6 +476,11 @@ def is_exact_match_model(model_type: str) -> bool:
     return model_type in {"podsai", "oldpodsai", "multispecies"}
 
 
+def normalize_multispecies_comparison_label(label: str) -> str:
+    """Map raw labels into the four multispecies comparison-matrix buckets."""
+    return label if label in WHALE_CLASS_NAMES else BACKGROUND_COMPARISON_LABEL
+
+
 def is_correct_prediction(actual_label: str, predicted_label: str, model_type: str) -> bool:
     """Return whether a prediction should count toward the Correct column.
 
@@ -619,7 +625,10 @@ def evaluate_multispecies_model(
             result.skipped += 1
             continue
 
-        predicted_label = str(inference_result.get("global_prediction_label", ""))
+        predicted_label = normalize_multispecies_comparison_label(
+            str(inference_result.get("global_prediction_label", ""))
+        )
+        actual_label = normalize_multispecies_comparison_label(sample.category)
         predicted_resident = is_resident_prediction(predicted_label, "multispecies")
 
         if is_correct_prediction(sample.category, predicted_label, "multispecies"):
@@ -634,7 +643,6 @@ def evaluate_multispecies_model(
         else:
             status = "incorrect"
 
-        actual_label = sample.category
         result.confusion_matrix.setdefault(actual_label, {})
         preds = result.confusion_matrix[actual_label]
         preds[predicted_label] = preds.get(predicted_label, 0) + 1
@@ -703,6 +711,43 @@ def print_confusion_matrix(result: ModelResult) -> None:
         print()
 
 
+def print_multispecies_confusion_matrix(result: ModelResult) -> None:
+    """Print the multispecies matrix over humpback/transient/resident/background."""
+    matrix = result.confusion_matrix
+    if not matrix:
+        return
+
+    labels = [label for label in COMPARISON_LABELS if (
+        sum(matrix.get(label, {}).values()) > 0
+        or any(preds.get(label, 0) > 0 for preds in matrix.values())
+    )]
+    if not labels:
+        return
+
+    row_totals = {actual: sum(matrix.get(actual, {}).values()) for actual in labels}
+    widest_total = max(len("total"), max(len(str(total)) for total in row_totals.values()))
+    col_width = max(max(len(label) for label in labels), widest_total) + MATRIX_CELL_PADDING
+    row_label_width = max(len(label) for label in labels) + MATRIX_CELL_PADDING
+
+    print(
+        "Confusion Matrix for multispecies "
+        "(rows=actual, cols=predicted; non-targets grouped as other/background):"
+    )
+    print(f"{'':>{row_label_width}}", end="")
+    for label in labels:
+        print(f"{label:>{col_width}}", end="")
+    print(f"{'total':>{col_width}}", end="")
+    print()
+
+    for actual in labels:
+        print(f"{actual:>{row_label_width}}", end="")
+        for predicted in labels:
+            count = matrix.get(actual, {}).get(predicted, 0)
+            print(f"{count:>{col_width}}", end="")
+        print(f"{row_totals[actual]:>{col_width}}", end="")
+        print()
+
+
 def print_summary(results: list[ModelResult]) -> None:
     """
     Print a formatted comparison table for all model results.
@@ -762,10 +807,11 @@ def print_summary(results: list[ModelResult]) -> None:
     print("  Note         = compares end-to-end 60-second inference on testing_60s_samples.csv")
 
     for r in results:
-        if r.model_type == "multispecies":
-            continue
         print()
-        print_confusion_matrix(r)
+        if r.model_type == "multispecies":
+            print_multispecies_confusion_matrix(r)
+        else:
+            print_confusion_matrix(r)
 
 
 def main() -> int:
