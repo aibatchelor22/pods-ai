@@ -994,6 +994,13 @@ def main() -> int:
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     valid_models = {"fastai", "orcahello", "oldpodsai", "podsai", "multispecies"}
+    if not models:
+        print(
+            "Error: --models did not contain any model names. "
+            f"Valid models: {sorted(valid_models)}",
+            file=sys.stderr,
+        )
+        return 1
     for model in models:
         if model not in valid_models:
             print(
@@ -1102,6 +1109,10 @@ def main() -> int:
                 wav_dir=wav_dir,
             )
             results.append(model_result)
+            print(
+                f"Completed multispecies: evaluated={model_result.evaluated}, "
+                f"skipped={model_result.skipped}, correct={model_result.correct}"
+            )
             print()
             continue
 
@@ -1115,7 +1126,15 @@ def main() -> int:
             result_model_type=model_type,
         )
         results.append(model_result)
+        print(
+            f"Completed {model_type}: evaluated={model_result.evaluated}, "
+            f"skipped={model_result.skipped}, correct={model_result.correct}"
+        )
         print()
+
+    if not results:
+        print("Error: no model results were produced.", file=sys.stderr)
+        return 1
 
     print_summary(results)
     return 0
