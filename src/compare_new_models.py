@@ -305,6 +305,7 @@ class MultiSpeciesWindowPredictor:
         self,
         model_path: str,
         threshold: float = 0.25,
+        class_thresholds: Optional[dict[str, float]] = None,
         segment_duration: float = 3.0,
         hop_duration: float = 2.0,
         min_num_positive_calls_threshold: int = 3,
@@ -313,6 +314,12 @@ class MultiSpeciesWindowPredictor:
     ) -> None:
         self.model_path = model_path
         self.threshold = threshold
+        self.class_thresholds = {
+            label: threshold
+            for label in ("humpback", "resident", "transient")
+        }
+        if class_thresholds:
+            self.class_thresholds.update(class_thresholds)
         self.segment_duration = segment_duration
         self.hop_duration = hop_duration
         self.min_num_positive_calls_threshold = min_num_positive_calls_threshold
@@ -321,6 +328,13 @@ class MultiSpeciesWindowPredictor:
 
         print(f"Loading multi-species comparison model: {model_path}")
         print(f"Using device: {self.device}")
+        print(
+            "Multi-species thresholds: "
+            + ", ".join(
+                f"{label}={self.class_thresholds[label]:.3f}"
+                for label in ("humpback", "resident", "transient")
+            )
+        )
         self.feature_extractor = load_multispecies_feature_extractor(model_path)
         if load_multitask_checkpoint_files(model_path) is None:
             raise ValueError(
@@ -393,7 +407,7 @@ class MultiSpeciesWindowPredictor:
 
         for score in smoothed_scores:
             label, confidence = max(score.items(), key=lambda item: item[1])
-            if confidence < self.threshold:
+            if confidence < self.class_thresholds[label]:
                 label = "other"
             local_labels.append(label)
             local_confidences.append(float(confidence))
@@ -893,7 +907,35 @@ def main() -> int:
         default=0.25,
         help=(
             "Minimum mapped window confidence for multispecies HW/SRKW/TKW "
-            "windows to count as positive (default: 0.25)."
+            "windows to count as positive when a class-specific threshold is "
+            "not set (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-humpback-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum mapped window confidence for multispecies humpback/HW "
+            "windows to count as positive. Defaults to --multispecies-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-resident-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum mapped window confidence for multispecies resident/SRKW "
+            "windows to count as positive. Defaults to --multispecies-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-transient-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum mapped window confidence for multispecies transient/TKW "
+            "windows to count as positive. Defaults to --multispecies-threshold."
         ),
     )
     parser.add_argument(
@@ -998,6 +1040,30 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    multispecies_class_thresholds = {
+        "humpback": (
+            args.multispecies_humpback_threshold
+            if args.multispecies_humpback_threshold is not None
+            else args.multispecies_threshold
+        ),
+        "resident": (
+            args.multispecies_resident_threshold
+            if args.multispecies_resident_threshold is not None
+            else args.multispecies_threshold
+        ),
+        "transient": (
+            args.multispecies_transient_threshold
+            if args.multispecies_transient_threshold is not None
+            else args.multispecies_threshold
+        ),
+    }
+    for label, threshold in multispecies_class_thresholds.items():
+        if not 0.0 <= threshold <= 1.0:
+            print(
+                f"Error: multispecies {label} threshold must be between 0 and 1, got {threshold}",
+                file=sys.stderr,
+            )
+            return 1
 
     samples = load_test_samples(testing_csv, max_samples=args.max_samples,
                                 category_filter=args.category)
@@ -1026,6 +1092,7 @@ def main() -> int:
                 multispecies_predictor = MultiSpeciesWindowPredictor(
                     model_path=args.multispecies_model_path,
                     threshold=args.multispecies_threshold,
+                    class_thresholds=multispecies_class_thresholds,
                     min_num_positive_calls_threshold=args.multispecies_min_positive_windows,
                     batch_size=args.multispecies_batch_size,
                 )
