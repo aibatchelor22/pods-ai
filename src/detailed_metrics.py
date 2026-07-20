@@ -24,6 +24,11 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader
 from transformers import AutoFeatureExtractor
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 from multispecies_train_model import (
     BACKGROUND_SPECIES,
     DEFAULT_MAX_DURATION,
@@ -48,6 +53,13 @@ from multispecies_train_model import (
 
 
 GROUP_COLUMNS = ["Provider", "Dataset", "Soundfile", "ClassSpecies", "Ecotype"]
+
+
+def progress_iter(iterable: DataLoader, description: str):
+    """Wrap an iterable in tqdm when available."""
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=len(iterable), desc=description, unit="batch")
 
 
 def resolve_path(path: str) -> Path:
@@ -233,7 +245,7 @@ def run_predictions(
     ecotype_probs: list[np.ndarray] = []
 
     with torch.inference_mode():
-        for step, batch in enumerate(dataloader, start=1):
+        for step, batch in enumerate(progress_iter(dataloader, "Inference batches"), start=1):
             batch.pop("kw_labels")
             batch.pop("species_labels")
             batch.pop("ecotype_labels")
@@ -252,7 +264,7 @@ def run_predictions(
             species_pred.append(np.argmax(species_prob, axis=1))
             ecotype_pred.append(np.argmax(ecotype_prob, axis=1))
 
-            if step % 25 == 0:
+            if tqdm is None and step % 25 == 0:
                 print(f"Processed {step * dataloader.batch_size:,} validation rows...")
 
     return {
