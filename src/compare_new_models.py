@@ -306,6 +306,9 @@ class MultiSpeciesWindowPredictor:
         model_path: str,
         threshold: float = 0.25,
         class_thresholds: Optional[dict[str, float]] = None,
+        aggregation_mode: str = "vote",
+        top_k: int = 3,
+        class_min_windows: Optional[dict[str, int]] = None,
         segment_duration: float = 3.0,
         hop_duration: float = 2.0,
         min_num_positive_calls_threshold: int = 3,
@@ -320,6 +323,9 @@ class MultiSpeciesWindowPredictor:
         }
         if class_thresholds:
             self.class_thresholds.update(class_thresholds)
+        self.aggregation_mode = aggregation_mode
+        self.top_k = top_k
+        self.class_min_windows = class_min_windows or {}
         self.segment_duration = segment_duration
         self.hop_duration = hop_duration
         self.min_num_positive_calls_threshold = min_num_positive_calls_threshold
@@ -335,6 +341,15 @@ class MultiSpeciesWindowPredictor:
                 for label in ("humpback", "resident", "transient")
             )
         )
+        print(f"Multi-species aggregation: {self.aggregation_mode}")
+        if self.aggregation_mode == "topk_mean":
+            print(
+                f"Multi-species top-k: {self.top_k}; minimum windows: "
+                + ", ".join(
+                    f"{label}={self.class_min_windows.get(label, 'scaled')}"
+                    for label in ("humpback", "resident", "transient")
+                )
+            )
         self.feature_extractor = load_multispecies_feature_extractor(model_path)
         if load_multitask_checkpoint_files(model_path) is None:
             raise ValueError(
@@ -399,6 +414,62 @@ class MultiSpeciesWindowPredictor:
             })
         return smoothed
 
+    def _scaled_min_positive_windows(self, total_segments: int) -> int:
+        """Return the existing scaled minimum positive-window requirement."""
+        scaled_threshold = max(1, (total_segments + SEGMENT_GROUP_SIZE - 1) // SEGMENT_GROUP_SIZE)
+        return min(scaled_threshold, self.min_num_positive_calls_threshold)
+
+    def _aggregate_vote(
+        self,
+        positive_predictions: list[tuple[str, float]],
+        effective_threshold: int,
+    ) -> tuple[str, float]:
+        """Use the original positive-window vote aggregation."""
+        if len(positive_predictions) < effective_threshold:
+            return "other", 0.0
+
+        class_votes: dict[str, list[float]] = {}
+        for label, confidence in positive_predictions:
+            class_votes.setdefault(label, []).append(confidence)
+        global_label = max(
+            class_votes,
+            key=lambda label: (len(class_votes[label]), np.mean(class_votes[label])),
+        )
+        global_confidence = float(np.mean(class_votes[global_label]))
+        return global_label, global_confidence
+
+    def _aggregate_topk_mean(
+        self,
+        smoothed_scores: list[dict[str, float]],
+        default_min_windows: int,
+    ) -> tuple[str, float]:
+        """Choose the class with the highest mean of its top-k positive windows."""
+        candidates = {}
+        for label in ("humpback", "resident", "transient"):
+            threshold = self.class_thresholds[label]
+            min_windows = self.class_min_windows.get(label, default_min_windows)
+            positive_scores = [
+                float(score[label])
+                for score in smoothed_scores
+                if float(score[label]) >= threshold
+            ]
+            if len(positive_scores) < min_windows:
+                continue
+            top_scores = sorted(positive_scores, reverse=True)[:self.top_k]
+            candidates[label] = (
+                float(np.mean(top_scores)),
+                len(positive_scores),
+            )
+
+        if not candidates:
+            return "other", 0.0
+
+        global_label = max(
+            candidates,
+            key=lambda label: (candidates[label][0], candidates[label][1]),
+        )
+        return global_label, candidates[global_label][0]
+
     def _aggregate(self, scores: list[dict[str, float]]) -> tuple[str, float, list[str], list[float]]:
         smoothed_scores = self._smooth_scores(scores)
         local_labels = []
@@ -414,22 +485,18 @@ class MultiSpeciesWindowPredictor:
             if label != "other":
                 positive_predictions.append((label, float(confidence)))
 
-        total_segments = len(local_labels)
-        scaled_threshold = max(1, (total_segments + SEGMENT_GROUP_SIZE - 1) // SEGMENT_GROUP_SIZE)
-        effective_threshold = min(scaled_threshold, self.min_num_positive_calls_threshold)
+        effective_threshold = self._scaled_min_positive_windows(len(local_labels))
 
-        if len(positive_predictions) >= effective_threshold:
-            class_votes: dict[str, list[float]] = {}
-            for label, confidence in positive_predictions:
-                class_votes.setdefault(label, []).append(confidence)
-            global_label = max(
-                class_votes,
-                key=lambda label: (len(class_votes[label]), np.mean(class_votes[label])),
+        if self.aggregation_mode == "topk_mean":
+            global_label, global_confidence = self._aggregate_topk_mean(
+                smoothed_scores,
+                default_min_windows=effective_threshold,
             )
-            global_confidence = float(np.mean(class_votes[global_label]))
         else:
-            global_label = "other"
-            global_confidence = 0.0
+            global_label, global_confidence = self._aggregate_vote(
+                positive_predictions,
+                effective_threshold,
+            )
 
         return global_label, global_confidence, local_labels, local_confidences
 
@@ -945,12 +1012,60 @@ def main() -> int:
         help="Window inference batch size for the multispecies model.",
     )
     parser.add_argument(
+        "--multispecies-aggregation-mode",
+        choices=["vote", "topk_mean"],
+        default="vote",
+        help=(
+            "60-second aggregation mode for the multispecies model. "
+            "vote keeps the original positive-window majority vote. "
+            "topk_mean scores each class by the mean of its top-k positive "
+            "windows (default: vote)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-top-k",
+        type=int,
+        default=3,
+        help=(
+            "Number of highest positive window scores to average per class when "
+            "using --multispecies-aggregation-mode topk_mean (default: 3)."
+        ),
+    )
+    parser.add_argument(
         "--multispecies-min-positive-windows",
         type=int,
         default=3,
         help=(
             "Cap for the scaled minimum positive-window count used by multispecies "
-            "60-second aggregation (default: 3)."
+            "60-second aggregation. In topk_mean mode this is the default per-class "
+            "minimum unless a class-specific value is set (default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-humpback-min-windows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum positive humpback windows required in topk_mean mode. "
+            "Defaults to the scaled --multispecies-min-positive-windows value."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-resident-min-windows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum positive resident windows required in topk_mean mode. "
+            "Defaults to the scaled --multispecies-min-positive-windows value."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-transient-min-windows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum positive transient windows required in topk_mean mode. "
+            "Defaults to the scaled --multispecies-min-positive-windows value."
         ),
     )
     parser.add_argument(
@@ -1041,6 +1156,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if args.multispecies_top_k <= 0:
+        print(
+            f"Error: --multispecies-top-k must be positive, got {args.multispecies_top_k}",
+            file=sys.stderr,
+        )
+        return 1
     if not 0.0 <= args.multispecies_threshold <= 1.0:
         print(
             f"Error: --multispecies-threshold must be between 0 and 1, got {args.multispecies_threshold}",
@@ -1068,6 +1189,23 @@ def main() -> int:
         if not 0.0 <= threshold <= 1.0:
             print(
                 f"Error: multispecies {label} threshold must be between 0 and 1, got {threshold}",
+                file=sys.stderr,
+            )
+            return 1
+    multispecies_class_min_windows = {
+        "humpback": args.multispecies_humpback_min_windows,
+        "resident": args.multispecies_resident_min_windows,
+        "transient": args.multispecies_transient_min_windows,
+    }
+    multispecies_class_min_windows = {
+        label: value
+        for label, value in multispecies_class_min_windows.items()
+        if value is not None
+    }
+    for label, min_windows in multispecies_class_min_windows.items():
+        if min_windows <= 0:
+            print(
+                f"Error: multispecies {label} minimum windows must be positive, got {min_windows}",
                 file=sys.stderr,
             )
             return 1
@@ -1100,6 +1238,9 @@ def main() -> int:
                     model_path=args.multispecies_model_path,
                     threshold=args.multispecies_threshold,
                     class_thresholds=multispecies_class_thresholds,
+                    aggregation_mode=args.multispecies_aggregation_mode,
+                    top_k=args.multispecies_top_k,
+                    class_min_windows=multispecies_class_min_windows,
                     min_num_positive_calls_threshold=args.multispecies_min_positive_windows,
                     batch_size=args.multispecies_batch_size,
                 )
