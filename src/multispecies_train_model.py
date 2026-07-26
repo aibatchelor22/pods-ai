@@ -26,6 +26,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Optional
@@ -1192,6 +1193,20 @@ def main() -> int:
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hub-model-id", default=None)
     args = parser.parse_args()
+
+    print("\n" + "=" * 72)
+    print("COMMAND LINE")
+    print("=" * 72)
+    print("Raw argv:")
+    print("  " + " ".join(sys.argv))
+    print("Parsed key settings:")
+    print(f"  batch_size={args.batch_size}")
+    print(f"  learning_rate={args.learning_rate:.3e}")
+    print(f"  warmup_ratio={args.warmup_ratio}")
+    print(f"  epochs={args.epochs}")
+    print(f"  output_dir={args.output_dir}")
+    print(f"  resume_from_checkpoint={args.resume_from_checkpoint}")
+    print("=" * 72 + "\n")
 
     save_steps = args.save_steps if args.save_steps is not None else args.eval_steps
     output_dir = resolve_path(args.output_dir)
