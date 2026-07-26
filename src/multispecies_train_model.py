@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from collections import Counter
 from pathlib import Path
@@ -37,6 +38,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError
 from transformers import (  # noqa: E402
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
@@ -198,6 +200,7 @@ class WaveformAugmenter:
         time_shift: bool = False,
         time_shift_prob: float = 1.0,
         max_shift_ms: float = 250.0,
+        time_shift_fade_ms: float = 0.0,
         gaussian_noise: bool = False,
         gaussian_noise_prob: float = 1.0,
         noise_std: float = 0.002,
@@ -211,6 +214,7 @@ class WaveformAugmenter:
         self.time_shift = time_shift
         self.time_shift_prob = time_shift_prob
         self.max_shift = int(sample_rate * max_shift_ms / 1000)
+        self.time_shift_fade = int(sample_rate * time_shift_fade_ms / 1000)
         self.gaussian_noise = gaussian_noise
         self.gaussian_noise_prob = gaussian_noise_prob
         self.noise_std = noise_std
@@ -233,7 +237,11 @@ class WaveformAugmenter:
             elif self.gain_clipping_mode == "soft":
                 audio = np.tanh(audio)
         if self.time_shift and self.max_shift > 0 and random.random() < self.time_shift_prob:
-            audio = np.roll(audio, random.randint(-self.max_shift, self.max_shift))
+            audio = self._zero_pad_shift(
+                audio,
+                random.randint(-self.max_shift, self.max_shift),
+                fade_samples=self.time_shift_fade,
+            )
         if self.gaussian_noise and random.random() < self.gaussian_noise_prob:
             noise_std = self.noise_std
             if self.noise_scale_mode == "rms":
@@ -241,6 +249,43 @@ class WaveformAugmenter:
                 noise_std *= rms
             audio = audio + np.random.normal(0, noise_std, size=audio.shape)
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+    @staticmethod
+    def _zero_pad_shift(
+        audio: np.ndarray,
+        shift: int,
+        fade_samples: int = 0,
+    ) -> np.ndarray:
+        """Shift audio without wrapping; newly exposed samples are silence."""
+        if shift == 0:
+            return audio
+
+        shifted = np.zeros_like(audio)
+        if shift > 0:
+            shifted[shift:] = audio[:-shift]
+            fade_len = min(fade_samples, len(shifted) - shift)
+            if fade_len > 0:
+                shifted[shift : shift + fade_len] *= np.linspace(
+                    0.0,
+                    1.0,
+                    fade_len,
+                    endpoint=True,
+                    dtype=shifted.dtype,
+                )
+        else:
+            shifted[:shift] = audio[-shift:]
+            fade_len = min(fade_samples, len(shifted) + shift)
+            if fade_len > 0:
+                fade_start = len(shifted) + shift - fade_len
+                fade_end = len(shifted) + shift
+                shifted[fade_start:fade_end] *= np.linspace(
+                    1.0,
+                    0.0,
+                    fade_len,
+                    endpoint=True,
+                    dtype=shifted.dtype,
+                )
+        return shifted
 
 
 class DCLDEAudioCollator:
@@ -433,22 +478,51 @@ class MultiTaskASTForDCLDE(nn.Module):
         }
 
 
+def _find_multitask_weights_path(model_dir: Path) -> Optional[Path]:
+    """Return the first supported multi-task checkpoint weight file in a directory."""
+    for filename in ("pytorch_model.bin", "model.safetensors"):
+        weights_path = model_dir / filename
+        if weights_path.exists():
+            return weights_path
+    return None
+
+
+def _download_multitask_weights_path(model_name: str) -> Path:
+    """Download the first supported multi-task checkpoint weight file from the Hub."""
+    errors = []
+    for filename in ("pytorch_model.bin", "model.safetensors"):
+        try:
+            return Path(hf_hub_download(model_name, filename))
+        except EntryNotFoundError as exc:
+            errors.append(f"{filename}: not found")
+        except Exception as exc:
+            errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+    raise FileNotFoundError(
+        f"Could not find/download supported weights for {model_name}. "
+        f"Tried pytorch_model.bin and model.safetensors. Details: {'; '.join(errors)}"
+    )
+
+
 def load_multitask_checkpoint_files(model_name: str) -> Optional[tuple[dict[str, Any], Path]]:
     """Return saved multitask metadata/state paths for local dirs or Hub repos."""
     local_path = Path(model_name)
     if local_path.exists():
         config_path = local_path / "multitask_config.json"
-        weights_path = local_path / "pytorch_model.bin"
-        if config_path.exists() and weights_path.exists():
+        weights_path = _find_multitask_weights_path(local_path)
+        if config_path.exists() and weights_path is not None:
             with config_path.open("r", encoding="utf-8") as file:
                 return json.load(file), weights_path
         return None
 
     try:
         config_path = Path(hf_hub_download(model_name, "multitask_config.json"))
-        weights_path = Path(hf_hub_download(model_name, "pytorch_model.bin"))
-    except Exception:
+    except Exception as exc:
+        print(
+            f"Warning: could not download multitask_config.json from {model_name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return None
+    weights_path = _download_multitask_weights_path(model_name)
 
     with config_path.open("r", encoding="utf-8") as file:
         return json.load(file), weights_path
@@ -500,7 +574,17 @@ def load_training_model(
         species_class_weights=species_class_weights,
         ecotype_class_weights=ecotype_class_weights,
     )
-    state_dict = torch.load(weights_path, map_location="cpu")
+    if weights_path.name.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file as load_safetensors_file
+        except ImportError as exc:
+            raise ImportError(
+                "Loading model.safetensors requires safetensors. "
+                "Install it with: pip install safetensors"
+            ) from exc
+        state_dict = load_safetensors_file(str(weights_path), device="cpu")
+    else:
+        state_dict = torch.load(weights_path, map_location="cpu")
     if isinstance(state_dict, dict) and "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -664,6 +748,7 @@ class LazyAudioTrainer(Trainer):
         self.train_collator = train_collator
         self.eval_collator = eval_collator
         self._final_candidate_evaluated = False
+        self._optimizer_scheduler_reported = False
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
@@ -671,7 +756,7 @@ class LazyAudioTrainer(Trainer):
         sampler = self._get_train_sampler()
         dataloader = DataLoader(
             self.train_dataset,
-            batch_size=self.args.train_batch_size,
+            batch_size=self.args.per_device_train_batch_size,
             sampler=sampler,
             shuffle=sampler is None,
             collate_fn=self.train_collator,
@@ -681,6 +766,32 @@ class LazyAudioTrainer(Trainer):
             persistent_workers=self.args.dataloader_num_workers > 0,
         )
         return self.accelerator.prepare(dataloader)
+
+    def create_optimizer_and_scheduler(self, num_training_steps: int) -> None:
+        """Create optimizer/scheduler and print the actual LR setup once."""
+        super().create_optimizer_and_scheduler(num_training_steps)
+        if self._optimizer_scheduler_reported:
+            return
+        self._optimizer_scheduler_reported = True
+        optimizer_lrs = []
+        if self.optimizer is not None:
+            optimizer_lrs = [
+                float(group.get("lr", 0.0))
+                for group in self.optimizer.param_groups
+            ]
+        scheduler_name = type(self.lr_scheduler).__name__ if self.lr_scheduler is not None else "None"
+        unique_lrs = sorted(set(optimizer_lrs))
+        formatted_lrs = ", ".join(f"{lr:.3e}" for lr in unique_lrs) if unique_lrs else "N/A"
+        print("\n" + "=" * 72)
+        print("OPTIMIZER / SCHEDULER")
+        print("=" * 72)
+        print(f"TrainingArguments learning_rate: {float(self.args.learning_rate):.3e}")
+        print(f"Initial optimizer lr group(s):   {formatted_lrs}")
+        print(f"Scheduler:                       {scheduler_name}")
+        print(f"Scheduler training steps:        {num_training_steps:,}")
+        print(f"Warmup ratio:                    {float(self.args.warmup_ratio):.6g}")
+        print(f"Warmup steps:                    {int(self.args.get_warmup_steps(num_training_steps)):,}")
+        print("=" * 72 + "\n")
 
     def _metric_key_for_best_model(self) -> str:
         """Return the evaluation metric key used by Trainer for best-model selection."""
@@ -736,7 +847,7 @@ class LazyAudioTrainer(Trainer):
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
         dataloader = DataLoader(
             eval_dataset,
-            batch_size=self.args.eval_batch_size,
+            batch_size=self.args.per_device_eval_batch_size,
             sampler=self._get_eval_sampler(eval_dataset),
             collate_fn=self.eval_collator,
             num_workers=self.args.dataloader_num_workers,
@@ -770,6 +881,45 @@ def analyze_dataset(dataset: dict[str, DCLDEAudioDataset]) -> None:
                 continue
             for label_id in sorted(counts):
                 print(f"    {id2label[label_id]:12s}: {counts[label_id]:7d}")
+    print("=" * 72 + "\n")
+
+
+def print_training_geometry(
+    training_args: TrainingArguments,
+    train_rows: int,
+    validation_rows: int,
+) -> None:
+    """Print batch-size and step-count details before training starts."""
+    world_size = max(1, int(getattr(training_args, "world_size", 1)))
+    gradient_accumulation_steps = max(1, int(training_args.gradient_accumulation_steps))
+    per_device_train_batch_size = int(training_args.per_device_train_batch_size)
+    per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
+    train_micro_batch = per_device_train_batch_size * world_size
+    effective_train_batch = train_micro_batch * gradient_accumulation_steps
+    train_batches_per_epoch = math.ceil(train_rows / train_micro_batch) if train_rows else 0
+    optimizer_steps_per_epoch = (
+        math.ceil(train_batches_per_epoch / gradient_accumulation_steps)
+        if train_batches_per_epoch
+        else 0
+    )
+    eval_micro_batch = per_device_eval_batch_size * world_size
+    eval_batches = math.ceil(validation_rows / eval_micro_batch) if validation_rows else 0
+
+    print("\n" + "=" * 72)
+    print("TRAINING GEOMETRY")
+    print("=" * 72)
+    print(f"Per-device train batch size:    {per_device_train_batch_size}")
+    print(f"Per-device eval batch size:     {per_device_eval_batch_size}")
+    print(f"Requested learning rate:        {float(training_args.learning_rate):.3e}")
+    print(f"Warmup ratio:                   {float(training_args.warmup_ratio):.6g}")
+    print(f"World size/device count:        {world_size}")
+    print(f"Gradient accumulation steps:    {gradient_accumulation_steps}")
+    print(f"Train rows:                     {train_rows:,}")
+    print(f"Validation rows:                {validation_rows:,}")
+    print(f"Train dataloader batches/epoch: {train_batches_per_epoch:,}")
+    print(f"Optimizer steps/epoch:          {optimizer_steps_per_epoch:,}")
+    print(f"Effective train batch/update:   {effective_train_batch:,}")
+    print(f"Eval batches/pass:              {eval_batches:,}")
     print("=" * 72 + "\n")
 
 
@@ -873,6 +1023,7 @@ def save_metadata(
             "time_shift": args.time_shift,
             "time_shift_prob": args.time_shift_prob,
             "max_shift_ms": args.max_shift_ms,
+            "time_shift_fade_ms": args.time_shift_fade_ms,
             "gaussian_noise": args.gaussian_noise,
             "gaussian_noise_prob": args.gaussian_noise_prob,
             "noise_std": args.noise_std,
@@ -908,10 +1059,10 @@ def main() -> int:
         help="Existing AST model or Hugging Face model ID to fine-tune.",
     )
     parser.add_argument("--epochs", type=float, default=3.0, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Per-device batch size.")
-    parser.add_argument("--learning-rate", type=float, default=3e-5, help="Learning rate.")
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=8, help="Per-device batch size.")
+    parser.add_argument("--learning-rate", "--learning_rate", type=float, default=3e-5, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay.")
-    parser.add_argument("--warmup-ratio", type=float, default=0.1, help="Warmup ratio.")
+    parser.add_argument("--warmup-ratio", "--warmup_ratio", type=float, default=0.1, help="Warmup ratio.")
     parser.add_argument(
         "--eval-steps",
         type=int,
@@ -1011,6 +1162,15 @@ def main() -> int:
         help="Probability of applying time shift to each training clip when --time-shift is set.",
     )
     parser.add_argument("--max-shift-ms", type=float, default=250.0)
+    parser.add_argument(
+        "--time-shift-fade-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Linear fade duration at the zero-padding boundary for time-shift augmentation. "
+            "Default 0 disables fading."
+        ),
+    )
     parser.add_argument("--gaussian-noise", action="store_true")
     parser.add_argument(
         "--gaussian-noise-prob",
@@ -1045,6 +1205,8 @@ def main() -> int:
     )
     if args.early_stopping_patience is not None and args.early_stopping_patience < 1:
         raise ValueError("--early-stopping-patience must be at least 1 when provided")
+    if args.time_shift_fade_ms < 0:
+        raise ValueError(f"--time-shift-fade-ms must be non-negative, got {args.time_shift_fade_ms}")
 
     kw_class_weights = parse_class_weights(args.kw_class_weights, KW_LABELS, "--kw-class-weights")
     species_class_weights = parse_class_weights(
@@ -1084,6 +1246,7 @@ def main() -> int:
             time_shift=args.time_shift,
             time_shift_prob=args.time_shift_prob,
             max_shift_ms=args.max_shift_ms,
+            time_shift_fade_ms=args.time_shift_fade_ms,
             gaussian_noise=args.gaussian_noise,
             gaussian_noise_prob=args.gaussian_noise_prob,
             noise_std=args.noise_std,
@@ -1095,7 +1258,8 @@ def main() -> int:
             f"time_shift={args.time_shift_prob if args.time_shift else 0.0}, "
             f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}; "
             f"gain_clipping_mode={args.gain_clipping_mode}; "
-            f"noise_scale_mode={args.noise_scale_mode}"
+            f"noise_scale_mode={args.noise_scale_mode}; "
+            f"time_shift_fade_ms={args.time_shift_fade_ms}"
         )
 
     if args.preprocessing_workers is not None:
@@ -1157,6 +1321,11 @@ def main() -> int:
         push_to_hub=args.push_to_hub,
         hub_strategy="all_checkpoints" if args.push_to_hub else "end",
         hub_model_id=args.hub_model_id if args.push_to_hub else None,
+    )
+    print_training_geometry(
+        training_args=training_args,
+        train_rows=len(dataset["train"]),
+        validation_rows=len(dataset["validation"]),
     )
 
     callbacks = []
