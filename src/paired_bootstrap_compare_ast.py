@@ -156,12 +156,7 @@ def combined_metrics_from_arrays(
 
 def make_dataset(frame: pd.DataFrame) -> DCLDEAudioDataset:
     """Build a DCLDEAudioDataset from a labeled manifest frame."""
-    return DCLDEAudioDataset(
-        clip_paths=frame["clip_path"].astype(str).tolist(),
-        kw_labels=frame["kw_labels"].astype(int).tolist(),
-        species_labels=frame["species_labels"].astype(int).tolist(),
-        ecotype_labels=frame["ecotype_labels"].astype(int).tolist(),
-    )
+    return DCLDEAudioDataset(frame.copy())
 
 
 def predict_or_load_cache(
