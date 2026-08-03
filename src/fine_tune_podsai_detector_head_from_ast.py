@@ -17,9 +17,13 @@ model, but its AST backbone has useful acoustic representations.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from functools import partial
 from pathlib import Path
 
+import pandas as pd
 import torch
+from datasets import Audio, ClassLabel, Dataset, DatasetDict
 from transformers import (
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
@@ -36,6 +40,7 @@ except Exception:
 
 
 DEFAULT_DETECTOR_MODEL = "davethaler/whale-call-detector"
+WHALE_CATEGORIES = {"resident", "transient", "humpback"}
 
 
 def resolve_path(path: str) -> Path:
@@ -118,6 +123,62 @@ def print_trainable_parameters(model: torch.nn.Module) -> None:
     print(f"Trainable parameters: {trainable:,} / {total:,}")
 
 
+def load_manifest(manifest_path: str, num_classes: int) -> Dataset:
+    """Load a PODS-AI clip manifest with clip_path and Category columns."""
+    path = resolve_path(manifest_path)
+    df = pd.read_csv(path, low_memory=False)
+
+    required_columns = {"clip_path", "Category"}
+    missing = required_columns - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    df["Category"] = df["Category"].astype(str).str.strip()
+    if num_classes == 2:
+        df["label"] = df["Category"].map(
+            lambda category: base_train.LABEL2ID["whale"]
+            if category in WHALE_CATEGORIES
+            else base_train.LABEL2ID["other"]
+        )
+    else:
+        df = df[df["Category"].isin(base_train.LABEL2ID)].copy()
+        df["label"] = df["Category"].map(base_train.LABEL2ID)
+
+    if df.empty:
+        raise ValueError(f"{path} has no rows compatible with num_classes={num_classes}.")
+
+    dataset = Dataset.from_dict(
+        {
+            "audio": df["clip_path"].astype(str).tolist(),
+            "label": df["label"].astype(int).tolist(),
+        }
+    )
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    dataset = dataset.cast_column(
+        "label",
+        ClassLabel(names=list(base_train.ID2LABEL.values())),
+    )
+    return dataset
+
+
+def analyze_manifest_dataset(dataset: DatasetDict) -> None:
+    """Print class counts for train and validation manifests."""
+    print("\n" + "=" * 60)
+    print("DATASET ANALYSIS")
+    print("=" * 60)
+    for split_name in ("train", "validation"):
+        labels = dataset[split_name]["label"]
+        counts = Counter(labels)
+        print(f"\n{split_name.upper()} split ({len(labels):,} samples):")
+        for class_id in sorted(counts):
+            class_name = base_train.ID2LABEL[class_id]
+            count = counts[class_id]
+            percentage = 100.0 * count / len(labels)
+            print(f"  {class_name:12s}: {count:7d} samples ({percentage:5.1f}%)")
+    print("=" * 60 + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -145,7 +206,8 @@ def main() -> None:
         default=7,
         help="Number of detector classes: 2 or 7 (default: 7).",
     )
-    parser.add_argument("--data-dir", "--data_dir", default="output/wav")
+    parser.add_argument("--train-manifest", "--train_manifest", required=True)
+    parser.add_argument("--val-manifest", "--val_manifest", required=True)
     parser.add_argument("--output-dir", "--output_dir", default="model/podsai_ast_transplant")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", "--batch_size", type=int, default=8)
@@ -175,14 +237,15 @@ def main() -> None:
 
     base_train.setup_label_mappings(args.num_classes)
 
-    data_dir = resolve_path(args.data_dir)
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading dataset from {data_dir}...")
-    dataset = base_train.load_audio_dataset(data_dir, args.num_classes)
+    print("Loading manifests...")
+    train_dataset = load_manifest(args.train_manifest, args.num_classes)
+    val_dataset = load_manifest(args.val_manifest, args.num_classes)
+    dataset = DatasetDict({"train": train_dataset, "validation": val_dataset})
     print(f"Dataset: {dataset}")
-    base_train.analyze_dataset(dataset)
+    analyze_manifest_dataset(dataset)
 
     print(f"Loading feature extractor from detector model: {args.detector_model}")
     feature_extractor = AutoFeatureExtractor.from_pretrained(args.detector_model)
@@ -215,8 +278,15 @@ def main() -> None:
     }
     if preprocessing_workers > 1:
         map_kwargs["num_proc"] = preprocessing_workers
-    dataset = dataset.map(
-        base_train.partial(
+    dataset["train"] = dataset["train"].map(
+        partial(
+            base_train.preprocess_function,
+            feature_extractor=feature_extractor,
+        ),
+        **map_kwargs,
+    )
+    dataset["validation"] = dataset["validation"].map(
+        partial(
             base_train.preprocess_function,
             feature_extractor=feature_extractor,
         ),
@@ -246,7 +316,7 @@ def main() -> None:
         model=target_model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"],
+        eval_dataset=dataset["validation"],
         compute_metrics=base_train.compute_metrics,
     )
 
