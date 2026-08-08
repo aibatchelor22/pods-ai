@@ -40,6 +40,7 @@ from multispecies_train_model import (
     ECOTYPE_LABELS,
     IGNORE_INDEX,
     KW_LABELS,
+    SAMPLE_RATE,
     SPECIES_LABELS,
     load_training_model,
 )
@@ -69,6 +70,24 @@ def safe_model_name(value: str) -> str:
         .replace(":", "_")
         .replace(" ", "_")
     )
+
+
+def preprocessing_cache_suffix(
+    mean_subtract: bool,
+    high_pass_filter: bool,
+    high_pass_cutoff_hz: float,
+    high_pass_order: int,
+) -> str:
+    """Return a cache filename suffix describing waveform preprocessing."""
+    parts = []
+    if mean_subtract:
+        parts.append("mean_subtract")
+    if high_pass_filter:
+        cutoff = f"{high_pass_cutoff_hz:g}".replace(".", "p")
+        parts.append(f"hp{cutoff}hz_o{high_pass_order}")
+    if not parts:
+        return ""
+    return "_" + "_".join(parts)
 
 
 def f1_binary_positive(y_true: np.ndarray, y_pred: np.ndarray, positive_label: int) -> float:
@@ -170,6 +189,10 @@ def predict_or_load_cache(
     dataloader_workers: int,
     device: str,
     reuse_cache: bool,
+    mean_subtract: bool,
+    high_pass_filter: bool,
+    high_pass_cutoff_hz: float,
+    high_pass_order: int,
 ) -> pd.DataFrame:
     """Load a prediction cache or run model inference and write one."""
     if reuse_cache and cache_path.exists():
@@ -200,6 +223,9 @@ def predict_or_load_cache(
         feature_extractor=feature_extractor,
         max_duration=max_duration,
         augmenter=None,
+        mean_subtract=mean_subtract,
+        high_pass_cutoff_hz=high_pass_cutoff_hz if high_pass_filter else None,
+        high_pass_order=high_pass_order,
     )
     dataloader = DataLoader(
         dataset,
@@ -354,6 +380,32 @@ def main() -> int:
     parser.add_argument("--batch-size", "--batch_size", type=int, default=32)
     parser.add_argument("--dataloader-workers", "--dataloader_workers", type=int, default=2)
     parser.add_argument("--max-duration", "--max_duration", type=float, default=DEFAULT_MAX_DURATION)
+    parser.add_argument(
+        "--mean-subtract",
+        "--mean_subtract",
+        action="store_true",
+        help="Subtract each clip's waveform mean before AST feature extraction.",
+    )
+    parser.add_argument(
+        "--high-pass-filter",
+        "--high_pass_filter",
+        action="store_true",
+        help="Apply a Butterworth high-pass filter before AST feature extraction.",
+    )
+    parser.add_argument(
+        "--high-pass-cutoff-hz",
+        "--high_pass_cutoff_hz",
+        type=float,
+        default=50.0,
+        help="High-pass cutoff frequency in Hz when --high-pass-filter is set (default: 50).",
+    )
+    parser.add_argument(
+        "--high-pass-order",
+        "--high_pass_order",
+        type=int,
+        default=4,
+        help="Butterworth high-pass filter order when --high-pass-filter is set (default: 4).",
+    )
     parser.add_argument("--n-bootstrap", "--n_bootstrap", type=int, default=DEFAULT_N_BOOTSTRAP)
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=22)
@@ -370,6 +422,15 @@ def main() -> int:
         raise ValueError("--n-bootstrap must be positive.")
     if not 0.0 < args.confidence < 1.0:
         raise ValueError("--confidence must be between 0 and 1.")
+    if args.high_pass_filter:
+        nyquist = SAMPLE_RATE / 2.0
+        if not 0.0 < args.high_pass_cutoff_hz < nyquist:
+            raise ValueError(
+                f"--high-pass-cutoff-hz must be between 0 and {nyquist}, "
+                f"got {args.high_pass_cutoff_hz}"
+            )
+        if args.high_pass_order < 1:
+            raise ValueError(f"--high-pass-order must be positive, got {args.high_pass_order}")
 
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -384,10 +445,24 @@ def main() -> int:
     print(f"Validation rows: {len(manifest_frame):,}")
     print(f"Device: {device}")
     print(f"Batch size: {args.batch_size}")
+    print(f"Waveform mean subtraction: {'enabled' if args.mean_subtract else 'disabled'}")
+    if args.high_pass_filter:
+        print(
+            "Waveform high-pass filter: "
+            f"enabled, cutoff={args.high_pass_cutoff_hz:g} Hz, order={args.high_pass_order}"
+        )
+    else:
+        print("Waveform high-pass filter: disabled")
     print(f"Bootstrap samples: {args.n_bootstrap:,}")
 
-    cache_a = output_dir / f"{safe_model_name(args.model_a_name)}_prediction_cache.csv"
-    cache_b = output_dir / f"{safe_model_name(args.model_b_name)}_prediction_cache.csv"
+    cache_suffix = preprocessing_cache_suffix(
+        mean_subtract=args.mean_subtract,
+        high_pass_filter=args.high_pass_filter,
+        high_pass_cutoff_hz=args.high_pass_cutoff_hz,
+        high_pass_order=args.high_pass_order,
+    )
+    cache_a = output_dir / f"{safe_model_name(args.model_a_name)}{cache_suffix}_prediction_cache.csv"
+    cache_b = output_dir / f"{safe_model_name(args.model_b_name)}{cache_suffix}_prediction_cache.csv"
 
     scored_a = predict_or_load_cache(
         model_label=f"Model A ({args.model_a_name})",
@@ -399,6 +474,10 @@ def main() -> int:
         dataloader_workers=args.dataloader_workers,
         device=device,
         reuse_cache=args.reuse_cache,
+        mean_subtract=args.mean_subtract,
+        high_pass_filter=args.high_pass_filter,
+        high_pass_cutoff_hz=args.high_pass_cutoff_hz,
+        high_pass_order=args.high_pass_order,
     )
     scored_b = predict_or_load_cache(
         model_label=f"Model B ({args.model_b_name})",
@@ -410,6 +489,10 @@ def main() -> int:
         dataloader_workers=args.dataloader_workers,
         device=device,
         reuse_cache=args.reuse_cache,
+        mean_subtract=args.mean_subtract,
+        high_pass_filter=args.high_pass_filter,
+        high_pass_cutoff_hz=args.high_pass_cutoff_hz,
+        high_pass_order=args.high_pass_order,
     )
 
     arrays_a = extract_prediction_arrays(scored_a)
