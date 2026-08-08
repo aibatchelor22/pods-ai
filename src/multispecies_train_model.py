@@ -35,7 +35,7 @@ import librosa
 import numpy as np
 import pandas as pd
 import torch
-from scipy.signal import butter, sosfilt, sosfiltfilt
+from scipy.signal import butter, lfilter, sosfilt, sosfiltfilt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -207,6 +207,16 @@ class WaveformAugmenter:
         gaussian_noise_prob: float = 1.0,
         noise_std: float = 0.002,
         noise_scale_mode: str = "absolute",
+        random_eq: bool = False,
+        random_eq_prob: float = 0.5,
+        eq_num_bands_min: int = 1,
+        eq_num_bands_max: int = 3,
+        eq_gain_db_min: float = -6.0,
+        eq_gain_db_max: float = 6.0,
+        eq_q_min: float = 0.4,
+        eq_q_max: float = 1.2,
+        eq_freq_min: float = 100.0,
+        eq_freq_max: float = 6000.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.random_gain = random_gain
@@ -221,6 +231,16 @@ class WaveformAugmenter:
         self.gaussian_noise_prob = gaussian_noise_prob
         self.noise_std = noise_std
         self.noise_scale_mode = noise_scale_mode
+        self.random_eq = random_eq
+        self.random_eq_prob = random_eq_prob
+        self.eq_num_bands_min = eq_num_bands_min
+        self.eq_num_bands_max = eq_num_bands_max
+        self.eq_gain_db_min = eq_gain_db_min
+        self.eq_gain_db_max = eq_gain_db_max
+        self.eq_q_min = eq_q_min
+        self.eq_q_max = eq_q_max
+        self.eq_freq_min = eq_freq_min
+        self.eq_freq_max = eq_freq_max
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         audio = audio.astype(np.float32, copy=True)
@@ -244,6 +264,8 @@ class WaveformAugmenter:
                 random.randint(-self.max_shift, self.max_shift),
                 fade_samples=self.time_shift_fade,
             )
+        if self.random_eq and random.random() < self.random_eq_prob:
+            audio = self._random_eq(audio)
         if self.gaussian_noise and random.random() < self.gaussian_noise_prob:
             noise_std = self.noise_std
             if self.noise_scale_mode == "rms":
@@ -288,6 +310,47 @@ class WaveformAugmenter:
                     dtype=shifted.dtype,
                 )
         return shifted
+
+    def _random_eq(self, audio: np.ndarray) -> np.ndarray:
+        """Apply random peaking EQ bands to one waveform."""
+        num_bands = random.randint(self.eq_num_bands_min, self.eq_num_bands_max)
+        output = audio
+        for _ in range(num_bands):
+            frequency_hz = random.uniform(self.eq_freq_min, self.eq_freq_max)
+            gain_db = random.uniform(self.eq_gain_db_min, self.eq_gain_db_max)
+            q = random.uniform(self.eq_q_min, self.eq_q_max)
+            b, a = self._peaking_eq_coefficients(
+                frequency_hz=frequency_hz,
+                gain_db=gain_db,
+                q=q,
+            )
+            output = lfilter(b, a, output).astype(np.float32, copy=False)
+        return output
+
+    def _peaking_eq_coefficients(
+        self,
+        frequency_hz: float,
+        gain_db: float,
+        q: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return RBJ cookbook peaking-EQ biquad coefficients."""
+        frequency_hz = min(max(frequency_hz, 1.0), (self.sample_rate / 2.0) - 1.0)
+        q = max(q, 1e-6)
+        amplitude = 10.0 ** (gain_db / 40.0)
+        omega = 2.0 * np.pi * frequency_hz / self.sample_rate
+        alpha = np.sin(omega) / (2.0 * q)
+        cos_omega = np.cos(omega)
+
+        b0 = 1.0 + alpha * amplitude
+        b1 = -2.0 * cos_omega
+        b2 = 1.0 - alpha * amplitude
+        a0 = 1.0 + alpha / amplitude
+        a1 = -2.0 * cos_omega
+        a2 = 1.0 - alpha / amplitude
+
+        b = np.array([b0 / a0, b1 / a0, b2 / a0], dtype=np.float32)
+        a = np.array([1.0, a1 / a0, a2 / a0], dtype=np.float32)
+        return b, a
 
 
 class DCLDEAudioCollator:
@@ -1071,6 +1134,16 @@ def save_metadata(
             "gaussian_noise_prob": args.gaussian_noise_prob,
             "noise_std": args.noise_std,
             "noise_scale_mode": args.noise_scale_mode,
+            "random_eq": args.random_eq,
+            "random_eq_prob": args.random_eq_prob,
+            "eq_num_bands_min": args.eq_num_bands_min,
+            "eq_num_bands_max": args.eq_num_bands_max,
+            "eq_gain_db_min": args.eq_gain_db_min,
+            "eq_gain_db_max": args.eq_gain_db_max,
+            "eq_q_min": args.eq_q_min,
+            "eq_q_max": args.eq_q_max,
+            "eq_freq_min": args.eq_freq_min,
+            "eq_freq_max": args.eq_freq_max,
         },
         "early_stopping": {
             "enabled": args.early_stopping_patience is not None,
@@ -1263,6 +1336,75 @@ def main() -> int:
             "standard deviation; 'rms' multiplies it by the clip RMS."
         ),
     )
+    parser.add_argument(
+        "--random-eq",
+        "--random_eq",
+        action="store_true",
+        help="Apply randomized peaking-EQ bands to training clips.",
+    )
+    parser.add_argument(
+        "--random-eq-prob",
+        "--random_eq_prob",
+        type=float,
+        default=0.5,
+        help="Probability of applying random EQ to each training clip when --random-eq is set.",
+    )
+    parser.add_argument(
+        "--eq-num-bands-min",
+        "--eq_num_bands_min",
+        type=int,
+        default=1,
+        help="Minimum number of random EQ bands when --random-eq is set.",
+    )
+    parser.add_argument(
+        "--eq-num-bands-max",
+        "--eq_num_bands_max",
+        type=int,
+        default=3,
+        help="Maximum number of random EQ bands when --random-eq is set.",
+    )
+    parser.add_argument(
+        "--eq-gain-db-min",
+        "--eq_gain_db_min",
+        type=float,
+        default=-6.0,
+        help="Minimum random EQ band gain in dB.",
+    )
+    parser.add_argument(
+        "--eq-gain-db-max",
+        "--eq_gain_db_max",
+        type=float,
+        default=6.0,
+        help="Maximum random EQ band gain in dB.",
+    )
+    parser.add_argument(
+        "--eq-q-min",
+        "--eq_q_min",
+        type=float,
+        default=0.4,
+        help="Minimum random EQ band Q value.",
+    )
+    parser.add_argument(
+        "--eq-q-max",
+        "--eq_q_max",
+        type=float,
+        default=1.2,
+        help="Maximum random EQ band Q value.",
+    )
+    parser.add_argument(
+        "--eq-freq-min",
+        "--eq_freq_min",
+        type=float,
+        default=100.0,
+        help="Minimum random EQ band center frequency in Hz.",
+    )
+    parser.add_argument(
+        "--eq-freq-max",
+        "--eq_freq_max",
+        type=float,
+        default=6000.0,
+        help="Maximum random EQ band center frequency in Hz.",
+    )
     parser.add_argument("--resume-from-checkpoint", default=None)
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--hub-model-id", default=None)
@@ -1292,12 +1434,43 @@ def main() -> int:
         args.gaussian_noise_prob,
         "--gaussian-noise-prob",
     )
+    args.random_eq_prob = validate_probability(args.random_eq_prob, "--random-eq-prob")
     if args.early_stopping_patience is not None and args.early_stopping_patience < 1:
         raise ValueError("--early-stopping-patience must be at least 1 when provided")
     if args.time_shift_fade_ms < 0:
         raise ValueError(f"--time-shift-fade-ms must be non-negative, got {args.time_shift_fade_ms}")
+    if args.eq_num_bands_min < 1 or args.eq_num_bands_max < 1:
+        raise ValueError("--eq-num-bands-min and --eq-num-bands-max must be positive")
+    if args.eq_num_bands_min > args.eq_num_bands_max:
+        raise ValueError(
+            "--eq-num-bands-min must be less than or equal to --eq-num-bands-max, "
+            f"got {args.eq_num_bands_min} > {args.eq_num_bands_max}"
+        )
+    if args.eq_gain_db_min > args.eq_gain_db_max:
+        raise ValueError(
+            "--eq-gain-db-min must be less than or equal to --eq-gain-db-max, "
+            f"got {args.eq_gain_db_min} > {args.eq_gain_db_max}"
+        )
+    if args.eq_q_min <= 0.0 or args.eq_q_max <= 0.0:
+        raise ValueError("--eq-q-min and --eq-q-max must be positive")
+    if args.eq_q_min > args.eq_q_max:
+        raise ValueError(
+            "--eq-q-min must be less than or equal to --eq-q-max, "
+            f"got {args.eq_q_min} > {args.eq_q_max}"
+        )
+    nyquist = SAMPLE_RATE / 2.0
+    if args.eq_freq_min <= 0.0 or args.eq_freq_max <= 0.0:
+        raise ValueError("--eq-freq-min and --eq-freq-max must be positive")
+    if args.eq_freq_min > args.eq_freq_max:
+        raise ValueError(
+            "--eq-freq-min must be less than or equal to --eq-freq-max, "
+            f"got {args.eq_freq_min} > {args.eq_freq_max}"
+        )
+    if args.eq_freq_max >= nyquist:
+        raise ValueError(
+            f"--eq-freq-max must be below Nyquist ({nyquist:g} Hz), got {args.eq_freq_max}"
+        )
     if args.high_pass_filter:
-        nyquist = SAMPLE_RATE / 2.0
         if not 0.0 < args.high_pass_cutoff_hz < nyquist:
             raise ValueError(
                 f"--high-pass-cutoff-hz must be between 0 and {nyquist}, "
@@ -1334,7 +1507,7 @@ def main() -> int:
     feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_name)
 
     augmenter = None
-    if args.random_gain or args.time_shift or args.gaussian_noise:
+    if args.random_gain or args.time_shift or args.gaussian_noise or args.random_eq:
         augmenter = WaveformAugmenter(
             sample_rate=SAMPLE_RATE,
             random_gain=args.random_gain,
@@ -1349,16 +1522,35 @@ def main() -> int:
             gaussian_noise_prob=args.gaussian_noise_prob,
             noise_std=args.noise_std,
             noise_scale_mode=args.noise_scale_mode,
+            random_eq=args.random_eq,
+            random_eq_prob=args.random_eq_prob,
+            eq_num_bands_min=args.eq_num_bands_min,
+            eq_num_bands_max=args.eq_num_bands_max,
+            eq_gain_db_min=args.eq_gain_db_min,
+            eq_gain_db_max=args.eq_gain_db_max,
+            eq_q_min=args.eq_q_min,
+            eq_q_max=args.eq_q_max,
+            eq_freq_min=args.eq_freq_min,
+            eq_freq_max=args.eq_freq_max,
         )
         print(
             "Training augmentation probabilities: "
             f"random_gain={args.random_gain_prob if args.random_gain else 0.0}, "
             f"time_shift={args.time_shift_prob if args.time_shift else 0.0}, "
-            f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}; "
+            f"gaussian_noise={args.gaussian_noise_prob if args.gaussian_noise else 0.0}, "
+            f"random_eq={args.random_eq_prob if args.random_eq else 0.0}; "
             f"gain_clipping_mode={args.gain_clipping_mode}; "
             f"noise_scale_mode={args.noise_scale_mode}; "
             f"time_shift_fade_ms={args.time_shift_fade_ms}"
         )
+        if args.random_eq:
+            print(
+                "Random EQ settings: "
+                f"bands={args.eq_num_bands_min}-{args.eq_num_bands_max}, "
+                f"gain_db={args.eq_gain_db_min:g}..{args.eq_gain_db_max:g}, "
+                f"q={args.eq_q_min:g}..{args.eq_q_max:g}, "
+                f"freq_hz={args.eq_freq_min:g}..{args.eq_freq_max:g}"
+            )
 
     if args.preprocessing_workers is not None:
         print("--preprocessing-workers is deprecated and ignored; use --dataloader-workers.")
