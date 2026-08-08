@@ -297,10 +297,12 @@ class DCLDEAudioCollator:
         feature_extractor: Any,
         max_duration: float,
         augmenter: Optional[WaveformAugmenter] = None,
+        mean_subtract: bool = False,
     ) -> None:
         self.feature_extractor = feature_extractor
         self.target_length = int(max_duration * SAMPLE_RATE)
         self.augmenter = augmenter
+        self.mean_subtract = mean_subtract
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         processed_audio = []
@@ -317,6 +319,8 @@ class DCLDEAudioCollator:
                 audio = np.pad(audio, (0, self.target_length - len(audio)), mode="constant")
 
             audio = audio.astype(np.float32, copy=False)
+            if self.mean_subtract:
+                audio = audio - float(audio.mean())
             if self.augmenter is not None:
                 audio = self.augmenter(audio)
             processed_audio.append(audio)
@@ -1017,6 +1021,7 @@ def save_metadata(
             ),
         },
         "augmentation": {
+            "mean_subtract": args.mean_subtract,
             "random_gain": args.random_gain,
             "random_gain_prob": args.random_gain_prob,
             "gain_db": args.gain_db,
@@ -1137,6 +1142,15 @@ def main() -> int:
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--drop-unknown-labels", action="store_true")
+    parser.add_argument(
+        "--mean-subtract",
+        "--mean_subtract",
+        action="store_true",
+        help=(
+            "Subtract each loaded clip's waveform mean before augmentation and "
+            "AST feature extraction. Useful for removing DC offset."
+        ),
+    )
     parser.add_argument("--random-gain", action="store_true")
     parser.add_argument(
         "--random-gain-prob",
@@ -1279,6 +1293,7 @@ def main() -> int:
 
     if args.preprocessing_workers is not None:
         print("--preprocessing-workers is deprecated and ignored; use --dataloader-workers.")
+    print(f"Waveform mean subtraction: {'enabled' if args.mean_subtract else 'disabled'}")
     print(
         "Using lazy audio preprocessing: features are generated per batch "
         f"with {args.dataloader_workers} dataloader worker(s)."
@@ -1287,11 +1302,13 @@ def main() -> int:
         feature_extractor=feature_extractor,
         max_duration=args.max_duration,
         augmenter=augmenter,
+        mean_subtract=args.mean_subtract,
     )
     eval_collator = DCLDEAudioCollator(
         feature_extractor=feature_extractor,
         max_duration=args.max_duration,
         augmenter=None,
+        mean_subtract=args.mean_subtract,
     )
 
     print(f"Loading multi-task AST model from {args.model_name}")
