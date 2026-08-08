@@ -35,6 +35,7 @@ import librosa
 import numpy as np
 import pandas as pd
 import torch
+from scipy.signal import butter, sosfilt, sosfiltfilt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -298,11 +299,42 @@ class DCLDEAudioCollator:
         max_duration: float,
         augmenter: Optional[WaveformAugmenter] = None,
         mean_subtract: bool = False,
+        high_pass_cutoff_hz: Optional[float] = None,
+        high_pass_order: int = 4,
     ) -> None:
         self.feature_extractor = feature_extractor
         self.target_length = int(max_duration * SAMPLE_RATE)
         self.augmenter = augmenter
         self.mean_subtract = mean_subtract
+        self.high_pass_cutoff_hz = high_pass_cutoff_hz
+        self.high_pass_order = high_pass_order
+        self.high_pass_sos: Optional[np.ndarray] = None
+        if high_pass_cutoff_hz is not None:
+            nyquist = SAMPLE_RATE / 2.0
+            if not 0.0 < high_pass_cutoff_hz < nyquist:
+                raise ValueError(
+                    f"high_pass_cutoff_hz must be between 0 and {nyquist}, "
+                    f"got {high_pass_cutoff_hz}"
+                )
+            if high_pass_order < 1:
+                raise ValueError(f"high_pass_order must be positive, got {high_pass_order}")
+            self.high_pass_sos = butter(
+                high_pass_order,
+                high_pass_cutoff_hz,
+                btype="highpass",
+                fs=SAMPLE_RATE,
+                output="sos",
+            )
+
+    def _high_pass_filter(self, audio: np.ndarray) -> np.ndarray:
+        """Apply configured high-pass filter to one waveform."""
+        if self.high_pass_sos is None:
+            return audio
+        try:
+            filtered = sosfiltfilt(self.high_pass_sos, audio)
+        except ValueError:
+            filtered = sosfilt(self.high_pass_sos, audio)
+        return filtered.astype(np.float32, copy=False)
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         processed_audio = []
@@ -321,6 +353,8 @@ class DCLDEAudioCollator:
             audio = audio.astype(np.float32, copy=False)
             if self.mean_subtract:
                 audio = audio - float(audio.mean())
+            if self.high_pass_sos is not None:
+                audio = self._high_pass_filter(audio)
             if self.augmenter is not None:
                 audio = self.augmenter(audio)
             processed_audio.append(audio)
@@ -1022,6 +1056,9 @@ def save_metadata(
         },
         "augmentation": {
             "mean_subtract": args.mean_subtract,
+            "high_pass_filter": args.high_pass_filter,
+            "high_pass_cutoff_hz": args.high_pass_cutoff_hz,
+            "high_pass_order": args.high_pass_order,
             "random_gain": args.random_gain,
             "random_gain_prob": args.random_gain_prob,
             "gain_db": args.gain_db,
@@ -1151,6 +1188,29 @@ def main() -> int:
             "AST feature extraction. Useful for removing DC offset."
         ),
     )
+    parser.add_argument(
+        "--high-pass-filter",
+        "--high_pass_filter",
+        action="store_true",
+        help=(
+            "Apply a Butterworth high-pass filter to each loaded clip before "
+            "augmentation and AST feature extraction."
+        ),
+    )
+    parser.add_argument(
+        "--high-pass-cutoff-hz",
+        "--high_pass_cutoff_hz",
+        type=float,
+        default=50.0,
+        help="High-pass cutoff frequency in Hz when --high-pass-filter is set (default: 50).",
+    )
+    parser.add_argument(
+        "--high-pass-order",
+        "--high_pass_order",
+        type=int,
+        default=4,
+        help="Butterworth high-pass filter order when --high-pass-filter is set (default: 4).",
+    )
     parser.add_argument("--random-gain", action="store_true")
     parser.add_argument(
         "--random-gain-prob",
@@ -1236,6 +1296,15 @@ def main() -> int:
         raise ValueError("--early-stopping-patience must be at least 1 when provided")
     if args.time_shift_fade_ms < 0:
         raise ValueError(f"--time-shift-fade-ms must be non-negative, got {args.time_shift_fade_ms}")
+    if args.high_pass_filter:
+        nyquist = SAMPLE_RATE / 2.0
+        if not 0.0 < args.high_pass_cutoff_hz < nyquist:
+            raise ValueError(
+                f"--high-pass-cutoff-hz must be between 0 and {nyquist}, "
+                f"got {args.high_pass_cutoff_hz}"
+            )
+        if args.high_pass_order < 1:
+            raise ValueError(f"--high-pass-order must be positive, got {args.high_pass_order}")
 
     kw_class_weights = parse_class_weights(args.kw_class_weights, KW_LABELS, "--kw-class-weights")
     species_class_weights = parse_class_weights(
@@ -1294,6 +1363,13 @@ def main() -> int:
     if args.preprocessing_workers is not None:
         print("--preprocessing-workers is deprecated and ignored; use --dataloader-workers.")
     print(f"Waveform mean subtraction: {'enabled' if args.mean_subtract else 'disabled'}")
+    if args.high_pass_filter:
+        print(
+            "Waveform high-pass filter: "
+            f"enabled, cutoff={args.high_pass_cutoff_hz:g} Hz, order={args.high_pass_order}"
+        )
+    else:
+        print("Waveform high-pass filter: disabled")
     print(
         "Using lazy audio preprocessing: features are generated per batch "
         f"with {args.dataloader_workers} dataloader worker(s)."
@@ -1303,12 +1379,16 @@ def main() -> int:
         max_duration=args.max_duration,
         augmenter=augmenter,
         mean_subtract=args.mean_subtract,
+        high_pass_cutoff_hz=args.high_pass_cutoff_hz if args.high_pass_filter else None,
+        high_pass_order=args.high_pass_order,
     )
     eval_collator = DCLDEAudioCollator(
         feature_extractor=feature_extractor,
         max_duration=args.max_duration,
         augmenter=None,
         mean_subtract=args.mean_subtract,
+        high_pass_cutoff_hz=args.high_pass_cutoff_hz if args.high_pass_filter else None,
+        high_pass_order=args.high_pass_order,
     )
 
     print(f"Loading multi-task AST model from {args.model_name}")
