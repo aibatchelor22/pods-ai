@@ -1180,6 +1180,15 @@ def main() -> int:
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay.")
     parser.add_argument("--warmup-ratio", "--warmup_ratio", type=float, default=0.1, help="Warmup ratio.")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help=(
+            "Random seed for model initialization, dataloader shuffling, and Trainer-controlled "
+            "randomness. Change this between fresh one-epoch runs to change the sample order."
+        ),
+    )
+    parser.add_argument(
         "--eval-steps",
         type=int,
         default=20000,
@@ -1419,6 +1428,7 @@ def main() -> int:
     print(f"  batch_size={args.batch_size}")
     print(f"  learning_rate={args.learning_rate:.3e}")
     print(f"  warmup_ratio={args.warmup_ratio}")
+    print(f"  seed={args.seed}")
     print(f"  epochs={args.epochs}")
     print(f"  output_dir={args.output_dir}")
     print(f"  resume_from_checkpoint={args.resume_from_checkpoint}")
@@ -1614,6 +1624,8 @@ def main() -> int:
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.epochs,
         warmup_ratio=args.warmup_ratio,
+        seed=args.seed,
+        data_seed=args.seed,
         fp16=torch.cuda.is_available(),
         load_best_model_at_end=True,
         metric_for_best_model="combined_score",
