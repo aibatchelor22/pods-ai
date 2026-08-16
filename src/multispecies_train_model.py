@@ -1092,6 +1092,7 @@ def save_metadata(
         "model_type": "podsai_dclde_multitask_ast",
         "base_model": base_model_name,
         "source_model": args.model_name,
+        "lr_scheduler_type": args.lr_scheduler_type,
         "kw_label2id": KW_LABELS,
         "kw_id2label": KW_ID2LABEL,
         "species_label2id": SPECIES_LABELS,
@@ -1177,6 +1178,12 @@ def main() -> int:
     parser.add_argument("--epochs", type=float, default=3.0, help="Number of training epochs.")
     parser.add_argument("--batch-size", "--batch_size", type=int, default=8, help="Per-device batch size.")
     parser.add_argument("--learning-rate", "--learning_rate", type=float, default=3e-5, help="Learning rate.")
+    parser.add_argument(
+        "--lr-scheduler-type",
+        choices=("linear", "constant_with_warmup", "cosine"),
+        default="linear",
+        help="Learning-rate scheduler type (default: linear).",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay.")
     parser.add_argument("--warmup-ratio", "--warmup_ratio", type=float, default=0.1, help="Warmup ratio.")
     parser.add_argument(
@@ -1427,6 +1434,7 @@ def main() -> int:
     print("Parsed key settings:")
     print(f"  batch_size={args.batch_size}")
     print(f"  learning_rate={args.learning_rate:.3e}")
+    print(f"  lr_scheduler_type={args.lr_scheduler_type}")
     print(f"  warmup_ratio={args.warmup_ratio}")
     print(f"  seed={args.seed}")
     print(f"  epochs={args.epochs}")
@@ -1619,6 +1627,7 @@ def main() -> int:
         save_total_limit=args.save_total_limit,
         logging_steps=args.logging_steps,
         learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
         weight_decay=args.weight_decay,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
