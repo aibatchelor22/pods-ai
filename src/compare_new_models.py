@@ -40,6 +40,7 @@ from transformers import AutoFeatureExtractor
 from run_inference import run_inference
 from multispecies_train_model import (
     ECOTYPE_LABELS,
+    KW_LABELS,
     SAMPLE_RATE,
     SPECIES_LABELS,
     load_multitask_checkpoint_files,
@@ -304,8 +305,8 @@ class MultiSpeciesWindowPredictor:
     def __init__(
         self,
         model_path: str,
-        threshold: float = 0.25,
-        class_thresholds: Optional[dict[str, float]] = None,
+        kw_threshold: float = 0.5,
+        humpback_threshold: float = 0.25,
         aggregation_mode: str = "vote",
         top_k: int = 3,
         class_min_windows: Optional[dict[str, int]] = None,
@@ -316,13 +317,8 @@ class MultiSpeciesWindowPredictor:
         device: Optional[str] = None,
     ) -> None:
         self.model_path = model_path
-        self.threshold = threshold
-        self.class_thresholds = {
-            label: threshold
-            for label in ("humpback", "resident", "transient")
-        }
-        if class_thresholds:
-            self.class_thresholds.update(class_thresholds)
+        self.kw_threshold = kw_threshold
+        self.humpback_threshold = humpback_threshold
         self.aggregation_mode = aggregation_mode
         self.top_k = top_k
         self.class_min_windows = class_min_windows or {}
@@ -336,10 +332,7 @@ class MultiSpeciesWindowPredictor:
         print(f"Using device: {self.device}")
         print(
             "Multi-species thresholds: "
-            + ", ".join(
-                f"{label}={self.class_thresholds[label]:.3f}"
-                for label in ("humpback", "resident", "transient")
-            )
+            f"KW={self.kw_threshold:.3f}, humpback={self.humpback_threshold:.3f}"
         )
         print(f"Multi-species aggregation: {self.aggregation_mode}")
         if self.aggregation_mode == "topk_mean":
@@ -386,20 +379,44 @@ class MultiSpeciesWindowPredictor:
             windows.append(segment.astype(np.float32, copy=False))
         return windows
 
-    @staticmethod
     def _comparison_scores(
+        self,
+        kw_probs: np.ndarray,
         species_probs: np.ndarray,
         ecotype_probs: np.ndarray,
     ) -> dict[str, float]:
-        species_kw = float(species_probs[SPECIES_LABELS["KW"]])
+        kw_confidence = float(kw_probs[KW_LABELS["kw"]])
+        if kw_confidence >= self.kw_threshold:
+            srkw_probability = float(ecotype_probs[ECOTYPE_LABELS["SRKW"]])
+            tkw_probability = float(ecotype_probs[ECOTYPE_LABELS["TKW"]])
+            restricted_total = srkw_probability + tkw_probability
+            if restricted_total > 0.0:
+                srkw_probability /= restricted_total
+                tkw_probability /= restricted_total
+            else:
+                srkw_probability = tkw_probability = 0.5
+
+            if srkw_probability >= tkw_probability:
+                return {
+                    "humpback": 0.0,
+                    "resident": kw_confidence * srkw_probability,
+                    "transient": 0.0,
+                }
+            return {
+                "humpback": 0.0,
+                "resident": 0.0,
+                "transient": kw_confidence * tkw_probability,
+            }
+
         return {
             "humpback": float(species_probs[SPECIES_LABELS["HW"]]),
-            "resident": species_kw * float(ecotype_probs[ECOTYPE_LABELS["SRKW"]]),
-            "transient": species_kw * float(ecotype_probs[ECOTYPE_LABELS["TKW"]]),
+            "resident": 0.0,
+            "transient": 0.0,
         }
 
     @staticmethod
     def _smooth_scores(scores: list[dict[str, float]]) -> list[dict[str, float]]:
+        """Smooth confidence without changing a window's gated class."""
         if not scores:
             return []
         smoothed = []
@@ -408,8 +425,17 @@ class MultiSpeciesWindowPredictor:
                 smoothed.append(current)
                 continue
             previous = scores[idx - 1]
+            current_label = max(current, key=current.get)
+            previous_label = max(previous, key=previous.get)
+            if current_label != previous_label:
+                smoothed.append(current)
+                continue
             smoothed.append({
-                label: (previous[label] + current[label]) / 2.0
+                label: (
+                    (previous[label] + current[label]) / 2.0
+                    if label == current_label
+                    else current[label]
+                )
                 for label in current
             })
         return smoothed
@@ -446,12 +472,15 @@ class MultiSpeciesWindowPredictor:
         """Choose the class with the highest mean of its top-k positive windows."""
         candidates = {}
         for label in ("humpback", "resident", "transient"):
-            threshold = self.class_thresholds[label]
             min_windows = self.class_min_windows.get(label, default_min_windows)
             positive_scores = [
                 float(score[label])
                 for score in smoothed_scores
-                if float(score[label]) >= threshold
+                if (
+                    float(score[label]) >= self.humpback_threshold
+                    if label == "humpback"
+                    else float(score[label]) > 0.0
+                )
             ]
             if len(positive_scores) < min_windows:
                 continue
@@ -478,7 +507,7 @@ class MultiSpeciesWindowPredictor:
 
         for score in smoothed_scores:
             label, confidence = max(score.items(), key=lambda item: item[1])
-            if confidence < self.class_thresholds[label]:
+            if label == "humpback" and confidence < self.humpback_threshold:
                 label = "other"
             local_labels.append(label)
             local_confidences.append(float(confidence))
@@ -517,11 +546,18 @@ class MultiSpeciesWindowPredictor:
                 )
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
                 outputs = self.model(**inputs)
-                _, species_logits, ecotype_logits = outputs["logits"]
+                kw_logits, species_logits, ecotype_logits = outputs["logits"]
+                kw_probs = torch.softmax(kw_logits, dim=-1).cpu().numpy()
                 species_probs = torch.softmax(species_logits, dim=-1).cpu().numpy()
                 ecotype_probs = torch.softmax(ecotype_logits, dim=-1).cpu().numpy()
-                for species_row, ecotype_row in zip(species_probs, ecotype_probs):
-                    window_scores.append(self._comparison_scores(species_row, ecotype_row))
+                for kw_row, species_row, ecotype_row in zip(
+                    kw_probs,
+                    species_probs,
+                    ecotype_probs,
+                ):
+                    window_scores.append(
+                        self._comparison_scores(kw_row, species_row, ecotype_row)
+                    )
 
         global_label, global_confidence, local_labels, local_confidences = self._aggregate(window_scores)
         return {
@@ -969,40 +1005,21 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "--multispecies-threshold",
+        "--multispecies-kw-threshold",
         type=float,
-        default=0.25,
+        default=0.5,
         help=(
-            "Minimum mapped window confidence for multispecies HW/SRKW/TKW "
-            "windows to count as positive when a class-specific threshold is "
-            "not set (default: 0.25)."
+            "Minimum binary KW-head probability required to classify a window "
+            "as resident/SRKW or transient/TKW (default: 0.5)."
         ),
     )
     parser.add_argument(
         "--multispecies-humpback-threshold",
         type=float,
-        default=None,
+        default=0.25,
         help=(
             "Minimum mapped window confidence for multispecies humpback/HW "
-            "windows to count as positive. Defaults to --multispecies-threshold."
-        ),
-    )
-    parser.add_argument(
-        "--multispecies-resident-threshold",
-        type=float,
-        default=None,
-        help=(
-            "Minimum mapped window confidence for multispecies resident/SRKW "
-            "windows to count as positive. Defaults to --multispecies-threshold."
-        ),
-    )
-    parser.add_argument(
-        "--multispecies-transient-threshold",
-        type=float,
-        default=None,
-        help=(
-            "Minimum mapped window confidence for multispecies transient/TKW "
-            "windows to count as positive. Defaults to --multispecies-threshold."
+            "windows to count as positive (default: 0.25)."
         ),
     )
     parser.add_argument(
@@ -1162,36 +1179,20 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    if not 0.0 <= args.multispecies_threshold <= 1.0:
+    if not 0.0 <= args.multispecies_kw_threshold <= 1.0:
         print(
-            f"Error: --multispecies-threshold must be between 0 and 1, got {args.multispecies_threshold}",
+            "Error: --multispecies-kw-threshold must be between 0 and 1, "
+            f"got {args.multispecies_kw_threshold}",
             file=sys.stderr,
         )
         return 1
-    multispecies_class_thresholds = {
-        "humpback": (
-            args.multispecies_humpback_threshold
-            if args.multispecies_humpback_threshold is not None
-            else args.multispecies_threshold
-        ),
-        "resident": (
-            args.multispecies_resident_threshold
-            if args.multispecies_resident_threshold is not None
-            else args.multispecies_threshold
-        ),
-        "transient": (
-            args.multispecies_transient_threshold
-            if args.multispecies_transient_threshold is not None
-            else args.multispecies_threshold
-        ),
-    }
-    for label, threshold in multispecies_class_thresholds.items():
-        if not 0.0 <= threshold <= 1.0:
-            print(
-                f"Error: multispecies {label} threshold must be between 0 and 1, got {threshold}",
-                file=sys.stderr,
-            )
-            return 1
+    if not 0.0 <= args.multispecies_humpback_threshold <= 1.0:
+        print(
+            "Error: --multispecies-humpback-threshold must be between 0 and 1, "
+            f"got {args.multispecies_humpback_threshold}",
+            file=sys.stderr,
+        )
+        return 1
     multispecies_class_min_windows = {
         "humpback": args.multispecies_humpback_min_windows,
         "resident": args.multispecies_resident_min_windows,
@@ -1236,8 +1237,8 @@ def main() -> int:
             if multispecies_predictor is None:
                 multispecies_predictor = MultiSpeciesWindowPredictor(
                     model_path=args.multispecies_model_path,
-                    threshold=args.multispecies_threshold,
-                    class_thresholds=multispecies_class_thresholds,
+                    kw_threshold=args.multispecies_kw_threshold,
+                    humpback_threshold=args.multispecies_humpback_threshold,
                     aggregation_mode=args.multispecies_aggregation_mode,
                     top_k=args.multispecies_top_k,
                     class_min_windows=multispecies_class_min_windows,
