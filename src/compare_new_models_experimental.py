@@ -1,0 +1,1644 @@
+#!/usr/bin/env python3
+# Copyright (c) PODS-AI contributors
+# SPDX-License-Identifier: MIT
+"""
+Compare multiple models on a test set of audio samples, including the
+DCLDE multi-species AST model trained by multispecies_train_model.py.
+
+Usage:
+    python compare_models.py [options]
+
+Loads a test set from testing_60s_samples.csv, then runs each enabled model
+(fastai, orcahello, oldpodsai (Wav2Vec2)), podsai (AST) on the corresponding
+60-second WAV files and reports correct identifications, whale-class F1, and
+per-whale-class false-positive/false-negative rates per model.
+
+A "correct" identification means:
+  - For fastai and orcahello, model predicted "resident" (SRKW) when the label is
+    "resident", or anything other than "resident" when the label is not "resident".
+  - For podsai and oldpodsai, the predicted category exactly matches the label.
+
+For each whale class X (resident, transient, humpback):
+  - X false positives are samples predicted as X when the correct label was not X.
+  - X false negatives are samples whose correct label is X but the model predicted something else.
+"""
+
+import argparse
+import csv
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import librosa
+import numpy as np
+import torch
+from transformers import AutoFeatureExtractor
+
+from run_inference import run_inference
+from multispecies_train_model import (
+    ECOTYPE_LABELS,
+    KW_LABELS,
+    SAMPLE_RATE,
+    SPECIES_LABELS,
+    load_multitask_checkpoint_files,
+    load_training_model,
+)
+
+RESIDENT_LABEL = "resident"
+WHALE_CLASS_NAMES = {"humpback", "resident", "transient"}
+BACKGROUND_COMPARISON_LABEL = "other/background"
+SUMMARY_LABELS = [
+    ("resident", "R"),
+    ("transient", "T"),
+    ("humpback", "H"),
+]
+MATRIX_CELL_PADDING = 2
+PODSAI_MODEL_ID = "davethaler/whale-call-detector"
+MULTISPECIES_MODEL_ID = "aibatchelor22/multi_species_detector_epoch_1"
+# renovate: datasource=git-refs depName=https://huggingface.co/davethaler/whale-call-detector versioning=git.
+PODSAI_MODEL_REVISION = "db51f75da131de0e53e8080a1f2c5f4b534810aa"
+OLD_PODSAI_MODEL_REVISION = "cef82c6e9ee661646ea0c583aeb68f4f7ec6d9d8"
+# Maps user-facing model names to inference backends. oldpodsai reuses podsai
+# inference with a different pinned model revision.
+MODEL_TYPE_TO_INFERENCE_TYPE = {
+    "fastai": "fastai",
+    "orcahello": "orcahello",
+    "oldpodsai": "podsai",
+    "podsai": "podsai",
+    "multispecies": "multispecies",
+}
+SEGMENT_GROUP_SIZE = 10
+COMPARISON_LABELS = ("humpback", "transient", "resident", BACKGROUND_COMPARISON_LABEL)
+
+
+@dataclass
+class TestSample:
+    """A single detection row used as a test sample."""
+
+    category: str
+    node_name: str
+    timestamp: str
+    uri: str
+    description: str
+    notes: str
+
+
+@dataclass
+class ModelResult:
+    """Accumulated results for a single model across all test samples."""
+
+    model_type: str
+    total: int = 0
+    correct: int = 0
+    false_positives: int = 0
+    false_negatives: int = 0
+    skipped: int = 0
+    predict_times: list[float] = field(default_factory=list)
+    # Maps actual_label -> {predicted_label -> count} for each evaluated sample.
+    confusion_matrix: dict[str, dict[str, int]] = field(default_factory=dict)
+    resident_diagnostics: list[dict[str, object]] = field(default_factory=list)
+
+    @property
+    def evaluated(self) -> int:
+        """Number of samples actually evaluated (not skipped)."""
+        return self.total - self.skipped
+
+    @property
+    def accuracy(self) -> Optional[float]:
+        """Fraction of evaluated samples correctly identified."""
+        if self.evaluated == 0:
+            return None
+        return self.correct / self.evaluated
+
+    @property
+    def false_positive_rate(self) -> Optional[float]:
+        """Fraction of evaluated samples that are false positives."""
+        if self.evaluated == 0:
+            return None
+        return self.false_positives / self.evaluated
+
+    @property
+    def false_negative_rate(self) -> Optional[float]:
+        """Fraction of evaluated samples that are false negatives."""
+        if self.evaluated == 0:
+            return None
+        return self.false_negatives / self.evaluated
+
+    @property
+    def avg_predict_time(self) -> Optional[float]:
+        """Average time in seconds spent in predict() method per WAV file."""
+        if not self.predict_times:
+            return None
+        return sum(self.predict_times) / len(self.predict_times)
+
+    @property
+    def whale_f1(self) -> Optional[float]:
+        """Macro F1 across whale classes present in the confusion matrix."""
+        whale_labels = sorted(
+            label
+            for label in _labels_seen_in_confusion_matrix(self.confusion_matrix)
+            if label in WHALE_CLASS_NAMES
+        )
+        if not whale_labels:
+            return None
+
+        f1_scores = []
+        for label in whale_labels:
+            true_positives = self.confusion_matrix.get(label, {}).get(label, 0)
+            false_positives = sum(
+                predicted_counts.get(label, 0)
+                for actual_label, predicted_counts in self.confusion_matrix.items()
+                if actual_label != label
+            )
+            false_negatives = sum(
+                count
+                for predicted_label, count in self.confusion_matrix.get(label, {}).items()
+                if predicted_label != label
+            )
+
+            precision_denominator = true_positives + false_positives
+            recall_denominator = true_positives + false_negatives
+            precision = (
+                true_positives / precision_denominator
+                if precision_denominator else 0.0
+            )
+            recall = (
+                true_positives / recall_denominator
+                if recall_denominator else 0.0
+            )
+            if precision + recall == 0:
+                f1_scores.append(0.0)
+            else:
+                f1_scores.append((2 * precision * recall) / (precision + recall))
+
+        return sum(f1_scores) / len(f1_scores)
+
+    def actual_count_for_label(self, label: str) -> int:
+        """Return how many evaluated samples have the given ground-truth label."""
+        return sum(self.confusion_matrix.get(label, {}).values())
+
+    def false_positive_count_for_label(self, label: str) -> int:
+        """Return the number of evaluated samples incorrectly predicted as the given label."""
+        return sum(
+            predicted_counts.get(label, 0)
+            for actual_label, predicted_counts in self.confusion_matrix.items()
+            if actual_label != label
+        )
+
+    def false_negative_count_for_label(self, label: str) -> int:
+        """Return the number of evaluated samples with the given label predicted as something else."""
+        return sum(
+            count
+            for predicted_label, count in self.confusion_matrix.get(label, {}).items()
+            if predicted_label != label
+        )
+
+    def false_positive_rate_for_label(self, label: str) -> Optional[float]:
+        """Return the fraction of non-label samples incorrectly predicted as the given label.
+
+        Returns None when there are no evaluated samples whose actual label differs from
+        the given label.
+        """
+        negative_count = self.evaluated - self.actual_count_for_label(label)
+        if negative_count == 0:
+            return None
+        return self.false_positive_count_for_label(label) / negative_count
+
+    def false_negative_rate_for_label(self, label: str) -> Optional[float]:
+        """Return the fraction of actual label samples predicted as something else.
+
+        Returns None when there are no evaluated samples whose actual label matches the
+        given label.
+        """
+        actual_count = self.actual_count_for_label(label)
+        if actual_count == 0:
+            return None
+        return self.false_negative_count_for_label(label) / actual_count
+
+
+def load_test_samples(testing_csv: Path, max_samples: Optional[int] = None,
+                      category_filter: Optional[str] = None) -> list[TestSample]:
+    """
+    Load test samples from testing_60s_samples.csv.
+
+    Args:
+        testing_csv: Path to testing_60s_samples.csv.
+        max_samples: Maximum number of samples to load. If None, load all samples.
+        category_filter: If specified, only load samples matching this category.
+                        If None, load samples from all categories.
+
+    Returns:
+        List of TestSample objects, or an empty list on error.
+    """
+    samples = []
+    try:
+        with open(testing_csv, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                category = row.get("Category", "")
+
+                # Skip if category filter is specified and doesn't match.
+                if category_filter is not None and category != category_filter:
+                    continue
+
+                samples.append(TestSample(
+                    category=category,
+                    node_name=row.get("NodeName", ""),
+                    timestamp=row.get("Timestamp", ""),
+                    uri=row.get("URI", ""),
+                    description=row.get("Description", ""),
+                    notes=row.get("Notes", ""),
+                ))
+
+                # Stop if we've reached the maximum.
+                if max_samples is not None and len(samples) >= max_samples:
+                    break
+
+    except (OSError, csv.Error, UnicodeDecodeError) as e:
+        print(f"Error reading {testing_csv}: {e}", file=sys.stderr)
+    return samples
+
+
+def find_wav_file(sample: TestSample, wav_dir: Path) -> Optional[Path]:
+    """
+    Find the 60-second WAV file for a testing sample.
+
+    WAV files are saved by download_wavs.py as:
+        <wav_dir>/<category>/<node_name_with_dashes>_<timestamp>.wav
+
+    Args:
+        sample: The testing sample.
+        wav_dir: Root directory of testing WAV files.
+
+    Returns:
+        Path to the WAV file, or None if not found.
+    """
+    node_name_in_filename = sample.node_name.replace("_", "-")
+    wav_filename = f"{node_name_in_filename}_{sample.timestamp}.wav"
+    wav_path = wav_dir / sample.category / wav_filename
+    if wav_path.exists():
+        return wav_path
+    return None
+
+
+def load_multispecies_feature_extractor(model_name: str):
+    """Load feature extractor from a multi-species repo, falling back to its base AST."""
+    try:
+        return AutoFeatureExtractor.from_pretrained(model_name)
+    except Exception as first_error:
+        checkpoint = load_multitask_checkpoint_files(model_name)
+        if checkpoint is None:
+            raise first_error
+        metadata, _ = checkpoint
+        base_model = metadata.get("base_model")
+        if not base_model:
+            raise first_error
+        print(f"Feature extractor not found in {model_name}; using base model {base_model}.")
+        return AutoFeatureExtractor.from_pretrained(base_model)
+
+
+class MultiSpeciesWindowPredictor:
+    """Run 60-second sliding-window comparison inference for the multi-species model."""
+
+    def __init__(
+        self,
+        model_path: str,
+        kw_threshold: float = 0.5,
+        humpback_threshold: float = 0.25,
+        resident_threshold: float = 0.25,
+        transient_threshold: float = 0.25,
+        ecotype_margin: float = 0.0,
+        aggregation_mode: str = "vote",
+        top_k: int = 3,
+        class_min_windows: Optional[dict[str, int]] = None,
+        segment_duration: float = 3.0,
+        hop_duration: float = 2.0,
+        min_num_positive_calls_threshold: int = 3,
+        batch_size: int = 16,
+        device: Optional[str] = None,
+    ) -> None:
+        self.model_path = model_path
+        self.kw_threshold = kw_threshold
+        self.humpback_threshold = humpback_threshold
+        self.resident_threshold = resident_threshold
+        self.transient_threshold = transient_threshold
+        self.ecotype_margin = ecotype_margin
+        self.aggregation_mode = aggregation_mode
+        self.top_k = top_k
+        self.class_min_windows = class_min_windows or {}
+        self.segment_duration = segment_duration
+        self.hop_duration = hop_duration
+        self.min_num_positive_calls_threshold = min_num_positive_calls_threshold
+        self.batch_size = batch_size
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        print(f"Loading multi-species comparison model: {model_path}")
+        print(f"Using device: {self.device}")
+        print(
+            "Multi-species thresholds: "
+            f"KW gate={self.kw_threshold:.3f}, "
+            f"humpback={self.humpback_threshold:.3f}, "
+            f"resident={self.resident_threshold:.3f}, "
+            f"transient={self.transient_threshold:.3f}, "
+            f"ecotype margin={self.ecotype_margin:.3f}"
+        )
+        print(f"Multi-species aggregation: {self.aggregation_mode}")
+        if self.aggregation_mode == "topk_mean":
+            print(
+                f"Multi-species top-k: {self.top_k}; minimum windows: "
+                + ", ".join(
+                    f"{label}={self.class_min_windows.get(label, 'scaled')}"
+                    for label in ("humpback", "resident", "transient")
+                )
+            )
+        self.feature_extractor = load_multispecies_feature_extractor(model_path)
+        if load_multitask_checkpoint_files(model_path) is None:
+            raise ValueError(
+                f"{model_path!r} does not look like a multispecies_train_model.py checkpoint. "
+                "Expected multitask_config.json plus pytorch_model.bin or model.safetensors. "
+                "If you used snapshot_download, pass --multispecies-model-path /path/to/local/snapshot."
+            )
+        self.model = load_training_model(
+            model_name=model_path,
+            dropout=0.0,
+            kw_loss_weight=1.0,
+            species_loss_weight=1.0,
+            ecotype_loss_weight=1.0,
+            freeze_backbone=False,
+        )
+        self.model.to(self.device)
+        self.model.eval()
+
+    def _window_audio(self, audio: np.ndarray) -> list[np.ndarray]:
+        segment_samples = int(self.segment_duration * SAMPLE_RATE)
+        hop_samples = int(self.hop_duration * SAMPLE_RATE)
+        audio_duration = len(audio) / SAMPLE_RATE
+        num_positions = int(np.floor((audio_duration - self.segment_duration) / self.hop_duration)) + 1
+        if num_positions < 1:
+            num_positions = 1
+
+        windows = []
+        for pos_idx in range(num_positions):
+            start = pos_idx * hop_samples
+            end = min(start + segment_samples, len(audio))
+            segment = audio[start:end]
+            if len(segment) < segment_samples:
+                segment = np.pad(segment, (0, segment_samples - len(segment)), mode="constant")
+            windows.append(segment.astype(np.float32, copy=False))
+        return windows
+
+    @staticmethod
+    def _raw_comparison_scores(
+        kw_probs: np.ndarray,
+        species_probs: np.ndarray,
+        ecotype_probs: np.ndarray,
+    ) -> dict[str, float]:
+        """Return ungated window scores for resident-detection diagnostics."""
+        kw_score = float(kw_probs[KW_LABELS["kw"]])
+        srkw_score = float(ecotype_probs[ECOTYPE_LABELS["SRKW"]])
+        tkw_score = float(ecotype_probs[ECOTYPE_LABELS["TKW"]])
+        restricted_total = srkw_score + tkw_score
+        if restricted_total > 0.0:
+            srkw_conditional_score = srkw_score / restricted_total
+            tkw_conditional_score = tkw_score / restricted_total
+        else:
+            srkw_conditional_score = tkw_conditional_score = 0.5
+
+        return {
+            "humpback_score": float(species_probs[SPECIES_LABELS["HW"]]),
+            "kw_score": kw_score,
+            "species_kw_score": float(species_probs[SPECIES_LABELS["KW"]]),
+            "srkw_conditional_score": srkw_conditional_score,
+            "tkw_conditional_score": tkw_conditional_score,
+            "resident_score": kw_score * srkw_conditional_score,
+            "transient_score": kw_score * tkw_conditional_score,
+        }
+
+    def _comparison_scores(
+        self,
+        kw_probs: np.ndarray,
+        species_probs: np.ndarray,
+        ecotype_probs: np.ndarray,
+    ) -> dict[str, float]:
+        no_detection = {"humpback": 0.0, "resident": 0.0, "transient": 0.0}
+        raw_scores = self._raw_comparison_scores(kw_probs, species_probs, ecotype_probs)
+        kw_confidence = raw_scores["kw_score"]
+        if kw_confidence >= self.kw_threshold:
+            srkw_probability = raw_scores["srkw_conditional_score"]
+            tkw_probability = raw_scores["tkw_conditional_score"]
+
+            if abs(srkw_probability - tkw_probability) < self.ecotype_margin:
+                return no_detection
+
+            resident_score = raw_scores["resident_score"]
+            transient_score = raw_scores["transient_score"]
+            if srkw_probability >= tkw_probability:
+                if resident_score < self.resident_threshold:
+                    return no_detection
+                return {
+                    "humpback": 0.0,
+                    "resident": resident_score,
+                    "transient": 0.0,
+                }
+            if transient_score < self.transient_threshold:
+                return no_detection
+            return {
+                "humpback": 0.0,
+                "resident": 0.0,
+                "transient": transient_score,
+            }
+
+        humpback_score = raw_scores["humpback_score"]
+        if humpback_score < self.humpback_threshold:
+            return no_detection
+        return {
+            "humpback": humpback_score,
+            "resident": 0.0,
+            "transient": 0.0,
+        }
+
+    def _aggregate_diagnostic_scores(
+        self,
+        window_diagnostics: list[dict[str, float]],
+    ) -> dict[str, object]:
+        """Average raw fields over the top-k resident-score windows before gates."""
+        if not window_diagnostics:
+            return {}
+
+        score_names = (
+            "humpback_score",
+            "kw_score",
+            "species_kw_score",
+            "srkw_conditional_score",
+            "tkw_conditional_score",
+            "resident_score",
+            "transient_score",
+        )
+        diagnostic_top_k = min(self.top_k, len(window_diagnostics))
+        top_window_indices = sorted(
+            range(len(window_diagnostics)),
+            key=lambda index: window_diagnostics[index]["resident_score"],
+            reverse=True,
+        )[:diagnostic_top_k]
+        aggregated: dict[str, object] = {
+            name: float(np.mean([
+                window_diagnostics[index][name]
+                for index in top_window_indices
+            ]))
+            for name in score_names
+        }
+        top_window_index = top_window_indices[0]
+        kw_gate_windows = [
+            window for window in window_diagnostics
+            if window["kw_score"] >= self.kw_threshold
+        ]
+        srkw_favored_windows = [
+            window for window in kw_gate_windows
+            if window["srkw_conditional_score"] >= window["tkw_conditional_score"]
+        ]
+        margin_pass_windows = [
+            window for window in srkw_favored_windows
+            if abs(
+                window["srkw_conditional_score"] - window["tkw_conditional_score"]
+            ) >= self.ecotype_margin
+        ]
+        resident_threshold_windows = [
+            window for window in margin_pass_windows
+            if window["resident_score"] >= self.resident_threshold
+        ]
+        default_required_windows = self._scaled_min_positive_windows(
+            len(window_diagnostics)
+        )
+        aggregated.update({
+            "diagnostic_top_k": diagnostic_top_k,
+            "top_window_index": top_window_index,
+            "top_window_time": top_window_index * self.hop_duration,
+            "num_windows": len(window_diagnostics),
+            "kw_gate_pass_windows": len(kw_gate_windows),
+            "srkw_favored_windows": len(srkw_favored_windows),
+            "ecotype_margin_pass_windows": len(margin_pass_windows),
+            "resident_threshold_pass_windows": len(resident_threshold_windows),
+            "resident_required_windows": self.class_min_windows.get(
+                "resident", default_required_windows
+            ),
+            "kw_gate_threshold": self.kw_threshold,
+            "resident_threshold": self.resident_threshold,
+            "ecotype_margin": self.ecotype_margin,
+        })
+        return aggregated
+
+    @staticmethod
+    def _smooth_scores(scores: list[dict[str, float]]) -> list[dict[str, float]]:
+        """Smooth confidence without changing a window's gated class."""
+        if not scores:
+            return []
+        smoothed = []
+        for idx, current in enumerate(scores):
+            if max(current.values()) <= 0.0 or idx == 0 or idx == len(scores) - 1:
+                smoothed.append(current)
+                continue
+            previous = scores[idx - 1]
+            current_label = max(current, key=current.get)
+            previous_label = max(previous, key=previous.get)
+            if current_label != previous_label:
+                smoothed.append(current)
+                continue
+            smoothed.append({
+                label: (
+                    (previous[label] + current[label]) / 2.0
+                    if label == current_label
+                    else current[label]
+                )
+                for label in current
+            })
+        return smoothed
+
+    def _scaled_min_positive_windows(self, total_segments: int) -> int:
+        """Return the existing scaled minimum positive-window requirement."""
+        scaled_threshold = max(1, (total_segments + SEGMENT_GROUP_SIZE - 1) // SEGMENT_GROUP_SIZE)
+        return min(scaled_threshold, self.min_num_positive_calls_threshold)
+
+    def _aggregate_vote(
+        self,
+        positive_predictions: list[tuple[str, float]],
+        effective_threshold: int,
+    ) -> tuple[str, float]:
+        """Use the original positive-window vote aggregation."""
+        if len(positive_predictions) < effective_threshold:
+            return "other", 0.0
+
+        class_votes: dict[str, list[float]] = {}
+        for label, confidence in positive_predictions:
+            class_votes.setdefault(label, []).append(confidence)
+        global_label = max(
+            class_votes,
+            key=lambda label: (len(class_votes[label]), np.mean(class_votes[label])),
+        )
+        global_confidence = float(np.mean(class_votes[global_label]))
+        return global_label, global_confidence
+
+    def _aggregate_topk_mean(
+        self,
+        smoothed_scores: list[dict[str, float]],
+        default_min_windows: int,
+    ) -> tuple[str, float]:
+        """Choose the class with the highest mean of its top-k positive windows."""
+        candidates = {}
+        for label in ("humpback", "resident", "transient"):
+            min_windows = self.class_min_windows.get(label, default_min_windows)
+            positive_scores = [
+                float(score[label])
+                for score in smoothed_scores
+                if (
+                    float(score[label]) >= self.humpback_threshold
+                    if label == "humpback"
+                    else float(score[label]) > 0.0
+                )
+            ]
+            if len(positive_scores) < min_windows:
+                continue
+            top_scores = sorted(positive_scores, reverse=True)[:self.top_k]
+            candidates[label] = (
+                float(np.mean(top_scores)),
+                len(positive_scores),
+            )
+
+        if not candidates:
+            return "other", 0.0
+
+        global_label = max(
+            candidates,
+            key=lambda label: (candidates[label][0], candidates[label][1]),
+        )
+        return global_label, candidates[global_label][0]
+
+    def _aggregate(self, scores: list[dict[str, float]]) -> tuple[str, float, list[str], list[float]]:
+        smoothed_scores = self._smooth_scores(scores)
+        local_labels = []
+        local_confidences = []
+        positive_predictions = []
+
+        for score in smoothed_scores:
+            label, confidence = max(score.items(), key=lambda item: item[1])
+            if label == "humpback" and confidence < self.humpback_threshold:
+                label = "other"
+            local_labels.append(label)
+            local_confidences.append(float(confidence))
+            if label != "other":
+                positive_predictions.append((label, float(confidence)))
+
+        effective_threshold = self._scaled_min_positive_windows(len(local_labels))
+
+        if self.aggregation_mode == "topk_mean":
+            global_label, global_confidence = self._aggregate_topk_mean(
+                smoothed_scores,
+                default_min_windows=effective_threshold,
+            )
+        else:
+            global_label, global_confidence = self._aggregate_vote(
+                positive_predictions,
+                effective_threshold,
+            )
+
+        return global_label, global_confidence, local_labels, local_confidences
+
+    def predict(self, wav_path: Path) -> dict[str, object]:
+        start_time = time.perf_counter()
+        audio, _ = librosa.load(str(wav_path), sr=SAMPLE_RATE, mono=True)
+        windows = self._window_audio(audio)
+
+        window_scores: list[dict[str, float]] = []
+        window_diagnostics: list[dict[str, float]] = []
+        with torch.inference_mode():
+            for batch_start in range(0, len(windows), self.batch_size):
+                batch_audio = windows[batch_start:batch_start + self.batch_size]
+                inputs = self.feature_extractor(
+                    batch_audio,
+                    sampling_rate=SAMPLE_RATE,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                inputs = {key: value.to(self.device) for key, value in inputs.items()}
+                outputs = self.model(**inputs)
+                kw_logits, species_logits, ecotype_logits = outputs["logits"]
+                kw_probs = torch.softmax(kw_logits, dim=-1).cpu().numpy()
+                species_probs = torch.softmax(species_logits, dim=-1).cpu().numpy()
+                ecotype_probs = torch.softmax(ecotype_logits, dim=-1).cpu().numpy()
+                for kw_row, species_row, ecotype_row in zip(
+                    kw_probs,
+                    species_probs,
+                    ecotype_probs,
+                ):
+                    window_diagnostics.append(
+                        self._raw_comparison_scores(kw_row, species_row, ecotype_row)
+                    )
+                    window_scores.append(
+                        self._comparison_scores(kw_row, species_row, ecotype_row)
+                    )
+
+        global_label, global_confidence, local_labels, local_confidences = self._aggregate(window_scores)
+        return {
+            "global_prediction_label": global_label,
+            "global_confidence": global_confidence,
+            "local_prediction_labels": local_labels,
+            "local_confidences": local_confidences,
+            "hop_duration": self.hop_duration,
+            "segment_duration": self.segment_duration,
+            "prethreshold_diagnostics": self._aggregate_diagnostic_scores(
+                window_diagnostics
+            ),
+            "predict_time": time.perf_counter() - start_time,
+        }
+
+
+def is_resident_prediction(global_prediction_label: str, model_type: str) -> bool:
+    """
+    Determine whether a model's prediction corresponds to "resident" (SRKW).
+
+    All model types (fastai, orcahello, oldpodsai, podsai) use "resident" as the
+    positive class label, so the check is the same regardless of model type.
+
+    Args:
+        global_prediction_label: The model's predicted class label.
+        model_type: The model type ('fastai', 'orcahello', or 'podsai').
+
+    Returns:
+        True if the prediction is "resident"; False otherwise.
+    """
+    return global_prediction_label == RESIDENT_LABEL
+
+
+def is_exact_match_model(model_type: str) -> bool:
+    """Return True when a model uses exact-category matching for correctness."""
+    return model_type in {"podsai", "oldpodsai", "multispecies"}
+
+
+def normalize_multispecies_comparison_label(label: str) -> str:
+    """Map raw labels into the four multispecies comparison-matrix buckets."""
+    return label if label in WHALE_CLASS_NAMES else BACKGROUND_COMPARISON_LABEL
+
+
+def is_correct_prediction(actual_label: str, predicted_label: str, model_type: str) -> bool:
+    """Return whether a prediction should count toward the Correct column.
+
+    Args:
+        actual_label: Ground-truth category for the sample.
+        predicted_label: Model-predicted category for the sample.
+        model_type: Model family used to interpret correctness.
+
+    Returns:
+        True when the prediction is correct under the model-specific summary rules.
+    """
+    if model_type == "multispecies":
+        if actual_label in WHALE_CLASS_NAMES:
+            return predicted_label == actual_label
+        return predicted_label not in WHALE_CLASS_NAMES
+    if is_exact_match_model(model_type):
+        return predicted_label == actual_label
+    return is_resident_prediction(predicted_label, model_type) == (actual_label == RESIDENT_LABEL)
+
+
+def _labels_seen_in_confusion_matrix(confusion_matrix: dict[str, dict[str, int]]) -> set[str]:
+    """Return all labels that appear as actual or predicted in a confusion matrix.
+
+    Args:
+        confusion_matrix: Mapping of actual labels to per-predicted-label counts.
+
+    Returns:
+        Set of unique labels appearing either as actual labels or predicted labels.
+    """
+    labels = set(confusion_matrix)
+    for predicted_counts in confusion_matrix.values():
+        labels.update(predicted_counts)
+    return labels
+
+
+def evaluate_model(
+    model_type: str,
+    model_path: Optional[str],
+    samples: list[TestSample],
+    wav_dir: Path,
+    model_revision: Optional[str] = None,
+    result_model_type: Optional[str] = None,
+) -> ModelResult:
+    """
+    Run a model against all test samples and accumulate results.
+
+    Args:
+        model_type: One of 'fastai', 'orcahello', 'oldpodsai', or 'podsai'.
+                    'oldpodsai' is mapped to 'podsai' inference internally.
+        model_path: Path to the model (or HuggingFace Hub model ID).
+        samples: List of testing samples.
+        wav_dir: Root directory containing testing WAV files.
+        model_revision: Git commit hash to pin the HuggingFace Hub model revision.
+                        Only used when model_path is a Hub model ID (not a local path).
+        result_model_type: Optional display name to store in ModelResult.model_type.
+                           If omitted, model_type is used.
+
+    Returns:
+        ModelResult with counts of correct, false positive, and false negative predictions,
+        plus timing information for predict() calls.
+    """
+    result = ModelResult(model_type=result_model_type or model_type, total=len(samples))
+
+    for sample in samples:
+        wav_path = find_wav_file(sample, wav_dir)
+        if wav_path is None:
+            print(
+                f"  [{model_type}] Skipping {sample.category}/{sample.node_name}"
+                f"/{sample.timestamp}: WAV not found"
+            )
+            result.skipped += 1
+            continue
+
+        expected_resident = (sample.category == RESIDENT_LABEL)
+
+        try:
+            inference_result = run_inference(str(wav_path), model_type=model_type,
+                                             model_path=model_path,
+                                             model_revision=model_revision)
+            predict_time = inference_result.get("predict_time", 0.0)
+            result.predict_times.append(predict_time)
+        except Exception as e:
+            print(f"  [{model_type}] Error on {wav_path.name}: {e}")
+            result.skipped += 1
+            continue
+
+        predicted_label = inference_result.get("global_prediction_label", "")
+        predicted_resident = is_resident_prediction(predicted_label, model_type)
+
+        if is_correct_prediction(sample.category, predicted_label, model_type):
+            result.correct += 1
+            status = "correct"
+        elif predicted_resident and not expected_resident:
+            result.false_positives += 1
+            status = "false_positive"
+        elif expected_resident and not predicted_resident:
+            result.false_negatives += 1
+            status = "false_negative"
+        else:
+            status = "incorrect"
+
+        # Update per-class confusion matrix.
+        actual_label = sample.category
+        if actual_label not in result.confusion_matrix:
+            result.confusion_matrix[actual_label] = {}
+        preds = result.confusion_matrix[actual_label]
+        preds[predicted_label] = preds.get(predicted_label, 0) + 1
+
+        print(
+            f"  [{model_type}] {sample.category}/{sample.node_name}/{sample.timestamp}: "
+            f"predicted={predicted_label!r} -> {status} ({predict_time:.2f}s)"
+        )
+
+    return result
+
+
+def evaluate_multispecies_model(
+    predictor: MultiSpeciesWindowPredictor,
+    samples: list[TestSample],
+    wav_dir: Path,
+    resident_report_path: Optional[Path] = None,
+) -> ModelResult:
+    """Evaluate the multi-species model with the same summary table labels."""
+    result = ModelResult(model_type="multispecies", total=len(samples))
+
+    for sample in samples:
+        wav_path = find_wav_file(sample, wav_dir)
+        if wav_path is None:
+            print(
+                f"  [multispecies] Skipping {sample.category}/{sample.node_name}"
+                f"/{sample.timestamp}: WAV not found"
+            )
+            result.skipped += 1
+            continue
+
+        expected_resident = sample.category == RESIDENT_LABEL
+        try:
+            inference_result = predictor.predict(wav_path)
+            predict_time = float(inference_result.get("predict_time", 0.0))
+            result.predict_times.append(predict_time)
+        except Exception as e:
+            print(f"  [multispecies] Error on {wav_path.name}: {e}")
+            result.skipped += 1
+            continue
+
+        predicted_label = normalize_multispecies_comparison_label(
+            str(inference_result.get("global_prediction_label", ""))
+        )
+        actual_label = normalize_multispecies_comparison_label(sample.category)
+        predicted_resident = is_resident_prediction(predicted_label, "multispecies")
+
+        if is_correct_prediction(sample.category, predicted_label, "multispecies"):
+            result.correct += 1
+            status = "correct"
+        elif predicted_resident and not expected_resident:
+            result.false_positives += 1
+            status = "false_positive"
+        elif expected_resident and not predicted_resident:
+            result.false_negatives += 1
+            status = "false_negative"
+        else:
+            status = "incorrect"
+
+        result.confusion_matrix.setdefault(actual_label, {})
+        preds = result.confusion_matrix[actual_label]
+        preds[predicted_label] = preds.get(predicted_label, 0) + 1
+
+        if sample.category == RESIDENT_LABEL:
+            diagnostics = inference_result.get("prethreshold_diagnostics", {})
+            if isinstance(diagnostics, dict) and diagnostics:
+                result.resident_diagnostics.append({
+                    "actual_label": sample.category,
+                    "predicted_label": predicted_label,
+                    "outcome_group": resident_outcome_group(predicted_label),
+                    "sample": f"{sample.node_name}/{sample.timestamp}",
+                    **diagnostics,
+                })
+                result.resident_diagnostics[-1]["likely_reason"] = (
+                    resident_diagnostic_reason(result.resident_diagnostics[-1])
+                )
+
+        print(
+            f"  [multispecies] {sample.category}/{sample.node_name}/{sample.timestamp}: "
+            f"predicted={predicted_label!r} -> {status} ({predict_time:.2f}s)"
+        )
+
+    print_resident_diagnostics(result.resident_diagnostics)
+    if resident_report_path is not None:
+        write_resident_diagnostics_report(
+            result.resident_diagnostics,
+            resident_report_path,
+        )
+    return result
+
+
+def resident_outcome_group(predicted_label: str) -> str:
+    """Map a resident clip prediction into one of the requested report groups."""
+    if predicted_label == "resident":
+        return "resident -> resident"
+    if predicted_label == "transient":
+        return "resident -> transient"
+    return "resident -> other/background"
+
+
+def resident_diagnostic_reason(record: dict[str, object]) -> str:
+    """Identify the first resident decision stage that rejected a clip."""
+    predicted_label = str(record["predicted_label"])
+    if predicted_label == "resident":
+        return "resident_detected"
+    if predicted_label == "transient":
+        return "tkw_selected"
+    if int(record["kw_gate_pass_windows"]) == 0:
+        return "low_kw_score"
+    if int(record["srkw_favored_windows"]) == 0:
+        return "high_kw_but_low_srkw_support"
+    if int(record["ecotype_margin_pass_windows"]) == 0:
+        return "ecotype_margin_failed"
+    if int(record["resident_threshold_pass_windows"]) == 0:
+        return "resident_threshold_failed"
+    if int(record["resident_threshold_pass_windows"]) < int(
+        record["resident_required_windows"]
+    ):
+        return "insufficient_resident_windows"
+    return "aggregation_selected_other_class"
+
+
+RESIDENT_REPORT_FIELDS = (
+    "outcome_group",
+    "likely_reason",
+    "sample",
+    "actual_label",
+    "predicted_label",
+    "humpback_score",
+    "kw_score",
+    "species_kw_score",
+    "srkw_conditional_score",
+    "tkw_conditional_score",
+    "resident_score",
+    "transient_score",
+    "top_window_index",
+    "top_window_time",
+    "diagnostic_top_k",
+    "num_windows",
+    "kw_gate_pass_windows",
+    "srkw_favored_windows",
+    "ecotype_margin_pass_windows",
+    "resident_threshold_pass_windows",
+    "resident_required_windows",
+    "kw_gate_threshold",
+    "resident_threshold",
+    "ecotype_margin",
+)
+
+
+def write_resident_diagnostics_report(
+    diagnostics: list[dict[str, object]],
+    report_path: Path,
+) -> None:
+    """Write resident diagnostics as CSV or grouped plain text."""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    if report_path.suffix.lower() == ".csv":
+        with report_path.open("w", newline="", encoding="utf-8") as report_file:
+            writer = csv.DictWriter(
+                report_file,
+                fieldnames=RESIDENT_REPORT_FIELDS,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(diagnostics)
+    else:
+        with report_path.open("w", encoding="utf-8") as report_file:
+            report_file.write("Resident clip diagnostics before gating/thresholding\n")
+            report_file.write(
+                "Scores are means over the top-k raw resident-score windows.\n"
+            )
+            for group_name in (
+                "resident -> resident",
+                "resident -> transient",
+                "resident -> other/background",
+            ):
+                records = [
+                    record for record in diagnostics
+                    if record["outcome_group"] == group_name
+                ]
+                report_file.write(f"\n{group_name} ({len(records)})\n")
+                for record in records:
+                    report_file.write(
+                        f"  sample={record['sample']} pred={record['predicted_label']} "
+                        f"reason={record['likely_reason']} "
+                        f"humpback={float(record['humpback_score']):.4f} "
+                        f"kw={float(record['kw_score']):.4f} "
+                        f"species_KW={float(record['species_kw_score']):.4f} "
+                        f"srkw_cond={float(record['srkw_conditional_score']):.4f} "
+                        f"tkw_cond={float(record['tkw_conditional_score']):.4f} "
+                        f"resident={float(record['resident_score']):.4f} "
+                        f"transient={float(record['transient_score']):.4f} "
+                        f"KW_windows={int(record['kw_gate_pass_windows'])}/"
+                        f"{int(record['num_windows'])} "
+                        f"SRKW_windows={int(record['srkw_favored_windows'])} "
+                        f"margin_windows={int(record['ecotype_margin_pass_windows'])} "
+                        f"resident_threshold_windows="
+                        f"{int(record['resident_threshold_pass_windows'])}/"
+                        f"{int(record['resident_required_windows'])} "
+                        f"top_window={int(record['top_window_index'])}"
+                        f"@{float(record['top_window_time']):.1f}s\n"
+                    )
+    print(f"Resident diagnostics report saved to: {report_path}")
+
+
+def print_resident_diagnostics(diagnostics: list[dict[str, object]]) -> None:
+    """Print pre-threshold resident diagnostics grouped by final prediction."""
+    if not diagnostics:
+        return
+
+    print()
+    print("Resident clip diagnostics before gating/thresholding")
+    print(
+        "Scores are means over the top-k raw resident-score windows; "
+        "top window is the highest raw resident-score window (zero-based index)."
+    )
+    groups = (
+        ("resident -> resident", lambda pred: pred == "resident"),
+        ("resident -> transient", lambda pred: pred == "transient"),
+        (
+            "resident -> other/background",
+            lambda pred: pred not in {"resident", "transient"},
+        ),
+    )
+    for group_name, belongs_to_group in groups:
+        records = [
+            record
+            for record in diagnostics
+            if belongs_to_group(str(record["predicted_label"]))
+        ]
+        print(f"\n{group_name} ({len(records)})")
+        for record in records:
+            print(
+                f"  sample={record['sample']} "
+                f"actual={record['actual_label']} pred={record['predicted_label']} "
+                f"reason={record['likely_reason']} "
+                f"humpback={float(record['humpback_score']):.4f} "
+                f"kw={float(record['kw_score']):.4f} "
+                f"species_KW={float(record['species_kw_score']):.4f} "
+                f"srkw_cond={float(record['srkw_conditional_score']):.4f} "
+                f"tkw_cond={float(record['tkw_conditional_score']):.4f} "
+                f"resident={float(record['resident_score']):.4f} "
+                f"transient={float(record['transient_score']):.4f} "
+                f"top_window={int(record['top_window_index'])}"
+                f"@{float(record['top_window_time']):.1f}s "
+                f"top_k={int(record['diagnostic_top_k'])}"
+            )
+
+
+def print_confusion_matrix(result: ModelResult) -> None:
+    """
+    Print a per-class confusion matrix for a single model result.
+
+    Rows are actual (ground-truth) labels; columns are predicted labels.
+    Only labels with at least one non-zero entry in their row (for actuals) or
+    column (for predicted) are shown; all-zero rows and columns are omitted.
+
+    Args:
+        result: ModelResult whose confusion_matrix to display.
+    """
+    matrix = result.confusion_matrix
+    if not matrix:
+        return
+
+    # Collect actual labels (rows) that have at least one non-zero prediction.
+    actual_labels = sorted(
+        actual for actual in matrix
+        if any(count > 0 for count in matrix[actual].values())
+    )
+
+    # Collect predicted labels (columns) that have at least one non-zero count.
+    predicted_labels = sorted(
+        set(
+            predicted
+            for preds in matrix.values()
+            for predicted, count in preds.items()
+            if count > 0
+        )
+    )
+
+    if not actual_labels or not predicted_labels:
+        return
+
+    row_totals = {actual: sum(matrix.get(actual, {}).values()) for actual in actual_labels}
+    all_labels = sorted(set(actual_labels) | set(predicted_labels))
+    widest_total = max(len("total"), max(len(str(total)) for total in row_totals.values()))
+    col_width = max(max(len(label) for label in predicted_labels), widest_total) + MATRIX_CELL_PADDING
+    row_label_width = max(len(label) for label in all_labels) + MATRIX_CELL_PADDING
+
+    print(f"Confusion Matrix for {result.model_type} (rows=actual, cols=predicted):")
+    print(f"{'':>{row_label_width}}", end="")
+    for label in predicted_labels:
+        print(f"{label:>{col_width}}", end="")
+    print(f"{'total':>{col_width}}", end="")
+    print()
+
+    for actual in actual_labels:
+        print(f"{actual:>{row_label_width}}", end="")
+        for predicted in predicted_labels:
+            count = matrix.get(actual, {}).get(predicted, 0)
+            print(f"{count:>{col_width}}", end="")
+        print(f"{row_totals[actual]:>{col_width}}", end="")
+        print()
+
+
+def print_multispecies_confusion_matrix(result: ModelResult) -> None:
+    """Print the multispecies matrix over humpback/transient/resident/background."""
+    matrix = result.confusion_matrix
+    if not matrix:
+        return
+
+    labels = [label for label in COMPARISON_LABELS if (
+        sum(matrix.get(label, {}).values()) > 0
+        or any(preds.get(label, 0) > 0 for preds in matrix.values())
+    )]
+    if not labels:
+        return
+
+    row_totals = {actual: sum(matrix.get(actual, {}).values()) for actual in labels}
+    widest_total = max(len("total"), max(len(str(total)) for total in row_totals.values()))
+    col_width = max(max(len(label) for label in labels), widest_total) + MATRIX_CELL_PADDING
+    row_label_width = max(len(label) for label in labels) + MATRIX_CELL_PADDING
+
+    print(
+        "Confusion Matrix for multispecies "
+        "(rows=actual, cols=predicted; non-targets grouped as other/background):"
+    )
+    print(f"{'':>{row_label_width}}", end="")
+    for label in labels:
+        print(f"{label:>{col_width}}", end="")
+    print(f"{'total':>{col_width}}", end="")
+    print()
+
+    for actual in labels:
+        print(f"{actual:>{row_label_width}}", end="")
+        for predicted in labels:
+            count = matrix.get(actual, {}).get(predicted, 0)
+            print(f"{count:>{col_width}}", end="")
+        print(f"{row_totals[actual]:>{col_width}}", end="")
+        print()
+
+
+def print_summary(results: list[ModelResult]) -> None:
+    """
+    Print a formatted comparison table for all model results.
+
+    Args:
+        results: List of ModelResult objects, one per model.
+    """
+    class_column_format = " {:>7} {:>7}"
+    header = (
+        f"{'Model':<15} {'Evaluated':>9} {'Correct':>9} {'Accuracy':>9} {'F1':>7}"
+        f"{class_column_format.format('RFP%', 'RFN%')}"
+        f"{class_column_format.format('TFP%', 'TFN%')}"
+        f"{class_column_format.format('HFP%', 'HFN%')}"
+        f" {'Avg Time':>10}"
+    )
+    separator = "=" * len(header)
+    print()
+    print(separator)
+    print("Model Comparison Summary")
+    print(separator)
+    print(header)
+    print("-" * len(header))
+
+    for r in results:
+        evaluated = r.evaluated
+        accuracy = f"{r.accuracy:.1%}" if r.accuracy is not None else "N/A"
+        whale_f1 = f"{r.whale_f1:.3f}" if r.whale_f1 is not None else "N/A"
+        avg_time = f"{r.avg_predict_time:.2f}s" if r.avg_predict_time is not None else "N/A"
+        class_stats = []
+        for label, _ in SUMMARY_LABELS:
+            false_positive_rate = r.false_positive_rate_for_label(label)
+            false_negative_rate = r.false_negative_rate_for_label(label)
+            class_stats.append(
+                class_column_format.format(
+                    f"{false_positive_rate:.1%}" if false_positive_rate is not None else "N/A",
+                    f"{false_negative_rate:.1%}" if false_negative_rate is not None else "N/A",
+                )
+            )
+
+        print(
+            f"{r.model_type:<15} {evaluated:>9} {r.correct:>9} {accuracy:>9} {whale_f1:>7}"
+            f"{''.join(class_stats)} {avg_time:>10}"
+        )
+        if r.skipped:
+            print(f"  ({r.skipped} skipped due to missing WAV or inference error)")
+
+    print(separator)
+    print()
+    print("Definitions:")
+    print("  Accuracy     = Correct / Evaluated")
+    print("  Correct      = fastai/orcahello: resident vs other; oldpodsai/podsai: exact category match")
+    print("                 multispecies: exact humpback/resident/transient match, non-targets as other")
+    print("  F1           = macro F1 over humpback, resident, and transient classes that are present")
+    print("  [R|T|H]FP%   = among non-[R|T|H] samples, fraction predicted as that class")
+    print("  [R|T|H]FN%   = among actual samples of that class, fraction predicted as another class")
+    print("  Avg Time     = average time spent in model predict() per 60-second WAV file")
+    print("  Note         = compares end-to-end 60-second inference on testing_60s_samples.csv")
+
+    for r in results:
+        print()
+        if r.model_type == "multispecies":
+            print_multispecies_confusion_matrix(r)
+        else:
+            print_confusion_matrix(r)
+
+
+def main() -> int:
+    """Entry point for the compare_models CLI.
+
+    Returns:
+        Exit code: 0 on success, 1 on error.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare model predictions on a test set loaded from testing_60s_samples.csv. "
+            "Runs each enabled model against the corresponding 60-second WAV files "
+            "and reports correct identifications, false positives, and false negatives."
+        )
+    )
+    parser.add_argument(
+        "--testing-csv",
+        default="output/csv/testing_60s_samples.csv",
+        help="Path to testing_60s_samples.csv (default: output/csv/testing_60s_samples.csv).",
+    )
+    parser.add_argument(
+        "--wav-dir",
+        default="output/testing-wav",
+        help="Root directory containing testing WAV files (default: output/testing-wav).",
+    )
+    parser.add_argument(
+        "--models",
+        default="fastai,orcahello,oldpodsai,podsai,multispecies",
+        help=(
+            "Comma-separated list of models to evaluate "
+            "(default: fastai,orcahello,oldpodsai,podsai,multispecies)."
+        ),
+    )
+    parser.add_argument(
+        "--fastai-model-path",
+        default="model",
+        help=(
+            "Path to FastAI model directory. "
+            "Defaults to model when not specified."
+        ),
+    )
+    parser.add_argument(
+        "--orcahello-model-path",
+        default="orcasound/orcahello-srkw-detector-v1",
+        help=(
+            "Path or HuggingFace Hub ID for the OrcaHello model. "
+            "Defaults to orcasound/orcahello-srkw-detector-v1 when not specified."
+        ),
+    )
+    parser.add_argument(
+        "--podsai-model-path",
+        default=PODSAI_MODEL_ID,
+        help=(
+            "Path to PODS-AI model directory or HuggingFace Hub ID. "
+            "Used by both and oldpodsai (Wav2Vec2) and podsai (AST). "
+            f"Defaults to {PODSAI_MODEL_ID!r} when not specified."
+        ),
+    )
+    parser.add_argument(
+        "--podsai-model-revision",
+        default=PODSAI_MODEL_REVISION,
+        help=(
+            "Git commit hash to pin the PODS-AI HuggingFace Hub model revision. "
+            "Only used when --podsai-model-path is a Hub model ID. "
+            f"Defaults to the pinned revision ({PODSAI_MODEL_REVISION})."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-model-path",
+        default=MULTISPECIES_MODEL_ID,
+        help=(
+            "Path or HuggingFace Hub ID for the DCLDE multi-species model. "
+            f"Defaults to {MULTISPECIES_MODEL_ID!r}."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-kw-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum binary KW-head probability required to classify a window "
+            "as resident/SRKW or transient/TKW (default: 0.5)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-humpback-threshold",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum mapped window confidence for multispecies humpback/HW "
+            "windows to count as positive (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-resident-threshold",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum binary-KW times conditional-SRKW score required to classify "
+            "a window as resident (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-transient-threshold",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum binary-KW times conditional-TKW score required to classify "
+            "a window as transient (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-ecotype-margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum absolute difference between conditional SRKW and TKW "
+            "probabilities; smaller margins are classified as other "
+            "(default: 0.0, disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-resident-report",
+        default=None,
+        help=(
+            "Optional .csv or .txt path for grouped resident pre-threshold "
+            "diagnostics and likely rejection reasons."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-batch-size",
+        type=int,
+        default=16,
+        help="Window inference batch size for the multispecies model.",
+    )
+    parser.add_argument(
+        "--multispecies-aggregation-mode",
+        choices=["vote", "topk_mean"],
+        default="vote",
+        help=(
+            "60-second aggregation mode for the multispecies model. "
+            "vote keeps the original positive-window majority vote. "
+            "topk_mean scores each class by the mean of its top-k positive "
+            "windows (default: vote)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-top-k",
+        type=int,
+        default=3,
+        help=(
+            "Number of highest positive window scores to average per class when "
+            "using --multispecies-aggregation-mode topk_mean (default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-min-positive-windows",
+        type=int,
+        default=3,
+        help=(
+            "Cap for the scaled minimum positive-window count used by multispecies "
+            "60-second aggregation. In topk_mean mode this is the default per-class "
+            "minimum unless a class-specific value is set (default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-humpback-min-windows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum positive humpback windows required in topk_mean mode. "
+            "Defaults to the scaled --multispecies-min-positive-windows value."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-resident-min-windows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum positive resident windows required in topk_mean mode. "
+            "Defaults to the scaled --multispecies-min-positive-windows value."
+        ),
+    )
+    parser.add_argument(
+        "--multispecies-transient-min-windows",
+        type=int,
+        default=None,
+        help=(
+            "Minimum positive transient windows required in topk_mean mode. "
+            "Defaults to the scaled --multispecies-min-positive-windows value."
+        ),
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of test samples to process. "
+            "If not specified, all samples are processed."
+        ),
+    )
+    parser.add_argument(
+        "--category",
+        default=None,
+        help=(
+            "Only test samples from this category. "
+            "If not specified, all categories are tested. "
+            "Categories: water, resident, transient, humpback, vessel, jingle, human."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    testing_csv = Path(args.testing_csv)
+    if not testing_csv.exists():
+        print(f"Error: testing CSV not found: {testing_csv}", file=sys.stderr)
+        print(
+            "Update output/csv/testing_60s_samples.csv before running compare_models.py.",
+            file=sys.stderr,
+        )
+        return 1
+
+    wav_dir = Path(args.wav_dir)
+    if not wav_dir.exists():
+        print(f"Error: WAV directory not found: {wav_dir}", file=sys.stderr)
+        print(
+            "Run download_wavs.py first to download testing WAV files.",
+            file=sys.stderr,
+        )
+        return 1
+
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    valid_models = {"fastai", "orcahello", "oldpodsai", "podsai", "multispecies"}
+    if not models:
+        print(
+            "Error: --models did not contain any model names. "
+            f"Valid models: {sorted(valid_models)}",
+            file=sys.stderr,
+        )
+        return 1
+    for model in models:
+        if model not in valid_models:
+            print(
+                f"Error: unknown model type {model!r}. Valid: {sorted(valid_models)}",
+                file=sys.stderr,
+            )
+            return 1
+
+    resident_report_path = (
+        Path(args.multispecies_resident_report)
+        if args.multispecies_resident_report
+        else None
+    )
+    if (
+        resident_report_path is not None
+        and resident_report_path.suffix.lower() not in {".csv", ".txt"}
+    ):
+        print(
+            "Error: --multispecies-resident-report must end in .csv or .txt, "
+            f"got {resident_report_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    model_paths: dict[str, Optional[str]] = {
+        "fastai": args.fastai_model_path,
+        "orcahello": args.orcahello_model_path,
+        "oldpodsai": args.podsai_model_path,
+        "podsai": args.podsai_model_path,
+        "multispecies": args.multispecies_model_path,
+    }
+    model_revisions: dict[str, Optional[str]] = {
+        "fastai": None,
+        "orcahello": None,
+        "oldpodsai": OLD_PODSAI_MODEL_REVISION,
+        "podsai": args.podsai_model_revision,
+        "multispecies": None,
+    }
+
+    # Validate max_samples if specified.
+    if args.max_samples is not None and args.max_samples <= 0:
+        print(f"Error: --max-samples must be a positive integer, got {args.max_samples}", file=sys.stderr)
+        return 1
+    if args.multispecies_batch_size <= 0:
+        print(
+            f"Error: --multispecies-batch-size must be positive, got {args.multispecies_batch_size}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.multispecies_min_positive_windows <= 0:
+        print(
+            "Error: --multispecies-min-positive-windows must be positive, "
+            f"got {args.multispecies_min_positive_windows}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.multispecies_top_k <= 0:
+        print(
+            f"Error: --multispecies-top-k must be positive, got {args.multispecies_top_k}",
+            file=sys.stderr,
+        )
+        return 1
+    multispecies_probability_options = {
+        "--multispecies-kw-threshold": args.multispecies_kw_threshold,
+        "--multispecies-humpback-threshold": args.multispecies_humpback_threshold,
+        "--multispecies-resident-threshold": args.multispecies_resident_threshold,
+        "--multispecies-transient-threshold": args.multispecies_transient_threshold,
+        "--multispecies-ecotype-margin": args.multispecies_ecotype_margin,
+    }
+    for option, value in multispecies_probability_options.items():
+        if not 0.0 <= value <= 1.0:
+            print(
+                f"Error: {option} must be between 0 and 1, got {value}",
+                file=sys.stderr,
+            )
+            return 1
+    multispecies_class_min_windows = {
+        "humpback": args.multispecies_humpback_min_windows,
+        "resident": args.multispecies_resident_min_windows,
+        "transient": args.multispecies_transient_min_windows,
+    }
+    multispecies_class_min_windows = {
+        label: value
+        for label, value in multispecies_class_min_windows.items()
+        if value is not None
+    }
+    for label, min_windows in multispecies_class_min_windows.items():
+        if min_windows <= 0:
+            print(
+                f"Error: multispecies {label} minimum windows must be positive, got {min_windows}",
+                file=sys.stderr,
+            )
+            return 1
+
+    samples = load_test_samples(testing_csv, max_samples=args.max_samples,
+                                category_filter=args.category)
+    if not samples:
+        if args.category:
+            print(f"Error: no test samples found for category '{args.category}'.", file=sys.stderr)
+        else:
+            print("Error: no test samples found.", file=sys.stderr)
+        return 1
+
+    print(f"Loaded {len(samples)} test samples from {testing_csv}")
+    if args.category:
+        print(f"  (filtered to category: {args.category})")
+    if args.max_samples is not None:
+        print(f"  (limited to first {args.max_samples} samples)")
+    print(f"WAV directory: {wav_dir}")
+    print(f"Models to evaluate: {', '.join(models)}")
+    print()
+
+    results = []
+    multispecies_predictor: Optional[MultiSpeciesWindowPredictor] = None
+    for model_type in models:
+        print(f"Evaluating model: {model_type}")
+        if model_type == "multispecies":
+            if multispecies_predictor is None:
+                multispecies_predictor = MultiSpeciesWindowPredictor(
+                    model_path=args.multispecies_model_path,
+                    kw_threshold=args.multispecies_kw_threshold,
+                    humpback_threshold=args.multispecies_humpback_threshold,
+                    resident_threshold=args.multispecies_resident_threshold,
+                    transient_threshold=args.multispecies_transient_threshold,
+                    ecotype_margin=args.multispecies_ecotype_margin,
+                    aggregation_mode=args.multispecies_aggregation_mode,
+                    top_k=args.multispecies_top_k,
+                    class_min_windows=multispecies_class_min_windows,
+                    min_num_positive_calls_threshold=args.multispecies_min_positive_windows,
+                    batch_size=args.multispecies_batch_size,
+                )
+            model_result = evaluate_multispecies_model(
+                predictor=multispecies_predictor,
+                samples=samples,
+                wav_dir=wav_dir,
+                resident_report_path=resident_report_path,
+            )
+            results.append(model_result)
+            print(
+                f"Completed multispecies: evaluated={model_result.evaluated}, "
+                f"skipped={model_result.skipped}, correct={model_result.correct}"
+            )
+            print()
+            continue
+
+        inference_model_type = MODEL_TYPE_TO_INFERENCE_TYPE[model_type]
+        model_result = evaluate_model(
+            model_type=inference_model_type,
+            model_path=model_paths[model_type],
+            samples=samples,
+            wav_dir=wav_dir,
+            model_revision=model_revisions[model_type],
+            result_model_type=model_type,
+        )
+        results.append(model_result)
+        print(
+            f"Completed {model_type}: evaluated={model_result.evaluated}, "
+            f"skipped={model_result.skipped}, correct={model_result.correct}"
+        )
+        print()
+
+    if not results:
+        print("Error: no model results were produced.", file=sys.stderr)
+        return 1
+
+    print_summary(results)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
