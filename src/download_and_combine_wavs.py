@@ -26,7 +26,7 @@ DEFAULT_PRIMARY_MANIFEST = (
 )
 DEFAULT_PRIMARY_WAV_ROOT = "/content/pods-ai/src/output/wav"
 DEFAULT_SECONDARY_MANIFEST = (
-    "/content/pods-ai/src/output/csv/"
+    "/content/pods-ai/output/csv/"
     "orcasound_60s_validation_manifest_no_mixed_extracted.csv"
 )
 DEFAULT_SECONDARY_OUTPUT_DIR = (
