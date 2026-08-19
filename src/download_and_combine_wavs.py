@@ -128,6 +128,32 @@ def read_manifest(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return fieldnames, list(reader)
 
 
+def download_primary_manifest_wavs(
+    manifest: Path,
+    wav_root: Path,
+    cache_root: Optional[Path] = None,
+) -> None:
+    """Download only the testing samples listed in the primary manifest.
+
+    Reuse download_wavs.py's testing-sample implementation so timestamps,
+    filenames, cache lookup, and existing-file behavior stay consistent. The
+    broader process_testing_csv() entry point is deliberately not called
+    because it deletes WAVs that are not listed in the manifest.
+    """
+    from download_wavs import download_testing_sample, parse_csv
+
+    rows = parse_csv(manifest)
+    print(f"Primary download: {len(rows)} manifest rows")
+    wav_root.mkdir(parents=True, exist_ok=True)
+
+    for index, row in enumerate(rows, start=1):
+        print(
+            f"[primary {index}/{len(rows)}] "
+            f"{row.category} - {row.node_name} - {row.timestamp_pst}"
+        )
+        download_testing_sample(row, wav_root, cache_root=cache_root)
+
+
 def find_gcs_copy_command() -> Optional[list[str]]:
     if shutil.which("gsutil"):
         return ["gsutil", "-q", "cp"]
@@ -331,6 +357,19 @@ def main() -> int:
     )
     parser.add_argument("--primary-manifest", default=DEFAULT_PRIMARY_MANIFEST)
     parser.add_argument("--primary-wav-root", default=DEFAULT_PRIMARY_WAV_ROOT)
+    parser.add_argument(
+        "--primary-cache-root",
+        default=None,
+        help=(
+            "Optional existing WAV root used as a cache before downloading "
+            "primary clips."
+        ),
+    )
+    parser.add_argument(
+        "--skip-primary-download",
+        action="store_true",
+        help="Do not run download_wavs.py's download process for the primary manifest.",
+    )
     parser.add_argument("--secondary-manifest", default=DEFAULT_SECONDARY_MANIFEST)
     parser.add_argument("--secondary-output-dir", default=DEFAULT_SECONDARY_OUTPUT_DIR)
     parser.add_argument("--output-manifest", default=DEFAULT_COMBINED_MANIFEST)
@@ -359,9 +398,21 @@ def main() -> int:
     if not secondary_manifest.is_file():
         parser.error(f"secondary manifest not found: {secondary_manifest}")
 
+    primary_wav_root = Path(args.primary_wav_root)
+    if not args.skip_primary_download:
+        download_primary_manifest_wavs(
+            primary_manifest,
+            primary_wav_root,
+            cache_root=(
+                Path(args.primary_cache_root)
+                if args.primary_cache_root is not None
+                else None
+            ),
+        )
+
     primary_rows, missing_primary = build_primary_rows(
         primary_manifest,
-        Path(args.primary_wav_root),
+        primary_wav_root,
     )
     print(
         f"Primary collection: {len(primary_rows)} usable WAVs, "
