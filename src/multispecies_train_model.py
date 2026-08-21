@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader, Dataset
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import (  # noqa: E402
+    AutoConfig,
     AutoFeatureExtractor,
     AutoModelForAudioClassification,
     EarlyStoppingCallback,
@@ -457,9 +458,14 @@ class MultiTaskASTForDCLDE(nn.Module):
         kw_class_weights: Optional[list[float]] = None,
         species_class_weights: Optional[list[float]] = None,
         ecotype_class_weights: Optional[list[float]] = None,
+        initialize_from_config: bool = False,
     ) -> None:
         super().__init__()
-        base_model = AutoModelForAudioClassification.from_pretrained(model_name)
+        if initialize_from_config:
+            config = AutoConfig.from_pretrained(model_name)
+            base_model = AutoModelForAudioClassification.from_config(config)
+        else:
+            base_model = AutoModelForAudioClassification.from_pretrained(model_name)
         self.base_model_name = model_name
         self.config = base_model.config
         self.ast = base_model.audio_spectrogram_transformer
@@ -663,8 +669,14 @@ def remap_legacy_ast_state_dict_keys(
             candidate_key = original_key
             for legacy_fragment, current_fragment in LEGACY_AST_KEY_REPLACEMENTS:
                 candidate_key = candidate_key.replace(legacy_fragment, current_fragment)
-            if candidate_key in expected:
-                output_key = candidate_key
+            candidate_keys = (
+                candidate_key,
+                candidate_key.replace("ast.encoder.layers.", "ast.layers."),
+            )
+            output_key = next(
+                (candidate for candidate in candidate_keys if candidate in expected),
+                original_key,
+            )
 
         if output_key in remapped_state_dict:
             previous_key = original_keys_by_output[output_key]
@@ -718,16 +730,22 @@ def load_training_model(
         )
 
     metadata, weights_path = checkpoint
+    standalone = bool(metadata.get("standalone", False))
     base_model = metadata.get("base_model")
-    if not base_model:
+    if not standalone and not base_model:
         raise ValueError(
             f"{model_name} has multitask weights but multitask_config.json is missing base_model."
         )
 
     print(f"Detected saved DCLDE multi-task checkpoint: {model_name}")
-    print(f"Rebuilding AST backbone from base model: {base_model}")
+    if standalone:
+        initialization_source = model_name
+        print("Rebuilding AST architecture from the checkpoint's bundled config.json.")
+    else:
+        initialization_source = base_model
+        print(f"Rebuilding AST backbone from base model: {base_model}")
     model = MultiTaskASTForDCLDE(
-        model_name=base_model,
+        model_name=initialization_source,
         dropout=dropout,
         kw_loss_weight=kw_loss_weight,
         species_loss_weight=species_loss_weight,
@@ -736,6 +754,7 @@ def load_training_model(
         kw_class_weights=kw_class_weights,
         species_class_weights=species_class_weights,
         ecotype_class_weights=ecotype_class_weights,
+        initialize_from_config=standalone,
     )
     if weights_path.name.endswith(".safetensors"):
         try:
