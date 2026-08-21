@@ -29,7 +29,7 @@ import random
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Collection, Optional
 
 import librosa
 import numpy as np
@@ -630,6 +630,67 @@ def load_multitask_checkpoint_files(model_name: str) -> Optional[tuple[dict[str,
         return json.load(file), weights_path
 
 
+LEGACY_AST_KEY_REPLACEMENTS = (
+    ("ast.encoder.layer.", "ast.encoder.layers."),
+    (".attention.attention.query.", ".attention.q_proj."),
+    (".attention.attention.key.", ".attention.k_proj."),
+    (".attention.attention.value.", ".attention.v_proj."),
+    (".attention.output.dense.", ".attention.o_proj."),
+    (".intermediate.dense.", ".mlp.fc1."),
+    (".output.dense.", ".mlp.fc2."),
+)
+
+
+def remap_legacy_ast_state_dict_keys(
+    state_dict: dict[str, Any],
+    expected_keys: Collection[str],
+) -> tuple[dict[str, Any], int]:
+    """Map legacy Transformers AST parameter names to names expected by this runtime.
+
+    Transformers renamed the AST encoder and attention/MLP parameters. Saved
+    multi-task checkpoints use the names from the Transformers version on which
+    they were trained. Only apply a translated name when the model built by the
+    installed runtime expects it, so legacy runtimes remain supported as well.
+    """
+    expected = set(expected_keys)
+    remapped_state_dict: dict[str, Any] = {}
+    original_keys_by_output: dict[str, str] = {}
+    remapped_count = 0
+
+    for original_key, value in state_dict.items():
+        output_key = original_key
+        if original_key not in expected:
+            candidate_key = original_key
+            for legacy_fragment, current_fragment in LEGACY_AST_KEY_REPLACEMENTS:
+                candidate_key = candidate_key.replace(legacy_fragment, current_fragment)
+            if candidate_key in expected:
+                output_key = candidate_key
+
+        if output_key in remapped_state_dict:
+            previous_key = original_keys_by_output[output_key]
+            raise ValueError(
+                "Checkpoint contains parameter names that collide after AST "
+                f"compatibility remapping: {previous_key!r} and {original_key!r} "
+                f"both map to {output_key!r}."
+            )
+
+        remapped_state_dict[output_key] = value
+        original_keys_by_output[output_key] = original_key
+        if output_key != original_key:
+            remapped_count += 1
+
+    return remapped_state_dict, remapped_count
+
+
+def _format_checkpoint_key_mismatch(keys: Collection[str], limit: int = 12) -> str:
+    """Format checkpoint key mismatches without printing hundreds of names."""
+    key_list = list(keys)
+    displayed = ", ".join(repr(key) for key in key_list[:limit])
+    if len(key_list) > limit:
+        displayed += f", ... ({len(key_list) - limit} more)"
+    return displayed
+
+
 def load_training_model(
     model_name: str,
     dropout: float,
@@ -689,11 +750,37 @@ def load_training_model(
         state_dict = torch.load(weights_path, map_location="cpu")
     if isinstance(state_dict, dict) and "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            f"Checkpoint {weights_path} did not contain a parameter state dictionary."
+        )
+
+    state_dict, remapped_count = remap_legacy_ast_state_dict_keys(
+        state_dict,
+        model.state_dict().keys(),
+    )
+    if remapped_count:
+        print(
+            f"Remapped {remapped_count} legacy AST checkpoint parameter names "
+            "for compatibility with the installed Transformers version."
+        )
+
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        print(f"Warning: missing keys while loading checkpoint: {missing_keys}")
-    if unexpected_keys:
-        print(f"Warning: unexpected keys while loading checkpoint: {unexpected_keys}")
+    if missing_keys or unexpected_keys:
+        details = []
+        if missing_keys:
+            details.append(
+                "missing keys: " + _format_checkpoint_key_mismatch(missing_keys)
+            )
+        if unexpected_keys:
+            details.append(
+                "unexpected keys: " + _format_checkpoint_key_mismatch(unexpected_keys)
+            )
+        raise RuntimeError(
+            f"Checkpoint {weights_path} is incompatible with the reconstructed model; "
+            + "; ".join(details)
+            + ". Refusing to run inference with partially loaded weights."
+        )
     return model
 
 
@@ -1261,7 +1348,7 @@ def main() -> int:
         "--ecotype-class-weights",
         default=None,
         help=(
-            "Optional ecotype head class weights, e.g. 'SRKW=2,TKW=2'. "
+            "Optional ecotype head class weights, e.g. 'SRKW=1.5,TKW=1.1'. "
             "Unspecified label=value classes default to 1."
         ),
     )
