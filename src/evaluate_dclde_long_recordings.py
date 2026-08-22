@@ -304,7 +304,10 @@ def load_recordings(
 
     requested_names = list(metadata_by_name)
     if args.max_files is not None:
-        requested_names = requested_names[: args.max_files]
+        requested_names = random.Random(args.seed).sample(
+            requested_names,
+            k=min(args.max_files, len(requested_names)),
+        )
     required_names = set(requested_names)
     gcs_index, gcs_sanity = build_noaa_gcs_index(
         args.gcs_base,
@@ -336,6 +339,7 @@ def load_recordings(
         "annotation_rows_used_as_inventory": len(rows),
         "unique_annotated_soundfiles": len(metadata_by_name),
         "requested_soundfiles": len(requested_names),
+        "random_subset_seed": args.seed if args.max_files is not None else None,
         "matched_recordings": len(recordings),
         "missing_gcs_audio_count": len(missing),
         "missing_gcs_audio_examples": missing[:25],
@@ -726,12 +730,13 @@ def binary_metrics(counts: BinaryCounts) -> dict[str, Any]:
     precision = safe_divide(counts.tp, counts.tp + counts.fp)
     recall = safe_divide(counts.tp, counts.tp + counts.fn)
     accuracy = safe_divide(counts.tp + counts.tn, counts.tp + counts.fp + counts.fn + counts.tn)
+    f1_denominator = 2 * counts.tp + counts.fp + counts.fn
     return {
         **asdict(counts),
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
-        "f1": harmonic_f1(precision, recall),
+        "f1": (2 * counts.tp / f1_denominator) if f1_denominator else None,
     }
 
 
@@ -942,6 +947,7 @@ def multiclass_metrics(
         fp = sum(matrix[actual][label] for actual in labels if actual != label)
         precision = safe_divide(tp, tp + fp)
         recall = safe_divide(tp, tp + fn)
+        f1_denominator = 2 * tp + fp + fn
         rows.append(
             {
                 "label": label,
@@ -951,7 +957,7 @@ def multiclass_metrics(
                 "false_negative_count": fn,
                 "precision": precision,
                 "recall": recall,
-                "f1": harmonic_f1(precision, recall),
+                "f1": (2 * tp / f1_denominator) if f1_denominator else None,
             }
         )
     f1_values = [row["f1"] for row in rows if row["support"] > 0 and row["f1"] is not None]
@@ -984,6 +990,7 @@ def focused_srkw_tkw_metrics(
         fp = sum(matrix[actual][label] for actual in ("SRKW", "TKW") if actual != label)
         precision = safe_divide(tp, tp + fp)
         recall = safe_divide(tp, tp + fn)
+        f1_denominator = 2 * tp + fp + fn
         rows.append(
             {
                 "label": label,
@@ -993,7 +1000,7 @@ def focused_srkw_tkw_metrics(
                 "false_negative_count": fn,
                 "precision": precision,
                 "recall": recall,
-                "f1": harmonic_f1(precision, recall),
+                "f1": (2 * tp / f1_denominator) if f1_denominator else None,
             }
         )
     f1_values = [row["f1"] for row in rows if row["support"] and row["f1"] is not None]
@@ -1012,13 +1019,14 @@ def event_detection_metrics(matches: list[EventMatch], audio_hours: float) -> di
     counts = Counter(match.status for match in matches)
     precision = safe_divide(counts["TP"], counts["TP"] + counts["FP"])
     recall = safe_divide(counts["TP"], counts["TP"] + counts["FN"])
+    f1_denominator = 2 * counts["TP"] + counts["FP"] + counts["FN"]
     return {
         "true_positives": counts["TP"],
         "false_positives": counts["FP"],
         "false_negatives": counts["FN"],
         "precision": precision,
         "recall": recall,
-        "f1": harmonic_f1(precision, recall),
+        "f1": (2 * counts["TP"] / f1_denominator) if f1_denominator else None,
         "false_positives_per_hour": safe_divide(counts["FP"], audio_hours),
         "misses_per_hour": safe_divide(counts["FN"], audio_hours),
     }
@@ -1081,7 +1089,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated NOAA bucket provider directories to index.",
     )
     parser.add_argument("--max-file-gb", type=float, default=10.0)
-    parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Randomly select at most this many annotated recordings using --seed.",
+    )
     parser.add_argument(
         "--temp-dir",
         default=None,

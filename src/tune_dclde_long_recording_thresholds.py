@@ -14,6 +14,7 @@ import csv
 import itertools
 import json
 import math
+import random
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -312,6 +313,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--annotations", default=evaluation.DEFAULT_ANNOTATIONS)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--failed-files", default=None)
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Randomly select at most this many cached recordings.",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--kw-thresholds", default=DEFAULT_THRESHOLDS)
     parser.add_argument("--event-merge-gaps", default="0,1,2,3")
     parser.add_argument("--minimum-positive-windows", default="1,2,3")
@@ -334,6 +342,8 @@ def main() -> int:
         raise ValueError("--event-iou-threshold must be between 0 and 1")
     if args.max_fp_per_hour is not None and args.max_fp_per_hour < 0:
         raise ValueError("--max-fp-per-hour cannot be negative")
+    if args.max_files is not None and args.max_files < 1:
+        raise ValueError("--max-files must be positive")
 
     thresholds = parse_number_list(args.kw_thresholds, float, "KW thresholds")
     gaps = parse_number_list(args.event_merge_gaps, float, "event merge gaps")
@@ -357,6 +367,15 @@ def main() -> int:
     )
     if not cached:
         raise ValueError("No complete cached recordings were found")
+    available_recordings = len(cached)
+    if args.max_files is not None:
+        cached = random.Random(args.seed).sample(
+            cached,
+            k=min(args.max_files, len(cached)),
+        )
+        cache_sanity["available_recordings_before_random_subset"] = available_recordings
+        cache_sanity["random_subset_recordings"] = len(cached)
+        cache_sanity["random_subset_seed"] = args.seed
     recordings = [item.recording for item in cached]
     annotation_table = evaluation.read_csv(args.annotations)
     truths_by_file, annotation_sanity = evaluation.load_annotations(
