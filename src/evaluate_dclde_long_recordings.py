@@ -207,7 +207,7 @@ def build_noaa_gcs_index(
     oversized = []
     for provider in providers:
         prefix = f"{base_gcs.rstrip('/')}/{provider}/audio"
-        LOGGER.info("Indexing gs://%s", prefix)
+        LOGGER.debug("Indexing gs://%s", prefix)
         try:
             objects = fs.find(prefix, detail=True)
         except Exception as error:
