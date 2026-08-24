@@ -22,7 +22,7 @@ from typing import Optional
 
 
 DEFAULT_PRIMARY_MANIFEST = (
-    "/content/pods-ai/output/csv/testing_60s_samples_old.csv"
+    "/content/pods-ai/output/csv/testing_60s_samples.csv"
 )
 DEFAULT_PRIMARY_WAV_ROOT = "/content/pods-ai/src/output/wav"
 DEFAULT_SECONDARY_MANIFEST = (
