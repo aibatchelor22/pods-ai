@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) PODS-AI contributors
 # SPDX-License-Identifier: MIT
-"""Extract 3-second training hard negatives from stable-event false positives.
+"""Extract 3-second multispecies hard negatives from long recordings.
 
 The script joins ``best_event_matches.csv`` (FP decisions),
 ``best_stable_events.csv`` (peak/event metadata), and ``window_predictions.csv``
@@ -11,8 +11,13 @@ window as a BKG WAV, appends a training-compatible manifest, and removes the
 temporary source recording. The output directory includes Kaggle dataset
 metadata and can be uploaded with the Kaggle CLI.
 
+KW candidates include false stable events. Independent window-score mining also
+finds background windows with high KW, HW, or AB probabilities. Overlapping
+class candidates are merged into one clip and tagged with every class for which
+they are a hard negative.
+
 Evaluator FPs can be real but unannotated calls. Review candidates whenever
-possible; an optional review CSV can restrict extraction to approved events.
+possible; an optional review CSV can restrict extraction to approved candidates.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ import math
 import random
 import re
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -62,6 +67,10 @@ WINDOW_SCORE_COLUMNS = (
 )
 PROVENANCE_COLUMNS = (
     "hard_negative_source",
+    "hard_negative_for",
+    "hard_negative_primary_class",
+    "hard_negative_score",
+    "source_candidate_id",
     "source_event_id",
     "source_audio_path",
     "source_peak_time_sec",
@@ -97,6 +106,11 @@ class Candidate:
     window_end_sec: float
     window_row: dict[str, str]
     review_decision: str
+    candidate_id: str = ""
+    hard_negative_for: tuple[str, ...] = ("KW",)
+    primary_class: str = "KW"
+    candidate_score: float = 0.0
+    source_kind: str = "stable_event_false_positive"
 
 
 def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -140,14 +154,20 @@ def load_reviews(path: Optional[Path]) -> dict[str, str]:
         return {}
     fields, rows = read_csv(path)
     event_field = next(
-        (field for field in ("event_id", "source_event_id") if field in fields), None
+        (
+            field
+            for field in ("candidate_id", "source_candidate_id", "event_id", "source_event_id")
+            if field in fields
+        ),
+        None,
     )
     decision_field = next(
         (field for field in ("decision", "review_decision", "approved") if field in fields), None
     )
     if event_field is None or decision_field is None:
         raise ValueError(
-            f"{path} must contain event_id/source_event_id and decision/review_decision"
+            f"{path} must contain candidate_id/source_candidate_id/event_id/source_event_id "
+            "and decision/review_decision"
         )
     return {
         (row.get(event_field) or "").strip(): (row.get(decision_field) or "").strip()
@@ -176,7 +196,9 @@ def truthy(value: Any) -> bool:
     return str(value or "").strip().casefold() in {"true", "1", "yes", "y"}
 
 
-def load_window_rows(path: Path, soundfiles: set[str]) -> dict[str, list[dict[str, str]]]:
+def load_window_rows(
+    path: Path, soundfiles: Optional[set[str]] = None
+) -> dict[str, list[dict[str, str]]]:
     fields, rows = read_csv(path)
     required = {
         "Soundfile", "window_start_sec", "window_end_sec", "species_ground_truth",
@@ -186,11 +208,24 @@ def load_window_rows(path: Path, soundfiles: set[str]) -> dict[str, list[dict[st
     grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         soundfile = (row.get("Soundfile") or "").strip()
-        if soundfile in soundfiles:
+        if soundfile and (soundfiles is None or soundfile in soundfiles):
             grouped[soundfile].append(row)
     for soundfile, values in grouped.items():
         values.sort(key=lambda row: float(row["window_start_sec"]))
     return grouped
+
+
+def window_candidate_id(soundfile: str, start_sec: float) -> str:
+    """Return a stable review/resume identifier for one cached window."""
+    return f"window::{soundfile}::{int(round(start_sec * 1000)):010d}ms"
+
+
+def row_context(row: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = (row.get(name) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def closest_peak_window(
@@ -269,6 +304,16 @@ def prepare_candidates(
                 window_end_sec=parse_float(window, "window_end_sec", event_id),
                 window_row=window,
                 review_decision=decision,
+                candidate_id=window_candidate_id(
+                    soundfile, parse_float(window, "window_start_sec", event_id)
+                ),
+                hard_negative_for=("KW",),
+                primary_class="KW",
+                candidate_score=max(
+                    event_score,
+                    parse_float(window, "species_probability_KW", event_id),
+                ),
+                source_kind="stable_event_false_positive",
             )
         )
 
@@ -311,6 +356,205 @@ def prepare_candidates(
             audit.append(
                 {"event_id": candidate.event_id, "soundfile": candidate.soundfile, "status": "skipped_total_limit"}
             )
+    return selected, audit
+
+
+def prepare_multispecies_candidates(
+    windows_by_file: dict[str, list[dict[str, str]]],
+    kw_event_candidates: list[Candidate],
+    reviews: dict[str, str],
+    require_reviewed: bool,
+    thresholds: dict[str, float],
+    minimum_peak_separation_sec: float,
+    max_clips_per_class_per_source: Optional[int],
+    max_clips_per_source: Optional[int],
+    max_total_clips: Optional[int],
+) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    """Select high-scoring background windows for KW, HW, and AB.
+
+    Stable-event KW false positives are retained even when their species-KW
+    probability is below the window threshold. Class/source quotas are applied
+    before the final per-source quota so one noisy head cannot consume the
+    complete mining budget.
+    """
+    audit: list[dict[str, Any]] = []
+    event_by_window = {candidate.candidate_id: candidate for candidate in kw_event_candidates}
+    candidates: dict[str, Candidate] = {}
+
+    for soundfile, windows in windows_by_file.items():
+        for window in windows:
+            start = parse_float(window, "window_start_sec", soundfile)
+            end = parse_float(window, "window_end_sec", soundfile)
+            candidate_id = window_candidate_id(soundfile, start)
+            event_candidate = event_by_window.get(candidate_id)
+            actual_species = (window.get("species_ground_truth") or "").strip()
+            if actual_species != "background" or truthy(window.get("ground_truth_ambiguous")):
+                if event_candidate is not None:
+                    audit.append({
+                        "candidate_id": candidate_id,
+                        "event_id": event_candidate.event_id,
+                        "soundfile": soundfile,
+                        "status": "skipped_nonbackground_window_truth",
+                        "species_ground_truth": actual_species,
+                    })
+                continue
+
+            scores = {
+                label: parse_float(window, f"species_probability_{label}", candidate_id)
+                for label in ("KW", "HW", "AB")
+            }
+            targets = {label for label, score in scores.items() if score >= thresholds[label]}
+            if event_candidate is not None:
+                targets.add("KW")
+            if not targets:
+                continue
+
+            decision = reviews.get(candidate_id, "")
+            if not decision and event_candidate is not None:
+                decision = reviews.get(event_candidate.event_id, event_candidate.review_decision)
+            normalized_decision = decision.casefold()
+            if decision and normalized_decision not in ACCEPTED_REVIEW_DECISIONS:
+                audit.append({
+                    "candidate_id": candidate_id,
+                    "event_id": event_candidate.event_id if event_candidate else "",
+                    "soundfile": soundfile,
+                    "status": "skipped_review_rejected",
+                })
+                continue
+            if require_reviewed and normalized_decision not in ACCEPTED_REVIEW_DECISIONS:
+                audit.append({
+                    "candidate_id": candidate_id,
+                    "event_id": event_candidate.event_id if event_candidate else "",
+                    "soundfile": soundfile,
+                    "status": "skipped_unapproved",
+                })
+                continue
+
+            primary = max(targets, key=lambda label: (scores[label], label))
+            candidate_score = max(scores[label] for label in targets)
+            if event_candidate is not None:
+                candidate_score = max(candidate_score, event_candidate.event_score)
+                candidate = replace(
+                    event_candidate,
+                    review_decision=decision,
+                    hard_negative_for=tuple(sorted(targets)),
+                    primary_class=primary,
+                    candidate_score=candidate_score,
+                    source_kind="stable_event_fp+window_score",
+                )
+            else:
+                center = (start + end) / 2.0
+                candidate = Candidate(
+                    event_id="",
+                    soundfile=soundfile,
+                    provider=row_context(window, "provider", "Provider"),
+                    dataset=row_context(window, "dataset", "Dataset"),
+                    peak_time_sec=center,
+                    event_start_sec=start,
+                    event_end_sec=end,
+                    peak_score=candidate_score,
+                    event_score=candidate_score,
+                    predicted_ecotype="",
+                    ecotype_confidence=0.0,
+                    window_start_sec=start,
+                    window_end_sec=end,
+                    window_row=window,
+                    review_decision=decision,
+                    candidate_id=candidate_id,
+                    hard_negative_for=tuple(sorted(targets)),
+                    primary_class=primary,
+                    candidate_score=candidate_score,
+                    source_kind="window_score_false_positive",
+                )
+            candidates[candidate_id] = candidate
+
+    # Apply independent per-class limits, then take their union. A window that
+    # fools multiple heads consumes one WAV but remains tagged for every head.
+    quota_selected: set[str] = set()
+    by_class_source: dict[tuple[str, str], list[Candidate]] = defaultdict(list)
+    for candidate in candidates.values():
+        for label in candidate.hard_negative_for:
+            by_class_source[(label, candidate.soundfile)].append(candidate)
+    for (label, soundfile), values in by_class_source.items():
+        ranked = sorted(
+            values,
+            key=lambda item: (
+                -float(item.window_row[f"species_probability_{label}"]),
+                -item.candidate_score,
+                item.window_start_sec,
+            ),
+        )
+        kept = (
+            ranked
+            if max_clips_per_class_per_source is None
+            else ranked[:max_clips_per_class_per_source]
+        )
+        quota_selected.update(item.candidate_id for item in kept)
+        for item in ranked[len(kept):]:
+            audit.append({
+                "candidate_id": item.candidate_id,
+                "event_id": item.event_id,
+                "soundfile": soundfile,
+                "hard_negative_for": label,
+                "status": "skipped_class_source_limit",
+            })
+
+    selected: list[Candidate] = []
+    by_file: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate_id in quota_selected:
+        by_file[candidates[candidate_id].soundfile].append(candidates[candidate_id])
+    for soundfile in sorted(by_file):
+        kept: list[Candidate] = []
+        for candidate in sorted(
+            by_file[soundfile],
+            key=lambda item: (-item.candidate_score, item.window_start_sec),
+        ):
+            nearby_index = next(
+                (
+                    index
+                    for index, other in enumerate(kept)
+                    if abs(candidate.peak_time_sec - other.peak_time_sec)
+                    < minimum_peak_separation_sec
+                ),
+                None,
+            )
+            if nearby_index is not None:
+                other = kept[nearby_index]
+                merged_targets = tuple(
+                    sorted(set(other.hard_negative_for) | set(candidate.hard_negative_for))
+                )
+                kept[nearby_index] = replace(other, hard_negative_for=merged_targets)
+                audit.append({
+                    "candidate_id": candidate.candidate_id,
+                    "event_id": candidate.event_id,
+                    "soundfile": soundfile,
+                    "status": "merged_near_duplicate",
+                    "merged_into": other.candidate_id,
+                })
+                continue
+            kept.append(candidate)
+        if max_clips_per_source is not None and len(kept) > max_clips_per_source:
+            for candidate in kept[max_clips_per_source:]:
+                audit.append({
+                    "candidate_id": candidate.candidate_id,
+                    "event_id": candidate.event_id,
+                    "soundfile": soundfile,
+                    "status": "skipped_source_limit",
+                })
+            kept = kept[:max_clips_per_source]
+        selected.extend(kept)
+
+    selected.sort(key=lambda item: (-item.candidate_score, item.soundfile, item.window_start_sec))
+    if max_total_clips is not None and len(selected) > max_total_clips:
+        for candidate in selected[max_total_clips:]:
+            audit.append({
+                "candidate_id": candidate.candidate_id,
+                "event_id": candidate.event_id,
+                "soundfile": candidate.soundfile,
+                "status": "skipped_total_limit",
+            })
+        selected = selected[:max_total_clips]
+    selected.sort(key=lambda item: (item.soundfile, item.window_start_sec))
     return selected, audit
 
 
@@ -382,7 +626,11 @@ def build_manifest_row(
             "clip_filename": clip_name,
             "clip_path": published_clip_path,
             "Generated": True,
-            "hard_negative_source": "stable_event_false_positive",
+            "hard_negative_source": candidate.source_kind,
+            "hard_negative_for": ";".join(candidate.hard_negative_for),
+            "hard_negative_primary_class": candidate.primary_class,
+            "hard_negative_score": candidate.candidate_score,
+            "source_candidate_id": candidate.candidate_id,
             "source_event_id": candidate.event_id,
             "source_audio_path": source_audio,
             "source_peak_time_sec": candidate.peak_time_sec,
@@ -411,13 +659,21 @@ def write_rows(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
         writer.writerows(rows)
 
 
-def existing_event_ids(path: Path) -> set[str]:
+def existing_candidate_ids(path: Path) -> set[str]:
     if not path.is_file():
         return set()
     fields, rows = read_csv(path)
-    if "source_event_id" not in fields:
+    id_fields = [
+        field for field in ("source_candidate_id", "source_event_id") if field in fields
+    ]
+    if not id_fields:
         return set()
-    return {(row.get("source_event_id") or "").strip() for row in rows}
+    return {
+        value
+        for row in rows
+        for field in id_fields
+        if (value := (row.get(field) or "").strip())
+    }
 
 
 def write_kaggle_metadata(
@@ -452,11 +708,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-manifest", default=None)
     parser.add_argument("--temp-dir", default=None)
     parser.add_argument("--minimum-event-score", type=float, default=0.0)
+    parser.add_argument(
+        "--kw-hard-negative-threshold", type=float, default=0.80,
+        help="Minimum species-KW probability for independent window mining.",
+    )
+    parser.add_argument(
+        "--humpback-hard-negative-threshold", type=float, default=0.80,
+        help="Minimum species-HW probability for independent window mining.",
+    )
+    parser.add_argument(
+        "--ab-hard-negative-threshold", type=float, default=0.80,
+        help="Minimum species-AB probability for independent window mining.",
+    )
     parser.add_argument("--minimum-peak-separation-sec", type=float, default=3.0)
     parser.add_argument("--annotation-buffer-sec", type=float, default=3.0)
     parser.add_argument("--clip-duration", type=float, default=3.0)
     parser.add_argument("--sample-rate", type=int, default=16000)
-    parser.add_argument("--max-clips-per-source", type=int, default=20)
+    parser.add_argument(
+        "--max-clips-per-class-per-source", type=int, default=20,
+        help="Maximum selected windows for each target class in one recording.",
+    )
+    parser.add_argument(
+        "--max-clips-per-source", type=int, default=60,
+        help="Final maximum across KW, HW, and AB for one recording.",
+    )
     parser.add_argument("--max-total-clips", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-resume", action="store_true")
@@ -482,10 +757,22 @@ def main() -> int:
         raise ValueError("Score/separation/annotation-buffer values cannot be negative")
     if not 0 <= args.minimum_event_score <= 1:
         raise ValueError("--minimum-event-score must be between 0 and 1")
+    class_thresholds = {
+        "KW": args.kw_hard_negative_threshold,
+        "HW": args.humpback_hard_negative_threshold,
+        "AB": args.ab_hard_negative_threshold,
+    }
+    if any(not 0 <= value <= 1 for value in class_thresholds.values()):
+        raise ValueError("All hard-negative thresholds must be between 0 and 1")
     if args.clip_duration <= 0 or args.sample_rate <= 0 or args.max_file_gb <= 0:
         raise ValueError("Clip duration/sample rate/max file size must be positive")
     if args.max_clips_per_source is not None and args.max_clips_per_source < 1:
         raise ValueError("--max-clips-per-source must be positive")
+    if (
+        args.max_clips_per_class_per_source is not None
+        and args.max_clips_per_class_per_source < 1
+    ):
+        raise ValueError("--max-clips-per-class-per-source must be positive")
     if args.max_total_clips is not None and args.max_total_clips < 1:
         raise ValueError("--max-total-clips must be positive")
 
@@ -508,30 +795,44 @@ def main() -> int:
 
     fp_ids = false_positive_event_ids(match_path)
     event_rows = load_event_rows(event_path, fp_ids)
-    soundfiles = {(row.get("soundfile") or "").strip() for row in event_rows}
-    windows_by_file = load_window_rows(window_path, soundfiles)
+    windows_by_file = load_window_rows(window_path)
     reviews = load_reviews(review_path)
-    candidates, audit = prepare_candidates(
+    kw_event_candidates, event_audit = prepare_candidates(
         event_rows,
         windows_by_file,
-        reviews,
-        args.require_reviewed,
+        {},
+        False,
         args.minimum_event_score,
         args.minimum_peak_separation_sec,
-        args.max_clips_per_source,
-        args.max_total_clips,
+        None,
+        None,
         args.seed,
     )
+    candidates, audit = prepare_multispecies_candidates(
+        windows_by_file=windows_by_file,
+        kw_event_candidates=kw_event_candidates,
+        reviews=reviews,
+        require_reviewed=args.require_reviewed,
+        thresholds=class_thresholds,
+        minimum_peak_separation_sec=args.minimum_peak_separation_sec,
+        max_clips_per_class_per_source=args.max_clips_per_class_per_source,
+        max_clips_per_source=args.max_clips_per_source,
+        max_total_clips=args.max_total_clips,
+    )
+    audit = event_audit + audit
     if not reviews:
         print(
-            "WARNING: no --review-csv was supplied. Evaluator false positives may include "
+            "WARNING: no --review-csv was supplied. High-scoring background windows may include "
             "real but unannotated calls; audit clips before training."
         )
     if not candidates:
-        raise ValueError("No FP candidates remain after score/review/ground-truth filters")
+        raise ValueError(
+            "No KW/HW/AB candidates remain after score/review/ground-truth filters"
+        )
 
     review_rows = [
         {
+            "candidate_id": candidate.candidate_id,
             "event_id": candidate.event_id,
             "soundfile": candidate.soundfile,
             "provider": candidate.provider,
@@ -541,6 +842,12 @@ def main() -> int:
             "window_end_sec": candidate.window_end_sec,
             "peak_score": candidate.peak_score,
             "event_topk_mean": candidate.event_score,
+            "hard_negative_for": ";".join(candidate.hard_negative_for),
+            "hard_negative_primary_class": candidate.primary_class,
+            "hard_negative_score": candidate.candidate_score,
+            "species_probability_KW": candidate.window_row.get("species_probability_KW", ""),
+            "species_probability_HW": candidate.window_row.get("species_probability_HW", ""),
+            "species_probability_AB": candidate.window_row.get("species_probability_AB", ""),
             "predicted_ecotype": candidate.predicted_ecotype,
             "species_ground_truth": candidate.window_row.get("species_ground_truth", ""),
             "decision": candidate.review_decision,
@@ -586,7 +893,7 @@ def main() -> int:
     for row in filtered_annotation_rows:
         template_by_file.setdefault(base.normalize_text(row.get(sound_column)), row)
 
-    completed = set() if args.no_resume else existing_event_ids(output_manifest)
+    completed = set() if args.no_resume else existing_candidate_ids(output_manifest)
     existing_rows = []
     if output_manifest.is_file() and not args.no_resume:
         _, existing_rows = read_csv(output_manifest)
@@ -596,9 +903,16 @@ def main() -> int:
     failed_count = 0
     candidates_by_file: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
-        if candidate.event_id in completed:
+        if candidate.candidate_id in completed or (
+            candidate.event_id and candidate.event_id in completed
+        ):
             audit.append(
-                {"event_id": candidate.event_id, "soundfile": candidate.soundfile, "status": "skipped_resume"}
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "event_id": candidate.event_id,
+                    "soundfile": candidate.soundfile,
+                    "status": "skipped_resume",
+                }
             )
         else:
             candidates_by_file[candidate.soundfile].append(candidate)
@@ -626,6 +940,7 @@ def main() -> int:
                     ):
                         audit.append(
                             {
+                                "candidate_id": candidate.candidate_id,
                                 "event_id": candidate.event_id,
                                 "soundfile": soundfile,
                                 "status": "skipped_annotation_buffer",
@@ -633,7 +948,8 @@ def main() -> int:
                         )
                         continue
                     clip_name = (
-                        f"longfp_{safe_name(Path(soundfile).stem)}_"
+                        f"longfp_{candidate.primary_class.lower()}_"
+                        f"{safe_name(Path(soundfile).stem)}_"
                         f"{int(round(start * 1000)):010d}ms_"
                         f"s{int(round(candidate.event_score * 1000)):03d}.wav"
                     )
@@ -654,7 +970,13 @@ def main() -> int:
                         )
                     )
                     audit.append(
-                        {"event_id": candidate.event_id, "soundfile": soundfile, "status": "saved"}
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "event_id": candidate.event_id,
+                            "soundfile": soundfile,
+                            "hard_negative_for": ";".join(candidate.hard_negative_for),
+                            "status": "saved",
+                        }
                     )
                     saved_count += 1
             print(
@@ -666,6 +988,7 @@ def main() -> int:
             for candidate in candidates_by_file[soundfile]:
                 audit.append(
                     {
+                        "candidate_id": candidate.candidate_id,
                         "event_id": candidate.event_id,
                         "soundfile": soundfile,
                         "status": "error",
@@ -692,7 +1015,18 @@ def main() -> int:
     summary = {
         "input_false_positive_events": len(fp_ids),
         "eligible_candidates": len(candidates),
+        "eligible_candidates_by_target": {
+            label: sum(label in candidate.hard_negative_for for candidate in candidates)
+            for label in ("KW", "HW", "AB")
+        },
         "new_clips_saved": saved_count,
+        "new_clips_saved_by_target": {
+            label: sum(
+                label in str(row.get("hard_negative_for", "")).split(";")
+                for row in saved_rows
+            )
+            for label in ("KW", "HW", "AB")
+        },
         "total_manifest_rows": len(all_rows),
         "failed_candidates": failed_count,
         "audit_status_counts": dict(Counter(row.get("status", "") for row in audit)),
@@ -703,10 +1037,17 @@ def main() -> int:
         json.dumps(summary, indent=2), encoding="utf-8"
     )
 
-    print("\nLong-recording FP hard-negative extraction")
+    print("\nLong-recording multispecies hard-negative extraction")
     print("=" * 64)
     print(f"Input FP events:       {len(fp_ids):,}")
     print(f"Eligible candidates:   {len(candidates):,}")
+    print(
+        "Candidate targets:     "
+        + ", ".join(
+            f"{label}={sum(label in candidate.hard_negative_for for candidate in candidates):,}"
+            for label in ("KW", "HW", "AB")
+        )
+    )
     print(f"New 3-second WAVs:     {saved_count:,}")
     print(f"Manifest rows total:   {len(all_rows):,}")
     print(f"Output directory:      {output_dir}")
