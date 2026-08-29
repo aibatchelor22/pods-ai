@@ -38,7 +38,7 @@ import torch
 from scipy.signal import butter, lfilter, sosfilt, sosfiltfilt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import (  # noqa: E402
@@ -119,11 +119,17 @@ class DCLDEAudioDataset(Dataset):
     not materialize AST feature tensors for the whole training set in RAM.
     """
 
-    def __init__(self, frame: pd.DataFrame) -> None:
+    def __init__(self, frame: pd.DataFrame, domain_columns: Optional[list[str]] = None) -> None:
         self.clip_paths = frame["clip_path"].astype(str).tolist()
         self.kw_labels = frame["kw_labels"].astype(int).tolist()
         self.species_labels = frame["species_labels"].astype(int).tolist()
         self.ecotype_labels = frame["ecotype_labels"].astype(int).tolist()
+        self.domain_columns = list(domain_columns or [])
+        self.domain_labels = (
+            frame["domain_label"].astype(str).tolist()
+            if "domain_label" in frame.columns
+            else []
+        )
 
     def __len__(self) -> int:
         return len(self.clip_paths)
@@ -140,7 +146,11 @@ class DCLDEAudioDataset(Dataset):
         return list(getattr(self, label_column))
 
 
-def load_manifest(manifest_path: str, drop_unknown_labels: bool = False) -> DCLDEAudioDataset:
+def load_manifest(
+    manifest_path: str,
+    drop_unknown_labels: bool = False,
+    domain_columns: Optional[list[str]] = None,
+) -> DCLDEAudioDataset:
     """Load a DCLDE manifest into a lightweight PyTorch Dataset."""
     path = resolve_path(manifest_path)
     df = pd.read_csv(path, low_memory=False)
@@ -187,7 +197,89 @@ def load_manifest(manifest_path: str, drop_unknown_labels: bool = False) -> DCLD
         for class_species, ecotype in zip(df["ClassSpecies"], df["Ecotype"])
     ]
 
-    return DCLDEAudioDataset(df.reset_index(drop=True))
+    if domain_columns:
+        missing_domain_columns = set(domain_columns) - set(df.columns)
+        if missing_domain_columns:
+            raise ValueError(
+                f"{path} missing domain-balance columns: {sorted(missing_domain_columns)}"
+            )
+        domain_parts = []
+        for column in domain_columns:
+            values = (
+                df[column]
+                .map(normalize_label)
+                .replace("", "<missing>")
+                .str.casefold()
+            )
+            domain_parts.append(column + "=" + values)
+        domain_labels = domain_parts[0]
+        for part in domain_parts[1:]:
+            domain_labels = domain_labels + " | " + part
+        df["domain_label"] = domain_labels
+
+    return DCLDEAudioDataset(df.reset_index(drop=True), domain_columns=domain_columns)
+
+
+def parse_domain_columns(value: str) -> list[str]:
+    """Parse a comma-separated list of manifest columns used as a domain key."""
+    columns = [item.strip() for item in value.split(",") if item.strip()]
+    if not columns:
+        raise ValueError("--domain-columns must contain at least one manifest column")
+    if len(columns) != len(set(columns)):
+        raise ValueError(f"--domain-columns contains duplicate names: {columns}")
+    return columns
+
+
+def domain_balanced_sample_weights(
+    dataset: DCLDEAudioDataset,
+    minimum_domain_samples: int = 25,
+) -> torch.DoubleTensor:
+    """Balance species, then domains within species, while preserving epoch length.
+
+    Every species receives equal expected sampling probability. Within a species,
+    sufficiently populated domains receive equal shares, and rows within each
+    species/domain group are sampled uniformly. A minimum effective group size
+    prevents a domain represented by only one or two clips from being repeated
+    thousands of times in one epoch.
+    """
+    if not dataset.domain_labels or len(dataset.domain_labels) != len(dataset):
+        raise ValueError("Training dataset does not contain domain labels")
+    if minimum_domain_samples < 1:
+        raise ValueError("minimum_domain_samples must be at least 1")
+
+    group_counts = Counter(zip(dataset.species_labels, dataset.domain_labels))
+    domains_by_species: dict[int, set[str]] = {}
+    for species_id, domain_label in group_counts:
+        domains_by_species.setdefault(species_id, set()).add(domain_label)
+
+    species_count = len(domains_by_species)
+    if species_count == 0:
+        raise ValueError("Cannot construct domain-balanced weights for an empty dataset")
+
+    domain_mass_sums: dict[int, float] = {}
+    for (species_id, _domain_label), group_size in group_counts.items():
+        domain_mass_sums[species_id] = domain_mass_sums.get(species_id, 0.0) + min(
+            1.0,
+            group_size / minimum_domain_samples,
+        )
+
+    weights = []
+    for species_id, domain_label in zip(dataset.species_labels, dataset.domain_labels):
+        group_size = group_counts[(species_id, domain_label)]
+        effective_group_size = max(group_size, minimum_domain_samples)
+        weights.append(
+            1.0
+            / (
+                species_count
+                * domain_mass_sums[species_id]
+                * effective_group_size
+            )
+        )
+
+    weights_tensor = torch.as_tensor(weights, dtype=torch.double)
+    # Scaling does not change sampling probabilities and makes diagnostics easier.
+    weights_tensor /= weights_tensor.mean()
+    return weights_tensor
 
 
 class WaveformAugmenter:
@@ -950,18 +1042,30 @@ class LazyAudioTrainer(Trainer):
         *args: Any,
         train_collator: DCLDEAudioCollator,
         eval_collator: DCLDEAudioCollator,
+        train_sample_weights: Optional[torch.DoubleTensor] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.train_collator = train_collator
         self.eval_collator = eval_collator
+        self.train_sample_weights = train_sample_weights
         self._final_candidate_evaluated = False
         self._optimizer_scheduler_reported = False
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
-        sampler = self._get_train_sampler()
+        if self.train_sample_weights is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(self.args.data_seed))
+            sampler = WeightedRandomSampler(
+                weights=self.train_sample_weights,
+                num_samples=len(self.train_dataset),
+                replacement=True,
+                generator=generator,
+            )
+        else:
+            sampler = self._get_train_sampler()
         dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.args.per_device_train_batch_size,
@@ -1089,6 +1193,43 @@ def analyze_dataset(dataset: dict[str, DCLDEAudioDataset]) -> None:
                 continue
             for label_id in sorted(counts):
                 print(f"    {id2label[label_id]:12s}: {counts[label_id]:7d}")
+    print("=" * 72 + "\n")
+
+
+def analyze_domain_balancing(
+    dataset: DCLDEAudioDataset,
+    sample_weights: torch.DoubleTensor,
+    minimum_domain_samples: int,
+) -> None:
+    """Print source and expected sampled distributions for balanced training."""
+    probabilities = sample_weights / sample_weights.sum()
+    source_species = Counter(dataset.species_labels)
+    expected_species: dict[int, float] = {}
+    expected_domains: dict[int, dict[str, float]] = {}
+    for index, (species_id, domain_label) in enumerate(
+        zip(dataset.species_labels, dataset.domain_labels)
+    ):
+        probability = float(probabilities[index])
+        expected_species[species_id] = expected_species.get(species_id, 0.0) + probability
+        species_domains = expected_domains.setdefault(species_id, {})
+        species_domains[domain_label] = species_domains.get(domain_label, 0.0) + probability
+
+    print("\n" + "=" * 72)
+    print("DOMAIN-BALANCED TRAINING SAMPLER")
+    print("=" * 72)
+    print(f"Domain columns: {', '.join(dataset.domain_columns)}")
+    print(f"Minimum effective species/domain group size: {minimum_domain_samples}")
+    print(f"Samples per epoch: {len(dataset):,} (sampling with replacement)")
+    for species_id in sorted(source_species):
+        species_name = SPECIES_ID2LABEL[species_id]
+        domains = expected_domains[species_id]
+        domain_percentages = [100.0 * value for value in domains.values()]
+        print(
+            f"  {species_name}: source={source_species[species_id]:,}, "
+            f"expected={100.0 * expected_species[species_id]:.2f}%, "
+            f"domains={len(domains)}, expected domain range="
+            f"{min(domain_percentages):.3f}%..{max(domain_percentages):.3f}% of all samples"
+        )
     print("=" * 72 + "\n")
 
 
@@ -1224,6 +1365,14 @@ def save_metadata(
                 "--ecotype-class-weights",
             ),
         },
+        "sampling": {
+            "domain_balanced": args.domain_balanced_sampling,
+            "domain_columns": parse_domain_columns(args.domain_columns),
+            "minimum_domain_samples": args.domain_balance_min_samples,
+            "strategy": "equal_species_then_equal_domain_with_small_group_floor",
+            "samples_per_epoch": "training_manifest_length",
+            "replacement": args.domain_balanced_sampling,
+        },
         "augmentation": {
             "mean_subtract": args.mean_subtract,
             "high_pass_filter": args.high_pass_filter,
@@ -1342,6 +1491,31 @@ def main() -> int:
         type=int,
         default=None,
         help="Deprecated; kept for older commands. Lazy preprocessing now uses --dataloader-workers.",
+    )
+    parser.add_argument(
+        "--domain-balanced-sampling",
+        action="store_true",
+        help=(
+            "Enable replacement sampling that gives each species equal expected weight, "
+            "then balances recording domains within each species. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--domain-columns",
+        default="Provider,Dataset",
+        help=(
+            "Comma-separated training-manifest columns that define a recording domain "
+            "when --domain-balanced-sampling is enabled (default: Provider,Dataset)."
+        ),
+    )
+    parser.add_argument(
+        "--domain-balance-min-samples",
+        type=int,
+        default=25,
+        help=(
+            "Minimum effective size of a species/domain group. This limits repeated "
+            "sampling of extremely small domains (default: 25; use 1 for exact balancing)."
+        ),
     )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--kw-loss-weight", type=float, default=1.0)
@@ -1546,6 +1720,10 @@ def main() -> int:
     print(f"  epochs={args.epochs}")
     print(f"  output_dir={args.output_dir}")
     print(f"  resume_from_checkpoint={args.resume_from_checkpoint}")
+    print(f"  domain_balanced_sampling={args.domain_balanced_sampling}")
+    if args.domain_balanced_sampling:
+        print(f"  domain_columns={args.domain_columns}")
+        print(f"  domain_balance_min_samples={args.domain_balance_min_samples}")
     print("=" * 72 + "\n")
 
     save_steps = args.save_steps if args.save_steps is not None else args.eval_steps
@@ -1561,6 +1739,8 @@ def main() -> int:
     args.random_eq_prob = validate_probability(args.random_eq_prob, "--random-eq-prob")
     if args.early_stopping_patience is not None and args.early_stopping_patience < 1:
         raise ValueError("--early-stopping-patience must be at least 1 when provided")
+    if args.domain_balance_min_samples < 1:
+        raise ValueError("--domain-balance-min-samples must be at least 1")
     if args.time_shift_fade_ms < 0:
         raise ValueError(f"--time-shift-fade-ms must be non-negative, got {args.time_shift_fade_ms}")
     if args.eq_num_bands_min < 1 or args.eq_num_bands_max < 1:
@@ -1622,10 +1802,26 @@ def main() -> int:
         print(f"Ecotype class loss weights: {ecotype_class_weights}")
 
     print("Loading manifests...")
-    train_dataset = load_manifest(args.train_manifest, drop_unknown_labels=args.drop_unknown_labels)
+    domain_columns = parse_domain_columns(args.domain_columns)
+    train_dataset = load_manifest(
+        args.train_manifest,
+        drop_unknown_labels=args.drop_unknown_labels,
+        domain_columns=domain_columns if args.domain_balanced_sampling else None,
+    )
     validation_dataset = load_manifest(args.val_manifest, drop_unknown_labels=args.drop_unknown_labels)
     dataset = {"train": train_dataset, "validation": validation_dataset}
     analyze_dataset(dataset)
+    train_sample_weights = None
+    if args.domain_balanced_sampling:
+        train_sample_weights = domain_balanced_sample_weights(
+            train_dataset,
+            minimum_domain_samples=args.domain_balance_min_samples,
+        )
+        analyze_domain_balancing(
+            train_dataset,
+            train_sample_weights,
+            minimum_domain_samples=args.domain_balance_min_samples,
+        )
 
     print(f"Loading feature extractor: {args.model_name}")
     feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_name)
@@ -1780,6 +1976,7 @@ def main() -> int:
         eval_dataset=dataset["validation"],
         train_collator=train_collator,
         eval_collator=eval_collator,
+        train_sample_weights=train_sample_weights,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
     )
