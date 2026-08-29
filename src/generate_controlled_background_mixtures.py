@@ -510,6 +510,18 @@ def write_outputs(
     pd.DataFrame(audit).to_csv(audit_path, index=False)
 
 
+def write_combined_manifest(
+    original_frame: pd.DataFrame,
+    mixture_rows: list[dict[str, Any]],
+    output_path: Path,
+) -> None:
+    """Append mixtures without filtering or deduplicating original rows."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mixture_frame = pd.DataFrame(mixture_rows)
+    combined = pd.concat([original_frame, mixture_frame], ignore_index=True, sort=False)
+    combined.to_csv(output_path, index=False)
+
+
 def write_kaggle_metadata(output_dir: Path, dataset_id: str, title: str, license_name: str) -> None:
     if dataset_id.count("/") != 1:
         raise ValueError("--kaggle-dataset-id must have the form owner/dataset-slug")
@@ -532,6 +544,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-manifest", default=None)
+    parser.add_argument(
+        "--combined-manifest",
+        default=None,
+        help=(
+            "Original manifest plus generated rows. Defaults to "
+            "OUTPUT_DIR/training_manifest_with_controlled_mixtures.csv."
+        ),
+    )
     parser.add_argument("--num-examples", type=int, default=30000)
     parser.add_argument(
         "--species-counts",
@@ -611,6 +631,11 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     clips_dir.mkdir(parents=True, exist_ok=True)
     output_manifest = Path(args.output_manifest) if args.output_manifest else output_dir / "controlled_mixture_manifest.csv"
+    combined_manifest = (
+        Path(args.combined_manifest)
+        if args.combined_manifest
+        else output_dir / "training_manifest_with_controlled_mixtures.csv"
+    )
     audit_path = output_dir / "generation_audit.csv"
     dataset_root = Path(args.dataset_root) if args.dataset_root else None
     rewrites = parse_path_rewrites(args.path_rewrite)
@@ -622,7 +647,8 @@ def main() -> int:
         else None
     )
 
-    frame = pd.read_csv(manifest_path, low_memory=False)
+    original_frame = pd.read_csv(manifest_path, low_memory=False)
+    frame = original_frame
     required = {"clip_path", "ClassSpecies", "Ecotype", *domain_columns}
     missing = required - set(frame.columns)
     if missing:
@@ -650,15 +676,19 @@ def main() -> int:
     np.random.default_rng(args.seed).shuffle(schedule)
     existing_rows: list[dict[str, Any]] = []
     completed_indices: set[int] = set()
+    published_root = f"/kaggle/input/datasets/{args.kaggle_dataset_id}/clips"
     if output_manifest.is_file() and not args.no_resume:
         existing = pd.read_csv(output_manifest, low_memory=False)
         existing_rows = existing.to_dict("records")
+        for row in existing_rows:
+            filename = normalize_text(row.get("clip_filename"))
+            if filename:
+                row["clip_path"] = f"{published_root}/{filename}"
         if "mixture_index" in existing.columns:
             completed_indices = set(existing["mixture_index"].dropna().astype(int))
     rows = existing_rows
     cache = AudioCache(args.sample_rate, args.clip_duration, args.audio_cache_items)
     all_background_domains = sorted(backgrounds_by_domain)
-    published_root = f"/kaggle/input/datasets/{args.kaggle_dataset_id}/clips"
     failures = Counter()
 
     print("\nControlled call/background mixture generation")
@@ -792,6 +822,7 @@ def main() -> int:
             print(f"Processed {mixture_index + 1:,}/{len(schedule):,}; saved {len(rows):,}")
 
     write_outputs(output_manifest, audit_path, rows, audit)
+    write_combined_manifest(original_frame, rows, combined_manifest)
     write_kaggle_metadata(output_dir, args.kaggle_dataset_id, args.kaggle_title, args.kaggle_license)
     saved_counts = Counter(normalize_text(row.get("ClassSpecies")) for row in rows)
     summary = {
@@ -799,6 +830,8 @@ def main() -> int:
         "requested_species_counts": species_counts,
         "saved_species_counts": dict(saved_counts),
         "saved_total": len(rows),
+        "combined_manifest": str(combined_manifest),
+        "combined_manifest_rows": len(original_frame) + len(rows),
         "failed_examples": sum(1 for row in audit if row.get("status") == "failed"),
         "retry_reasons": dict(failures.most_common()),
         "arguments": vars(args),
@@ -811,6 +844,8 @@ def main() -> int:
     print("=" * 72)
     print(f"Saved mixtures:        {len(rows):,} ({dict(saved_counts)})")
     print(f"Manifest:              {output_manifest}")
+    print(f"Combined manifest:     {combined_manifest}")
+    print(f"Combined rows:         {len(original_frame) + len(rows):,}")
     print(f"Audit:                 {audit_path}")
     print(f"Kaggle metadata:       {output_dir / 'dataset-metadata.json'}")
     print("Review the audit and listen to a sample from every species/SNR range before training.")
