@@ -1457,6 +1457,15 @@ def main() -> int:
         help="Validate every N optimizer steps (default: 20000).",
     )
     parser.add_argument(
+        "--evaluate-best-model-at-end",
+        action="store_true",
+        help=(
+            "Re-run validation after Trainer reloads the selected best checkpoint. "
+            "Disabled by default because the checkpoint's metrics were already "
+            "recorded during training."
+        ),
+    )
+    parser.add_argument(
         "--save-steps",
         type=int,
         default=None,
@@ -1718,6 +1727,7 @@ def main() -> int:
     print(f"  warmup_ratio={args.warmup_ratio}")
     print(f"  seed={args.seed}")
     print(f"  epochs={args.epochs}")
+    print(f"  evaluate_best_model_at_end={args.evaluate_best_model_at_end}")
     print(f"  output_dir={args.output_dir}")
     print(f"  resume_from_checkpoint={args.resume_from_checkpoint}")
     print(f"  domain_balanced_sampling={args.domain_balanced_sampling}")
@@ -1984,9 +1994,26 @@ def main() -> int:
     print("Starting training...")
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
-    print("Evaluating selected best model...")
-    metrics = trainer.evaluate()
-    print(f"Evaluation metrics: {metrics}")
+    selected_checkpoint = trainer.state.best_model_checkpoint
+    selected_metric = trainer.state.best_metric
+    print("\nSelected best model")
+    print("=" * 72)
+    print(f"Checkpoint: {selected_checkpoint or 'final in-memory model'}")
+    if selected_metric is None:
+        print("combined_score: unavailable")
+    else:
+        print(f"combined_score: {float(selected_metric):.6f}")
+    print("=" * 72)
+
+    if args.evaluate_best_model_at_end:
+        print("Evaluating selected best model...")
+        metrics = trainer.evaluate()
+        print(f"Evaluation metrics: {metrics}")
+    else:
+        print(
+            "Skipping redundant end-of-training validation. Pass "
+            "--evaluate-best-model-at-end to run it."
+        )
 
     print(f"Saving final model artifacts to {output_dir}")
     trainer.save_model(str(output_dir))
