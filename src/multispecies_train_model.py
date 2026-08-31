@@ -124,6 +124,11 @@ class DCLDEAudioDataset(Dataset):
         self.kw_labels = frame["kw_labels"].astype(int).tolist()
         self.species_labels = frame["species_labels"].astype(int).tolist()
         self.ecotype_labels = frame["ecotype_labels"].astype(int).tolist()
+        self.hard_negative_flags = (
+            frame["is_hard_negative"].astype(bool).tolist()
+            if "is_hard_negative" in frame.columns
+            else [False] * len(frame)
+        )
         self.domain_columns = list(domain_columns or [])
         self.domain_labels = (
             frame["domain_label"].astype(str).tolist()
@@ -150,6 +155,8 @@ def load_manifest(
     manifest_path: str,
     drop_unknown_labels: bool = False,
     domain_columns: Optional[list[str]] = None,
+    clip_path_dataset_root: Optional[str] = None,
+    is_hard_negative: bool = False,
 ) -> DCLDEAudioDataset:
     """Load a DCLDE manifest into a lightweight PyTorch Dataset."""
     path = resolve_path(manifest_path)
@@ -161,8 +168,14 @@ def load_manifest(
         raise ValueError(f"{path} missing required columns: {sorted(missing)}")
 
     df = df.copy()
+    if clip_path_dataset_root:
+        df["clip_path"] = rewrite_clip_paths_for_dataset_root(
+            df,
+            clip_path_dataset_root,
+        )
     df["ClassSpecies"] = df["ClassSpecies"].map(normalize_label)
     df["Ecotype"] = df["Ecotype"].map(normalize_label)
+    df["is_hard_negative"] = bool(is_hard_negative)
 
     known_species_mask = df["ClassSpecies"].isin(KNOWN_SPECIES)
     if not known_species_mask.all():
@@ -218,6 +231,115 @@ def load_manifest(
         df["domain_label"] = domain_labels
 
     return DCLDEAudioDataset(df.reset_index(drop=True), domain_columns=domain_columns)
+
+
+def rewrite_clip_paths_for_dataset_root(
+    frame: pd.DataFrame,
+    dataset_root: str,
+) -> list[str]:
+    """Rebuild manifest audio paths under a mounted Kaggle dataset root.
+
+    ``relative_clip_path`` is preferred when present. Older hard-negative
+    manifests only contain stale ``/kaggle/working/.../clips`` paths; for those
+    rows the filename is placed under ``DATASET_ROOT/clips``.
+    """
+    root = str(dataset_root).strip().replace("\\", "/").rstrip("/")
+    if not root:
+        raise ValueError("--hard-negative-dataset-root cannot be empty")
+
+    rewritten = []
+    has_relative = "relative_clip_path" in frame.columns
+    for _, row in frame.iterrows():
+        relative = normalize_label(row.get("relative_clip_path")) if has_relative else ""
+        if relative:
+            suffix = relative.replace("\\", "/").lstrip("/")
+        else:
+            original = normalize_label(row.get("clip_path")).replace("\\", "/")
+            filename = original.rsplit("/", 1)[-1]
+            if not filename:
+                raise ValueError("Hard-negative manifest contains an empty clip_path")
+            suffix = f"clips/{filename}"
+        rewritten.append(f"{root}/{suffix}")
+    return rewritten
+
+
+def concatenate_audio_datasets(
+    primary: DCLDEAudioDataset,
+    additional: DCLDEAudioDataset,
+) -> DCLDEAudioDataset:
+    """Concatenate lightweight datasets while retaining hard-negative flags."""
+    frame = pd.DataFrame(
+        {
+            "clip_path": [*primary.clip_paths, *additional.clip_paths],
+            "kw_labels": [*primary.kw_labels, *additional.kw_labels],
+            "species_labels": [*primary.species_labels, *additional.species_labels],
+            "ecotype_labels": [*primary.ecotype_labels, *additional.ecotype_labels],
+            "is_hard_negative": [
+                *primary.hard_negative_flags,
+                *additional.hard_negative_flags,
+            ],
+        }
+    )
+    return DCLDEAudioDataset(frame)
+
+
+def validate_hard_negative_dataset(dataset: DCLDEAudioDataset) -> None:
+    """Require every row in a separate hard-negative manifest to be background."""
+    background_id = SPECIES_LABELS["background"]
+    invalid = [
+        index
+        for index, (kw_label, species_label, ecotype_label, is_hard_negative) in enumerate(
+            zip(
+                dataset.kw_labels,
+                dataset.species_labels,
+                dataset.ecotype_labels,
+                dataset.hard_negative_flags,
+            )
+        )
+        if (
+            not is_hard_negative
+            or kw_label != KW_LABELS["not_kw"]
+            or species_label != background_id
+            or ecotype_label != IGNORE_INDEX
+        )
+    ]
+    if invalid:
+        raise ValueError(
+            "--hard-negative-manifest must contain only BKG/UndBio rows with no "
+            f"ecotype; invalid row indices include {invalid[:10]}"
+        )
+
+
+def validate_hard_negative_clip_paths(dataset: DCLDEAudioDataset) -> None:
+    """Fail early when rewritten hard-negative audio paths are unavailable."""
+    missing = [path for path in dataset.clip_paths if not Path(path).is_file()]
+    if missing:
+        examples = ", ".join(missing[:5])
+        raise FileNotFoundError(
+            f"{len(missing):,} hard-negative audio files were not found; examples: {examples}"
+        )
+
+
+def hard_negative_sample_weights(
+    dataset: DCLDEAudioDataset,
+    sampling_ratio: float,
+) -> torch.DoubleTensor:
+    """Assign a fixed probability mass to hard negatives for replacement sampling."""
+    if not 0.0 < sampling_ratio < 1.0:
+        raise ValueError("--hard-negative-sampling-ratio must be greater than 0 and less than 1")
+    hard_count = sum(dataset.hard_negative_flags)
+    regular_count = len(dataset) - hard_count
+    if hard_count == 0 or regular_count == 0:
+        raise ValueError("Hard-negative sampling requires both regular and hard-negative rows")
+
+    hard_weight = sampling_ratio / hard_count
+    regular_weight = (1.0 - sampling_ratio) / regular_count
+    weights = torch.as_tensor(
+        [hard_weight if flag else regular_weight for flag in dataset.hard_negative_flags],
+        dtype=torch.double,
+    )
+    weights /= weights.mean()
+    return weights
 
 
 def parse_domain_columns(value: str) -> list[str]:
@@ -1043,12 +1165,14 @@ class LazyAudioTrainer(Trainer):
         train_collator: DCLDEAudioCollator,
         eval_collator: DCLDEAudioCollator,
         train_sample_weights: Optional[torch.DoubleTensor] = None,
+        train_samples_per_epoch: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.train_collator = train_collator
         self.eval_collator = eval_collator
         self.train_sample_weights = train_sample_weights
+        self.train_samples_per_epoch = train_samples_per_epoch
         self._final_candidate_evaluated = False
         self._optimizer_scheduler_reported = False
 
@@ -1060,7 +1184,7 @@ class LazyAudioTrainer(Trainer):
             generator.manual_seed(int(self.args.data_seed))
             sampler = WeightedRandomSampler(
                 weights=self.train_sample_weights,
-                num_samples=len(self.train_dataset),
+                num_samples=self.train_samples_per_epoch or len(self.train_dataset),
                 replacement=True,
                 generator=generator,
             )
@@ -1193,6 +1317,34 @@ def analyze_dataset(dataset: dict[str, DCLDEAudioDataset]) -> None:
                 continue
             for label_id in sorted(counts):
                 print(f"    {id2label[label_id]:12s}: {counts[label_id]:7d}")
+
+
+def analyze_hard_negative_sampling(
+    dataset: DCLDEAudioDataset,
+    sample_weights: torch.DoubleTensor,
+    sampling_ratio: float,
+    samples_per_epoch: int,
+    batch_size: int,
+) -> None:
+    """Print expected hard-negative exposure for the replacement sampler."""
+    probabilities = sample_weights / sample_weights.sum()
+    hard_probability = sum(
+        float(probabilities[index])
+        for index, flag in enumerate(dataset.hard_negative_flags)
+        if flag
+    )
+    hard_count = sum(dataset.hard_negative_flags)
+    print("\n" + "=" * 72)
+    print("HARD-NEGATIVE TRAINING SAMPLER")
+    print("=" * 72)
+    print(f"Regular manifest rows:          {len(dataset) - hard_count:,}")
+    print(f"Unique hard-negative rows:      {hard_count:,}")
+    print(f"Target hard-negative fraction:  {sampling_ratio:.2%}")
+    print(f"Effective probability mass:     {hard_probability:.2%}")
+    print(f"Samples per epoch:              {samples_per_epoch:,} (replacement sampling)")
+    print(f"Expected hard negatives/epoch:  {samples_per_epoch * hard_probability:,.1f}")
+    print(f"Expected hard negatives/batch:  {batch_size * hard_probability:.2f}")
+    print("=" * 72)
     print("=" * 72 + "\n")
 
 
@@ -1369,9 +1521,20 @@ def save_metadata(
             "domain_balanced": args.domain_balanced_sampling,
             "domain_columns": parse_domain_columns(args.domain_columns),
             "minimum_domain_samples": args.domain_balance_min_samples,
-            "strategy": "equal_species_then_equal_domain_with_small_group_floor",
+            "hard_negative_manifest": args.hard_negative_manifest,
+            "hard_negative_dataset_root": args.hard_negative_dataset_root,
+            "hard_negative_sampling_ratio": args.hard_negative_sampling_ratio,
+            "strategy": (
+                "fixed_hard_negative_probability_mass"
+                if args.hard_negative_manifest
+                else "equal_species_then_equal_domain_with_small_group_floor"
+                if args.domain_balanced_sampling
+                else "trainer_default_random_sampling"
+            ),
             "samples_per_epoch": "training_manifest_length",
-            "replacement": args.domain_balanced_sampling,
+            "replacement": bool(
+                args.domain_balanced_sampling or args.hard_negative_manifest
+            ),
         },
         "augmentation": {
             "mean_subtract": args.mean_subtract,
@@ -1525,6 +1688,36 @@ def main() -> int:
             "Minimum effective size of a species/domain group. This limits repeated "
             "sampling of extremely small domains (default: 25; use 1 for exact balancing)."
         ),
+    )
+    parser.add_argument(
+        "--hard-negative-manifest",
+        default=None,
+        help=(
+            "Optional background-only hard-negative CSV. Rows are added to the training "
+            "pool and sampled at --hard-negative-sampling-ratio; disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--hard-negative-dataset-root",
+        default=None,
+        help=(
+            "Optional mounted Kaggle dataset root for rebuilding hard-negative clip paths. "
+            "Uses relative_clip_path when available, otherwise DATASET_ROOT/clips/FILENAME."
+        ),
+    )
+    parser.add_argument(
+        "--hard-negative-sampling-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Required with --hard-negative-manifest. Fraction of all epoch draws allocated "
+            "to hard negatives, for example 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--skip-hard-negative-path-validation",
+        action="store_true",
+        help="Skip the pre-training existence check for hard-negative audio files.",
     )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--kw-loss-weight", type=float, default=1.0)
@@ -1734,6 +1927,10 @@ def main() -> int:
     if args.domain_balanced_sampling:
         print(f"  domain_columns={args.domain_columns}")
         print(f"  domain_balance_min_samples={args.domain_balance_min_samples}")
+    print(f"  hard_negative_manifest={args.hard_negative_manifest}")
+    if args.hard_negative_manifest:
+        print(f"  hard_negative_dataset_root={args.hard_negative_dataset_root}")
+        print(f"  hard_negative_sampling_ratio={args.hard_negative_sampling_ratio}")
     print("=" * 72 + "\n")
 
     save_steps = args.save_steps if args.save_steps is not None else args.eval_steps
@@ -1751,6 +1948,28 @@ def main() -> int:
         raise ValueError("--early-stopping-patience must be at least 1 when provided")
     if args.domain_balance_min_samples < 1:
         raise ValueError("--domain-balance-min-samples must be at least 1")
+    if args.domain_balanced_sampling and args.hard_negative_manifest:
+        raise ValueError(
+            "--domain-balanced-sampling and --hard-negative-manifest cannot be used "
+            "together; run this ablation with domain balancing disabled"
+        )
+    if bool(args.hard_negative_manifest) != bool(
+        args.hard_negative_sampling_ratio is not None
+    ):
+        raise ValueError(
+            "Specify both --hard-negative-manifest and "
+            "--hard-negative-sampling-ratio, or neither"
+        )
+    if args.hard_negative_sampling_ratio is not None and not (
+        0.0 < args.hard_negative_sampling_ratio < 1.0
+    ):
+        raise ValueError(
+            "--hard-negative-sampling-ratio must be greater than 0 and less than 1"
+        )
+    if args.hard_negative_dataset_root and not args.hard_negative_manifest:
+        raise ValueError(
+            "--hard-negative-dataset-root requires --hard-negative-manifest"
+        )
     if args.time_shift_fade_ms < 0:
         raise ValueError(f"--time-shift-fade-ms must be non-negative, got {args.time_shift_fade_ms}")
     if args.eq_num_bands_min < 1 or args.eq_num_bands_max < 1:
@@ -1818,6 +2037,23 @@ def main() -> int:
         drop_unknown_labels=args.drop_unknown_labels,
         domain_columns=domain_columns if args.domain_balanced_sampling else None,
     )
+    primary_train_rows = len(train_dataset)
+    hard_negative_dataset = None
+    if args.hard_negative_manifest:
+        hard_negative_dataset = load_manifest(
+            args.hard_negative_manifest,
+            drop_unknown_labels=False,
+            clip_path_dataset_root=args.hard_negative_dataset_root,
+            is_hard_negative=True,
+        )
+        validate_hard_negative_dataset(hard_negative_dataset)
+        if not args.skip_hard_negative_path_validation:
+            print("Validating hard-negative audio paths...")
+            validate_hard_negative_clip_paths(hard_negative_dataset)
+        train_dataset = concatenate_audio_datasets(
+            train_dataset,
+            hard_negative_dataset,
+        )
     validation_dataset = load_manifest(args.val_manifest, drop_unknown_labels=args.drop_unknown_labels)
     dataset = {"train": train_dataset, "validation": validation_dataset}
     analyze_dataset(dataset)
@@ -1831,6 +2067,18 @@ def main() -> int:
             train_dataset,
             train_sample_weights,
             minimum_domain_samples=args.domain_balance_min_samples,
+        )
+    elif hard_negative_dataset is not None:
+        train_sample_weights = hard_negative_sample_weights(
+            train_dataset,
+            sampling_ratio=args.hard_negative_sampling_ratio,
+        )
+        analyze_hard_negative_sampling(
+            train_dataset,
+            train_sample_weights,
+            sampling_ratio=args.hard_negative_sampling_ratio,
+            samples_per_epoch=primary_train_rows,
+            batch_size=args.batch_size,
         )
 
     print(f"Loading feature extractor: {args.model_name}")
@@ -1961,7 +2209,7 @@ def main() -> int:
     )
     print_training_geometry(
         training_args=training_args,
-        train_rows=len(dataset["train"]),
+        train_rows=primary_train_rows,
         validation_rows=len(dataset["validation"]),
     )
 
@@ -1987,6 +2235,9 @@ def main() -> int:
         train_collator=train_collator,
         eval_collator=eval_collator,
         train_sample_weights=train_sample_weights,
+        train_samples_per_epoch=(
+            primary_train_rows if hard_negative_dataset is not None else None
+        ),
         compute_metrics=compute_metrics,
         callbacks=callbacks,
     )
