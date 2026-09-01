@@ -29,7 +29,8 @@ from scipy.signal import resample_poly
 DEFAULT_OUTPUT_DIR = "/kaggle/working/orcasound_distractor_background_mixtures"
 DEFAULT_KAGGLE_DATASET_ID = "leonisviridis/orcasound-distractor-background-mixtures"
 DEFAULT_CATEGORIES = ("bird", "vessel", "jingle", "human")
-BACKGROUND_SPECIES = {"BKG", "UndBio"}
+BACKGROUND_SPECIES = {"BKG"}
+UNCERTAIN_OR_TARGET_SPECIES = {"KW", "HW", "AB", "UNDBIO"}
 EPSILON = 1e-12
 
 
@@ -90,6 +91,13 @@ def candidate_paths(
         relative = normalize_text(row.get("relative_clip_path")).replace("\\", "/")
         filename = normalized.rsplit("/", 1)[-1]
         category = normalize_text(row.get("Category") or row.get("category")).casefold()
+        node_name = normalize_text(row.get("NodeName") or row.get("node_name"))
+        timestamp = normalize_text(row.get("Timestamp") or row.get("timestamp"))
+        inferred_filename = (
+            f"{node_name.replace('_', '-')}_{timestamp}.wav"
+            if node_name and timestamp
+            else ""
+        )
         if relative:
             candidates.append(dataset_root / relative.lstrip("/"))
         if not path.is_absolute():
@@ -108,6 +116,16 @@ def candidate_paths(
                     dataset_root / "src" / "output" / "wav" / category / filename,
                 ]
             )
+        if inferred_filename:
+            candidates.extend(
+                [
+                    dataset_root / inferred_filename,
+                    dataset_root / "clips" / inferred_filename,
+                    dataset_root / category / inferred_filename,
+                    dataset_root / "output" / "wav" / category / inferred_filename,
+                    dataset_root / "src" / "output" / "wav" / category / inferred_filename,
+                ]
+            )
     unique = []
     seen = set()
     for candidate in candidates:
@@ -116,6 +134,112 @@ def candidate_paths(
             unique.append(candidate)
             seen.add(key)
     return unique
+
+
+def parse_orcasound_timestamp(value: Any) -> pd.Timestamp:
+    """Parse the timestamp convention used by Orcasound manifests."""
+    text = normalize_text(value)
+    if not text:
+        raise ValueError("missing Orcasound timestamp")
+    return pd.to_datetime(
+        text.removesuffix("_PST"),
+        format="%Y_%m_%d_%H_%M_%S",
+        errors="raise",
+    )
+
+
+def quarantine_same_node_day(
+    distractors: pd.DataFrame,
+    testing: pd.DataFrame,
+    node_column: str = "NodeName",
+    timestamp_column: str = "Timestamp",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove distractors from the same hydrophone/date as a held-out test row."""
+    required = {node_column, timestamp_column}
+    for name, frame in (("distractor", distractors), ("testing", testing)):
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"{name} manifest missing quarantine columns: {sorted(missing)}")
+
+    held_out_keys = {
+        (
+            normalize_text(row[node_column]).casefold(),
+            parse_orcasound_timestamp(row[timestamp_column]).date().isoformat(),
+        )
+        for _, row in testing.iterrows()
+    }
+    keys = distractors.apply(
+        lambda row: (
+            normalize_text(row[node_column]).casefold(),
+            parse_orcasound_timestamp(row[timestamp_column]).date().isoformat(),
+        ),
+        axis=1,
+    )
+    excluded_mask = keys.isin(held_out_keys)
+    excluded = distractors.loc[excluded_mask].copy()
+    excluded["quarantine_reason"] = "same_hydrophone_and_calendar_date_as_test"
+    return distractors.loc[~excluded_mask].copy(), excluded
+
+
+def numeric(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+    return result if math.isfinite(result) else math.nan
+
+
+def basename(value: Any) -> str:
+    return Path(normalize_text(value).replace("\\", "/")).name
+
+
+def screen_backgrounds_with_annotations(
+    backgrounds: pd.DataFrame,
+    annotations: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reject BKG donor clips overlapping target or uncertain annotations."""
+    required_annotations = {"Soundfile", "ClassSpecies", "FileBeginSec", "FileEndSec"}
+    missing = required_annotations - set(annotations.columns)
+    if missing:
+        raise ValueError(f"Annotations CSV missing columns: {sorted(missing)}")
+    if "Soundfile" not in backgrounds.columns:
+        return backgrounds.copy(), pd.DataFrame()
+
+    unsafe = annotations.copy()
+    unsafe["_species"] = unsafe["ClassSpecies"].map(normalize_text).str.upper()
+    unsafe = unsafe.loc[unsafe["_species"].isin(UNCERTAIN_OR_TARGET_SPECIES)].copy()
+    unsafe["_soundfile"] = unsafe["Soundfile"].map(basename)
+    unsafe["_start"] = pd.to_numeric(unsafe["FileBeginSec"], errors="coerce")
+    unsafe["_end"] = pd.to_numeric(unsafe["FileEndSec"], errors="coerce")
+    unsafe = unsafe.loc[
+        unsafe["_soundfile"].ne("")
+        & unsafe["_start"].notna()
+        & unsafe["_end"].notna()
+        & unsafe["_end"].gt(unsafe["_start"])
+    ]
+    intervals = {
+        soundfile: list(zip(group["_start"], group["_end"], group["_species"]))
+        for soundfile, group in unsafe.groupby("_soundfile", sort=False)
+    }
+
+    excluded_indices = []
+    reasons = {}
+    for index, row in backgrounds.iterrows():
+        soundfile = basename(row.get("Soundfile"))
+        clip_start = numeric(row.get("ClipStartSec"))
+        clip_end = numeric(row.get("ClipEndSec"))
+        if not soundfile or not math.isfinite(clip_start) or not math.isfinite(clip_end):
+            continue
+        for annotation_start, annotation_end, species in intervals.get(soundfile, []):
+            if clip_start < annotation_end and annotation_start < clip_end:
+                excluded_indices.append(index)
+                reasons[index] = f"overlaps_annotation_{species}"
+                break
+
+    excluded = backgrounds.loc[excluded_indices].copy()
+    if not excluded.empty:
+        excluded["background_exclusion_reason"] = [reasons[index] for index in excluded.index]
+    return backgrounds.drop(index=excluded_indices).copy(), excluded
 
 
 def resolve_audio_path(
@@ -195,11 +319,68 @@ def rms(waveform: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(waveform, dtype=np.float64))))
 
 
+def active_rms(
+    waveform: np.ndarray,
+    sample_rate: int,
+    frame_duration_ms: float = 100.0,
+    active_quantile: float = 0.80,
+) -> float:
+    """RMS over frames at or above the waveform's frame-RMS quantile."""
+    frame_samples = max(1, int(round(sample_rate * frame_duration_ms / 1000.0)))
+    usable_samples = (len(waveform) // frame_samples) * frame_samples
+    if usable_samples < frame_samples:
+        return rms(waveform)
+    frames = waveform[:usable_samples].reshape(-1, frame_samples)
+    frame_rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    cutoff = float(np.quantile(frame_rms, active_quantile))
+    active_frames = frames[frame_rms >= cutoff]
+    return rms(active_frames) if active_frames.size else rms(waveform)
+
+
+def dbfs(value: float) -> float:
+    return 20.0 * math.log10(max(float(value), EPSILON))
+
+
+def clipped_percent(waveform: np.ndarray) -> float:
+    return float(100.0 * np.mean(np.abs(waveform) >= 0.999))
+
+
+def validate_audio_quality(
+    waveform: np.ndarray,
+    role: str,
+    minimum_rms_dbfs: float | None,
+    maximum_clipped_percent: float | None,
+) -> dict[str, float]:
+    waveform_rms = rms(waveform)
+    waveform_rms_dbfs = dbfs(waveform_rms)
+    waveform_clipped_percent = clipped_percent(waveform)
+    if minimum_rms_dbfs is not None and waveform_rms_dbfs < minimum_rms_dbfs:
+        raise ValueError(
+            f"{role}_rms_dbfs_below_minimum: "
+            f"{waveform_rms_dbfs:.3f} < {minimum_rms_dbfs:.3f}"
+        )
+    if (
+        maximum_clipped_percent is not None
+        and waveform_clipped_percent > maximum_clipped_percent
+    ):
+        raise ValueError(
+            f"{role}_clipped_percent_above_maximum: "
+            f"{waveform_clipped_percent:.6f} > {maximum_clipped_percent:.6f}"
+        )
+    return {
+        "rms": waveform_rms,
+        "rms_dbfs": waveform_rms_dbfs,
+        "clipped_percent": waveform_clipped_percent,
+    }
+
+
 def mix_distractor_and_background(
     distractor: np.ndarray,
     background: np.ndarray,
     target_snr_db: float,
     peak_limit: float,
+    sample_rate: int = 16000,
+    snr_reference: str = "rms",
 ) -> tuple[np.ndarray, dict[str, float]]:
     distractor_rms = rms(distractor)
     background_rms = rms(background)
@@ -207,10 +388,29 @@ def mix_distractor_and_background(
         raise ValueError("silent_distractor")
     if background_rms <= EPSILON:
         raise ValueError("silent_background")
-    target_distractor_rms = background_rms * 10.0 ** (target_snr_db / 20.0)
-    distractor_gain = target_distractor_rms / distractor_rms
+    if snr_reference == "active_rms":
+        distractor_reference_rms = active_rms(distractor, sample_rate)
+        background_reference_rms = active_rms(background, sample_rate)
+    elif snr_reference == "rms":
+        distractor_reference_rms = distractor_rms
+        background_reference_rms = background_rms
+    else:
+        raise ValueError(f"Unsupported SNR reference: {snr_reference}")
+    if distractor_reference_rms <= EPSILON:
+        raise ValueError("silent_distractor_reference")
+    if background_reference_rms <= EPSILON:
+        raise ValueError("silent_background_reference")
+    target_distractor_rms = background_reference_rms * 10.0 ** (target_snr_db / 20.0)
+    distractor_gain = target_distractor_rms / distractor_reference_rms
     scaled_distractor = distractor * distractor_gain
-    measured_snr_db = 20.0 * math.log10((rms(scaled_distractor) + EPSILON) / background_rms)
+    scaled_distractor_reference_rms = (
+        active_rms(scaled_distractor, sample_rate)
+        if snr_reference == "active_rms"
+        else rms(scaled_distractor)
+    )
+    measured_snr_db = 20.0 * math.log10(
+        (scaled_distractor_reference_rms + EPSILON) / background_reference_rms
+    )
     mixture = background + scaled_distractor
     peak_before_scale = float(np.max(np.abs(mixture)))
     peak_scale = min(1.0, peak_limit / peak_before_scale) if peak_before_scale > 0 else 1.0
@@ -218,6 +418,8 @@ def mix_distractor_and_background(
     return mixture, {
         "distractor_rms": distractor_rms,
         "background_rms": background_rms,
+        "distractor_reference_rms": distractor_reference_rms,
+        "background_reference_rms": background_reference_rms,
         "distractor_gain": distractor_gain,
         "measured_snr_db": measured_snr_db,
         "peak_before_scale": peak_before_scale,
@@ -309,6 +511,7 @@ def output_row(
         "mixture_index": mixture_index,
         "mixture_seed": seed,
         "mixture_method": "broadband_distractor_plus_underwater_background",
+        "mixture_snr_reference": metrics.get("snr_reference", "rms"),
         "mixture_target_snr_db": target_snr_db,
         "mixture_measured_snr_db": metrics["measured_snr_db"],
         "mixture_distractor_gain": metrics["distractor_gain"],
@@ -325,6 +528,14 @@ def output_row(
         "background_domain": background_domain,
         "distractor_rms_before_gain": metrics["distractor_rms"],
         "background_rms": metrics["background_rms"],
+        "distractor_reference_rms_before_gain": metrics.get(
+            "distractor_reference_rms", metrics["distractor_rms"]
+        ),
+        "background_reference_rms": metrics.get(
+            "background_reference_rms", metrics["background_rms"]
+        ),
+        "distractor_clipped_percent": metrics.get("distractor_clipped_percent"),
+        "background_clipped_percent": metrics.get("background_clipped_percent"),
     }
 
 
@@ -350,6 +561,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distractor-manifest", required=True)
     parser.add_argument("--training-manifest", required=True)
     parser.add_argument(
+        "--annotations-csv",
+        required=True,
+        help="Original Annotations.csv used to reject BKG donors overlapping target/UndBio annotations.",
+    )
+    parser.add_argument(
+        "--testing-manifest",
+        required=True,
+        help="Held-out Orcasound 60s manifest used for same-hydrophone/day quarantine.",
+    )
+    parser.add_argument(
         "--ordinary-background-manifest",
         default=None,
         help="BKG/UndBio donor manifest; defaults to --training-manifest.",
@@ -362,6 +583,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--background-path-rewrite", action="append", default=[])
     parser.add_argument("--category-column", default=None)
     parser.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES))
+    parser.add_argument(
+        "--allow-undbio-backgrounds",
+        action="store_true",
+        help="Allow ClassSpecies=UndBio ordinary background donors (default: excluded).",
+    )
     parser.add_argument("--mixtures-per-source", type=int, default=10)
     parser.add_argument("--num-mixtures", type=int, default=None)
     parser.add_argument(
@@ -381,6 +607,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-duration", type=float, default=3.0)
     parser.add_argument("--snr-db-min", type=float, default=-12.0)
     parser.add_argument("--snr-db-max", type=float, default=12.0)
+    parser.add_argument(
+        "--snr-reference",
+        choices=("rms", "active_rms"),
+        default="rms",
+        help="Level reference used to set SNR (default: whole-clip RMS).",
+    )
+    parser.add_argument(
+        "--minimum-background-rms-dbfs",
+        type=float,
+        default=None,
+        help="Reject fitted background donors quieter than this whole-clip RMS level.",
+    )
+    parser.add_argument(
+        "--maximum-clipped-percent",
+        type=float,
+        default=None,
+        help="Reject distractor or background clips with a larger percent of samples at |x| >= 0.999.",
+    )
     parser.add_argument("--max-shift-ms", type=float, default=500.0)
     parser.add_argument("--peak-limit", type=float, default=0.99)
     parser.add_argument("--audio-format", choices=("wav", "flac"), default="wav")
@@ -413,6 +657,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-shift-ms cannot be negative")
     if not 0 < args.peak_limit <= 1:
         raise ValueError("--peak-limit must be in (0, 1]")
+    if args.maximum_clipped_percent is not None and not (
+        0 <= args.maximum_clipped_percent <= 100
+    ):
+        raise ValueError("--maximum-clipped-percent must be in [0, 100]")
     if args.audio_cache_items < 1 or args.max_attempts_per_mixture < 1:
         raise ValueError("Cache size and maximum attempts must be positive")
     if args.checkpoint_every < 1:
@@ -427,7 +675,15 @@ def main() -> int:
     distractor_manifest = Path(args.distractor_manifest)
     training_manifest = Path(args.training_manifest)
     background_manifest = Path(args.ordinary_background_manifest or args.training_manifest)
-    for path in (distractor_manifest, training_manifest, background_manifest):
+    annotations_path = Path(args.annotations_csv)
+    testing_manifest = Path(args.testing_manifest)
+    for path in (
+        distractor_manifest,
+        training_manifest,
+        background_manifest,
+        annotations_path,
+        testing_manifest,
+    ):
         if not path.is_file():
             raise FileNotFoundError(path)
 
@@ -446,10 +702,14 @@ def main() -> int:
         else output_dir / "training_manifest_with_orcasound_distractors.csv"
     )
     audit_path = output_dir / "generation_audit.csv"
+    quarantine_path = output_dir / "quarantined_orcasound_distractors.csv"
+    background_exclusions_path = output_dir / "background_annotation_exclusions.csv"
 
     distractors = pd.read_csv(distractor_manifest, low_memory=False)
     training_frame = pd.read_csv(training_manifest, low_memory=False)
     backgrounds = pd.read_csv(background_manifest, low_memory=False)
+    annotations = pd.read_csv(annotations_path, low_memory=False)
+    testing = pd.read_csv(testing_manifest, low_memory=False)
     distractor_path_column = find_column(
         distractors,
         args.distractor_path_column,
@@ -474,11 +734,27 @@ def main() -> int:
     distractors = distractors.loc[distractors["_category"].isin(allowed_categories)].copy()
     if distractors.empty:
         raise ValueError(f"No distractor rows matched categories {sorted(allowed_categories)}")
+    distractors_before_quarantine = len(distractors)
+    distractors, quarantined_distractors = quarantine_same_node_day(distractors, testing)
+    quarantined_distractors.to_csv(quarantine_path, index=False)
+    if distractors.empty:
+        raise ValueError("All distractor rows were removed by same-hydrophone/day quarantine")
+    allowed_background_species = set(BACKGROUND_SPECIES)
+    if args.allow_undbio_backgrounds:
+        allowed_background_species.add("UndBio")
     backgrounds = backgrounds.loc[
-        backgrounds["ClassSpecies"].map(normalize_text).isin(BACKGROUND_SPECIES)
+        backgrounds["ClassSpecies"].map(normalize_text).isin(allowed_background_species)
     ].copy()
     if backgrounds.empty:
-        raise ValueError("No BKG or UndBio rows were found in the ordinary background manifest")
+        raise ValueError("No eligible BKG rows were found in the ordinary background manifest")
+    backgrounds_before_annotation_screen = len(backgrounds)
+    backgrounds, background_exclusions = screen_backgrounds_with_annotations(
+        backgrounds,
+        annotations,
+    )
+    background_exclusions.to_csv(background_exclusions_path, index=False)
+    if backgrounds.empty:
+        raise ValueError("All ordinary backgrounds were rejected by annotation screening")
 
     categories = sorted(distractors["_category"].unique())
     total_mixtures = args.num_mixtures or len(distractors) * args.mixtures_per_source
@@ -529,11 +805,24 @@ def main() -> int:
     print("=" * 72)
     print(f"Distractor manifest:       {distractor_manifest}")
     print(f"Training manifest:         {training_manifest}")
+    print(f"Annotations CSV:           {annotations_path}")
+    print(f"Held-out testing manifest: {testing_manifest}")
+    print(
+        f"Distractor quarantine:     {distractors_before_quarantine - len(distractors):,} removed; "
+        f"{len(distractors):,} retained"
+    )
+    print(
+        f"Annotation donor screen:   {backgrounds_before_annotation_screen - len(backgrounds):,} "
+        f"removed; {len(backgrounds):,} retained"
+    )
     print(f"Ordinary backgrounds:      {len(backgrounds):,} across {len(domains):,} domains")
     print(f"Eligible distractors:      {len(distractors):,}")
     print(f"Distractor categories:     {dict(Counter(distractors['_category']))}")
     print(f"Requested mixtures:        {len(schedule):,} ({dict(Counter(schedule))})")
     print(f"Target SNR range:          {args.snr_db_min:g}..{args.snr_db_max:g} dB")
+    print(f"SNR reference:             {args.snr_reference}")
+    print(f"Minimum background RMS:    {args.minimum_background_rms_dbfs} dBFS")
+    print(f"Maximum clipped samples:   {args.maximum_clipped_percent}%")
     print(f"Uniform background domains:{args.uniform_background_domains}")
     print(f"Already completed:         {len(completed_indices):,}")
     print("=" * 72 + "\n")
@@ -567,6 +856,18 @@ def main() -> int:
                 background_audio = fit_duration(
                     cache.load(background_path), target_samples, example_rng
                 )
+                distractor_quality = validate_audio_quality(
+                    distractor_audio,
+                    "distractor",
+                    minimum_rms_dbfs=None,
+                    maximum_clipped_percent=args.maximum_clipped_percent,
+                )
+                background_quality = validate_audio_quality(
+                    background_audio,
+                    "background",
+                    minimum_rms_dbfs=args.minimum_background_rms_dbfs,
+                    maximum_clipped_percent=args.maximum_clipped_percent,
+                )
                 shift = (
                     int(example_rng.integers(-max_shift_samples, max_shift_samples + 1))
                     if max_shift_samples
@@ -579,7 +880,16 @@ def main() -> int:
                     background_audio,
                     target_snr_db,
                     args.peak_limit,
+                    sample_rate=args.sample_rate,
+                    snr_reference=args.snr_reference,
                 )
+                metrics["snr_reference"] = args.snr_reference
+                metrics["distractor_clipped_percent"] = distractor_quality[
+                    "clipped_percent"
+                ]
+                metrics["background_clipped_percent"] = background_quality[
+                    "clipped_percent"
+                ]
                 extension = ".wav" if args.audio_format == "wav" else ".flac"
                 filename = (
                     f"distractor_{mixture_index:06d}_{category}_"
@@ -658,7 +968,13 @@ def main() -> int:
         "distractor_manifest": str(distractor_manifest),
         "training_manifest": str(training_manifest),
         "ordinary_background_manifest": str(background_manifest),
+        "annotations_csv": str(annotations_path),
+        "testing_manifest": str(testing_manifest),
+        "distractors_before_quarantine": distractors_before_quarantine,
+        "quarantined_distractors": len(quarantined_distractors),
         "eligible_distractors": len(distractors),
+        "backgrounds_before_annotation_screen": backgrounds_before_annotation_screen,
+        "background_annotation_exclusions": len(background_exclusions),
         "requested_mixtures": len(schedule),
         "saved_mixtures": len(rows),
         "saved_categories": dict(Counter(normalize_text(row.get("distractor_category")) for row in rows)),
