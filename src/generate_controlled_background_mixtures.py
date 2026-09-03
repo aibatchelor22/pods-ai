@@ -40,6 +40,7 @@ POSITIVE_SPECIES = ("KW", "HW", "AB")
 BACKGROUND_SPECIES = {"BKG", "UndBio"}
 MISSING_DOMAIN = "<missing>"
 EPSILON = 1e-12
+_PCA_RANDOM_PROJECTIONS: dict[tuple[int, int], np.ndarray] = {}
 
 
 def normalize_text(value: Any) -> str:
@@ -94,6 +95,37 @@ def parse_species_counts(value: Optional[str], total: int) -> dict[str, int]:
     if any(count < 0 for count in counts.values()) or sum(counts.values()) < 1:
         raise ValueError("--species-counts must contain non-negative counts with a positive sum")
     return counts
+
+
+def randomized_low_rank_reconstruction(
+    centered: np.ndarray,
+    rank: int,
+    power_iterations: int = 2,
+) -> np.ndarray:
+    """Approximate a PCA reconstruction without computing a full SVD.
+
+    Three-second STFT matrices are small but a full decomposition per output
+    clip is costly at dataset scale. A fixed random projection makes this
+    approximation deterministic, fast, and sufficiently accurate for
+    estimating broad stationary background structure.
+    """
+    maximum_rank = min(centered.shape)
+    if rank < 1 or rank > maximum_rank:
+        raise ValueError(f"PCA rank must be in [1, {maximum_rank}]")
+    projected_rank = min(maximum_rank, rank + 4)
+    key = (centered.shape[1], projected_rank)
+    projection = _PCA_RANDOM_PROJECTIONS.get(key)
+    if projection is None:
+        projection = np.random.default_rng(0).standard_normal(key)
+        _PCA_RANDOM_PROJECTIONS[key] = projection
+    basis = centered @ projection
+    for _ in range(power_iterations):
+        basis = centered @ (centered.T @ basis)
+    basis, _ = np.linalg.qr(basis, mode="reduced")
+    compressed = basis.T @ centered
+    left, singular_values, right = np.linalg.svd(compressed, full_matrices=False)
+    left = basis @ left[:, :rank]
+    return (left * singular_values[:rank]) @ right[:rank]
 
 
 def canonical_domain(row: pd.Series, columns: list[str]) -> str:
@@ -227,8 +259,19 @@ def isolate_annotated_call(
     time_margin_sec: float,
     n_fft: int,
     hop_length: int,
+    foreground_mask_method: str = "annotation_rectangle",
+    mask_percentile: float = 95.0,
+    pca_components: int = 1,
 ) -> tuple[np.ndarray, float, float]:
-    """Return a smoothly time-frequency-masked call segment and event offsets."""
+    """Return a time-frequency-isolated call segment and event offsets.
+
+    ``annotation_rectangle`` retains the original behavior: the annotated
+    time/frequency rectangle is softened and applied directly. The
+    ``pca_percentile`` mode additionally estimates stationary donor noise with
+    a low-rank PCA reconstruction and retains only unusually energetic
+    residual bins inside the annotation rectangle. This is a waveform-friendly
+    adaptation of Padovese et al.'s vocalization-mask augmentation.
+    """
     clip_duration = len(waveform) / sample_rate
     segment_start = max(0.0, event_start - time_margin_sec)
     segment_end = min(clip_duration, event_end + time_margin_sec)
@@ -241,14 +284,44 @@ def isolate_annotated_call(
         boundary="zeros",
         padded=True,
     )
-    mask = (
+    annotation_mask = (
         (frequencies[:, None] >= low_hz)
         & (frequencies[:, None] <= high_hz)
         & (times[None, :] >= segment_start)
         & (times[None, :] <= segment_end)
     ).astype(np.float32)
-    if not np.any(mask):
+    if not np.any(annotation_mask):
         raise ValueError("empty_time_frequency_mask")
+
+    if foreground_mask_method == "annotation_rectangle":
+        mask = annotation_mask
+    elif foreground_mask_method == "pca_percentile":
+        magnitude = np.abs(spectrum).astype(np.float64)
+        log_magnitude = np.log1p(magnitude / max(float(np.median(magnitude)), EPSILON))
+
+        # Treat time frames as observations and frequency bins as features.
+        # The temporal mean plus the leading components model stationary and
+        # slowly varying donor-recording structure. Positive residuals contain
+        # transient energy such as the annotated vocalization.
+        observations = log_magnitude.T
+        mean_spectrum = observations.mean(axis=0, keepdims=True)
+        centered = observations - mean_spectrum
+        rank = min(pca_components, centered.shape[0] - 1, centered.shape[1])
+        if rank < 1:
+            raise ValueError("insufficient_stft_frames_for_pca")
+        reconstruction = mean_spectrum + randomized_low_rank_reconstruction(centered, rank)
+        residual = np.maximum(observations - reconstruction, 0.0).T
+        candidates = residual[annotation_mask.astype(bool)]
+        candidates = candidates[np.isfinite(candidates) & (candidates > 0)]
+        if candidates.size == 0:
+            raise ValueError("pca_mask_has_no_positive_residual_energy")
+        threshold = float(np.percentile(candidates, mask_percentile))
+        mask = ((residual >= threshold) & annotation_mask.astype(bool)).astype(np.float32)
+        if not np.any(mask):
+            raise ValueError("empty_pca_percentile_mask")
+    else:
+        raise ValueError(f"Unknown foreground mask method: {foreground_mask_method}")
+
     frequency_bin_hz = sample_rate / n_fft
     sigma_frequency = max(0.5, 30.0 / frequency_bin_hz)
     sigma_time = max(0.5, 0.025 * sample_rate / hop_length)
@@ -438,6 +511,9 @@ def output_row(
     low_hz: float,
     high_hz: float,
     metrics: dict[str, float],
+    foreground_mask_method: str,
+    mask_percentile: float,
+    pca_components: int,
     seed: int,
     clip_duration: float,
 ) -> dict[str, Any]:
@@ -450,7 +526,11 @@ def output_row(
             "Dataset": background.get("Dataset", ""),
             "ClassSpecies": species,
             "KW": int(species == "KW"),
-            "AnnotationLevel": "ControlledMixture",
+            "AnnotationLevel": (
+                "VocalizationMaskMixture"
+                if foreground_mask_method == "pca_percentile"
+                else "ControlledMixture"
+            ),
             "FileBeginSec": metrics["mixed_event_start_sec"],
             "FileEndSec": metrics["mixed_event_end_sec"],
             "CenterSec": (
@@ -465,7 +545,18 @@ def output_row(
             "Generated": True,
             "mixture_index": mixture_index,
             "mixture_seed": seed,
-            "mixture_method": "annotation_time_frequency_mask_controlled_snr",
+            "mixture_method": (
+                "pca_percentile_vocalization_mask_controlled_snr"
+                if foreground_mask_method == "pca_percentile"
+                else "annotation_time_frequency_mask_controlled_snr"
+            ),
+            "foreground_mask_method": foreground_mask_method,
+            "foreground_mask_percentile": (
+                mask_percentile if foreground_mask_method == "pca_percentile" else np.nan
+            ),
+            "foreground_mask_pca_components": (
+                pca_components if foreground_mask_method == "pca_percentile" else np.nan
+            ),
             "mixture_target_snr_db": metrics["target_snr_db"],
             "mixture_measured_snr_db": metrics["measured_snr_db"],
             "mixture_signal_gain": metrics["signal_gain"],
@@ -548,8 +639,8 @@ def parse_args() -> argparse.Namespace:
         "--combined-manifest",
         default=None,
         help=(
-            "Original manifest plus generated rows. Defaults to "
-            "OUTPUT_DIR/training_manifest_with_controlled_mixtures.csv."
+            "Original manifest plus generated rows. The default filename in "
+            "OUTPUT_DIR reflects the selected foreground-mask method."
         ),
     )
     parser.add_argument("--num-examples", type=int, default=30000)
@@ -578,6 +669,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frequency-margin-hz", type=float, default=100.0)
     parser.add_argument("--stft-n-fft", type=int, default=1024)
     parser.add_argument("--stft-hop-length", type=int, default=256)
+    parser.add_argument(
+        "--foreground-mask-method",
+        choices=("annotation_rectangle", "pca_percentile"),
+        default="annotation_rectangle",
+        help=(
+            "Call-isolation method. pca_percentile removes a low-rank estimate "
+            "of stationary donor noise before retaining high-energy residual bins."
+        ),
+    )
+    parser.add_argument(
+        "--mask-percentile",
+        type=float,
+        default=95.0,
+        help="Residual-energy percentile retained by pca_percentile (default: 95).",
+    )
+    parser.add_argument(
+        "--pca-components",
+        type=int,
+        default=1,
+        help="Low-rank PCA components used to estimate donor background (default: 1).",
+    )
     parser.add_argument("--peak-limit", type=float, default=0.99)
     parser.add_argument("--audio-format", choices=("wav", "flac"), default="wav")
     parser.add_argument("--audio-cache-items", type=int, default=256)
@@ -612,6 +724,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Invalid STFT dimensions")
     if args.stft_hop_length >= args.stft_n_fft:
         raise ValueError("--stft-hop-length must be smaller than --stft-n-fft")
+    if not 0 <= args.mask_percentile < 100:
+        raise ValueError("--mask-percentile must be in [0, 100)")
+    if args.pca_components < 1:
+        raise ValueError("--pca-components must be positive")
     if not 0 < args.peak_limit <= 1:
         raise ValueError("--peak-limit must be in (0, 1]")
     if args.audio_cache_items < 1 or args.max_attempts_per_example < 1:
@@ -630,11 +746,25 @@ def main() -> int:
     clips_dir = output_dir / "clips"
     output_dir.mkdir(parents=True, exist_ok=True)
     clips_dir.mkdir(parents=True, exist_ok=True)
-    output_manifest = Path(args.output_manifest) if args.output_manifest else output_dir / "controlled_mixture_manifest.csv"
+    default_generated_name = (
+        "vocalization_mask_manifest.csv"
+        if args.foreground_mask_method == "pca_percentile"
+        else "controlled_mixture_manifest.csv"
+    )
+    default_combined_name = (
+        "training_manifest_with_vocalization_mask_mixtures.csv"
+        if args.foreground_mask_method == "pca_percentile"
+        else "training_manifest_with_controlled_mixtures.csv"
+    )
+    output_manifest = (
+        Path(args.output_manifest)
+        if args.output_manifest
+        else output_dir / default_generated_name
+    )
     combined_manifest = (
         Path(args.combined_manifest)
         if args.combined_manifest
-        else output_dir / "training_manifest_with_controlled_mixtures.csv"
+        else output_dir / default_combined_name
     )
     audit_path = output_dir / "generation_audit.csv"
     dataset_root = Path(args.dataset_root) if args.dataset_root else None
@@ -699,6 +829,12 @@ def main() -> int:
     print(f"Background domains:    {len(backgrounds_by_domain):,}")
     print(f"Requested mixtures:    {len(schedule):,} ({species_counts})")
     print(f"Target SNR range:      {args.snr_db_min:g}..{args.snr_db_max:g} dB")
+    print(f"Foreground mask:       {args.foreground_mask_method}")
+    if args.foreground_mask_method == "pca_percentile":
+        print(
+            f"PCA mask settings:     components={args.pca_components}, "
+            f"percentile={args.mask_percentile:g}"
+        )
     print(f"Different domain:      {args.different_domain_background}")
     print(f"Already completed:     {len(completed_indices):,}")
     print("=" * 72 + "\n")
@@ -747,6 +883,9 @@ def main() -> int:
                     args.time_margin_sec,
                     args.stft_n_fft,
                     args.stft_hop_length,
+                    args.foreground_mask_method,
+                    args.mask_percentile,
+                    args.pca_components,
                 )
                 target_snr_db = float(example_rng.uniform(args.snr_db_min, args.snr_db_max))
                 mixture, metrics = mix_call_and_background(
@@ -781,6 +920,9 @@ def main() -> int:
                         low_hz,
                         high_hz,
                         metrics,
+                        args.foreground_mask_method,
+                        args.mask_percentile,
+                        args.pca_components,
                         args.seed,
                         args.clip_duration,
                     )
