@@ -3,8 +3,9 @@
 
 This is the first stage of the Multispecies Cetacean V2 dataset build. It does
 not download audio. It creates an auditable master annotation table, assigns
-entire source recordings to train/validation/test, inventories the public GCS
-objects, and packs recordings into extraction jobs that fit Kaggle storage.
+entire source recordings to train/validation/test, plans provider-balanced
+original background windows, inventories the public GCS objects, and packs
+recordings into extraction jobs that fit Kaggle storage.
 """
 
 from __future__ import annotations
@@ -354,10 +355,11 @@ def assign_recording_splits(
 ) -> dict[str, str]:
     """Select a deterministic recording split with balanced evaluation labels.
 
-    Multiple seeded recording-level assignments are evaluated, and the one
-    closest to the requested fractions across source labels, KW ecotypes,
-    providers, sufficiently large datasets, total annotations, and recording
-    counts is retained. Audio from a source recording is never divided.
+    Each provider is optimized separately so all providers remain represented
+    near the requested proportions. Multiple seeded recording-level assignments
+    are evaluated within each provider, balancing source labels, KW ecotypes,
+    datasets, annotation counts, and recording counts. Audio from a source
+    recording is never divided.
     """
     if search_trials < 1:
         raise ValueError("search_trials must be at least 1")
@@ -366,12 +368,11 @@ def assign_recording_splits(
         "validation": validation_fraction,
         "test": test_fraction,
     }
-    recording_features: list[tuple[str, dict[str, int]]] = []
-    feature_totals: Counter[str] = Counter()
-    dataset_totals: Counter[str] = Counter()
+    dataset_totals: Counter[tuple[str, str]] = Counter()
     for rows in grouped.values():
-        dataset_totals[rows[0]["Dataset"]] += len(rows)
+        dataset_totals[(rows[0]["Provider"], rows[0]["Dataset"])] += len(rows)
 
+    provider_features: dict[str, list[tuple[str, dict[str, int]]]] = defaultdict(list)
     for recording_id, rows in grouped.items():
         label_counts = Counter(row["model_source_label"] for row in rows)
         ecotype_counts = Counter(
@@ -383,78 +384,85 @@ def assign_recording_splits(
             features[f"label:{label}"] = label_counts[label]
         for ecotype in sorted(VALID_ECOTYPES):
             features[f"ecotype:{ecotype}"] = ecotype_counts[ecotype]
-        features[f"provider:{first['Provider']}"] = len(rows)
-        if dataset_totals[first["Dataset"]] >= 100:
+        if dataset_totals[(first["Provider"], first["Dataset"])] >= 100:
             features[f"dataset:{first['Dataset']}"] = len(rows)
-        recording_features.append((recording_id, features))
-        feature_totals.update(features)
+        provider_features[first["Provider"]].append((recording_id, features))
 
-    recording_features.sort(key=lambda item: item[0])
+    all_assignments: dict[str, str] = {}
     split_names = tuple(fractions)
-    best_score = math.inf
-    best_assignments: dict[str, str] = {}
-    best_trial = -1
+    for provider, recording_features in sorted(provider_features.items()):
+        recording_features.sort(key=lambda item: item[0])
+        feature_totals: Counter[str] = Counter()
+        for _, features in recording_features:
+            feature_totals.update(features)
+        best_score = math.inf
+        best_assignments: dict[str, str] = {}
+        best_trial = -1
 
-    for trial in range(search_trials):
-        rng = random.Random(f"{seed}|multispecies-cetacean-split|{trial}")
-        assignments: dict[str, str] = {}
-        split_features = {split: Counter() for split in split_names}
-        for recording_id, features in recording_features:
-            value = rng.random()
-            if value < train_fraction:
-                split = "train"
-            elif value < train_fraction + validation_fraction:
-                split = "validation"
-            else:
-                split = "test"
-            assignments[recording_id] = split
-            split_features[split].update(features)
+        for trial in range(search_trials):
+            rng = random.Random(
+                f"{seed}|multispecies-cetacean-split|{provider}|{trial}"
+            )
+            assignments: dict[str, str] = {}
+            split_features = {split: Counter() for split in split_names}
+            for recording_id, features in recording_features:
+                value = rng.random()
+                if value < train_fraction:
+                    split = "train"
+                elif value < train_fraction + validation_fraction:
+                    split = "validation"
+                else:
+                    split = "test"
+                assignments[recording_id] = split
+                split_features[split].update(features)
 
-        grouped_errors: dict[str, list[float]] = defaultdict(list)
-        for feature, total in feature_totals.items():
-            if total <= 0:
-                continue
-            if feature.startswith("label:"):
-                group_name = "labels"
-            elif feature.startswith("ecotype:"):
-                group_name = "ecotypes"
-            elif feature.startswith("provider:"):
-                group_name = "providers"
-            elif feature.startswith("dataset:"):
-                group_name = "datasets"
-            else:
-                group_name = "totals"
-            for split, fraction in fractions.items():
-                expected = total * fraction
-                observed = split_features[split][feature]
-                grouped_errors[group_name].append(
-                    ((observed - expected) / expected) ** 2
-                )
-        group_weights = {
-            "totals": 0.10,
-            "labels": 0.25,
-            "ecotypes": 0.45,
-            "providers": 0.15,
-            "datasets": 0.05,
-        }
-        score = sum(
-            group_weights[name] * (sum(values) / len(values))
-            for name, values in grouped_errors.items()
-            if values
+            grouped_errors: dict[str, list[float]] = defaultdict(list)
+            for feature, total in feature_totals.items():
+                if total <= 0:
+                    continue
+                if feature.startswith("label:"):
+                    group_name = "labels"
+                elif feature.startswith("ecotype:"):
+                    group_name = "ecotypes"
+                elif feature.startswith("dataset:"):
+                    group_name = "datasets"
+                else:
+                    group_name = "totals"
+                for split, fraction in fractions.items():
+                    expected = total * fraction
+                    observed = split_features[split][feature]
+                    grouped_errors[group_name].append(
+                        ((observed - expected) / expected) ** 2
+                    )
+
+            group_weights = {
+                "totals": 0.15,
+                "labels": 0.30,
+                "ecotypes": 0.35,
+                "datasets": 0.20,
+            }
+            score = sum(
+                group_weights[name] * (sum(values) / len(values))
+                for name, values in grouped_errors.items()
+                if values
+            )
+            core_errors = grouped_errors["labels"] + grouped_errors["ecotypes"]
+            if core_errors:
+                score += 0.25 * max(core_errors)
+            if grouped_errors["datasets"]:
+                score += 0.10 * max(grouped_errors["datasets"])
+            if score < best_score:
+                best_score = score
+                best_assignments = assignments
+                best_trial = trial
+
+        all_assignments.update(best_assignments)
+        print(
+            f"Selected split trial {best_trial} of {search_trials} for "
+            f"{provider} (balance score {best_score:.8f})"
         )
-        core_errors = grouped_errors["labels"] + grouped_errors["ecotypes"]
-        if core_errors:
-            score += 0.25 * max(core_errors)
-        if score < best_score:
-            best_score = score
-            best_assignments = assignments
-            best_trial = trial
 
-    print(
-        f"Selected recording-level split trial {best_trial} of {search_trials} "
-        f"(balance score {best_score:.8f})"
-    )
-    return best_assignments
+    return all_assignments
 
 
 def make_dataset_names(split: str, number: int) -> tuple[str, str]:
@@ -549,7 +557,7 @@ def pack_shards(
                     "kaggle_dataset_id": dataset_id,
                     "recording_count": len(shard["records"]),  # type: ignore[arg-type]
                     "clip_count": sum(
-                        int(row["annotation_count"])
+                        int(row["planned_clip_count"])
                         for row in shard["records"]  # type: ignore[union-attr]
                     ),
                     "estimated_peak_working_bytes": (
@@ -562,6 +570,85 @@ def pack_shards(
             all_shards.append(shard)
 
     return all_shards
+
+
+def merged_annotation_intervals(
+    rows: Iterable[dict[str, str]],
+) -> list[list[float]]:
+    intervals: list[tuple[float, float]] = []
+    for row in rows:
+        begin = parse_float(row.get("FileBeginSec"))
+        end = parse_float(row.get("FileEndSec"))
+        if begin is not None and end is not None and end > begin:
+            intervals.append((begin, end))
+    intervals.sort()
+    merged: list[list[float]] = []
+    for begin, end in intervals:
+        if not merged or begin > merged[-1][1]:
+            merged.append([begin, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return merged
+
+
+def allocate_background_requests(
+    recordings: list[dict[str, object]],
+    target_per_provider: int,
+    max_per_recording: int,
+    orcasound_max_per_recording: int,
+    seed: int,
+    fractions: dict[str, float],
+) -> None:
+    """Allocate requested background windows broadly across source recordings."""
+    for record in recordings:
+        record["ambient_windows_requested"] = 0
+
+    if target_per_provider <= 0:
+        return
+
+    providers = sorted({str(record["Provider"]) for record in recordings})
+    for provider in providers:
+        for split, fraction in fractions.items():
+            target = round(target_per_provider * fraction)
+            candidates = [
+                record
+                for record in recordings
+                if record["Provider"] == provider
+                and record["split"] == split
+                and record.get("background_policy")
+                and (
+                    str(record.get("audio_match_status", "")).startswith("matched")
+                    or record.get("audio_match_status") == "inventory_skipped"
+                )
+            ]
+            candidates.sort(
+                key=lambda record: (
+                    int(record["annotation_count"]),
+                    stable_fraction(
+                        seed,
+                        f"background|{provider}|{split}|{record['source_recording_id']}",
+                    ),
+                )
+            )
+            cap = (
+                orcasound_max_per_recording
+                if provider.casefold() == "orcasound"
+                else max_per_recording
+            )
+            remaining = target
+            while remaining > 0 and candidates:
+                added = False
+                for record in candidates:
+                    current = int(record["ambient_windows_requested"])
+                    if current >= cap:
+                        continue
+                    record["ambient_windows_requested"] = current + 1
+                    remaining -= 1
+                    added = True
+                    if remaining == 0:
+                        break
+                if not added:
+                    break
 
 
 def write_csv(path: Path, fieldnames: list[str], rows: Iterable[dict[str, object]]) -> None:
@@ -606,6 +693,41 @@ def main() -> int:
     parser.add_argument("--max-working-gb", type=float, default=14.0)
     parser.add_argument("--working-safety-gb", type=float, default=2.0)
     parser.add_argument("--remote-seek-buffer-gb", type=float, default=0.25)
+    parser.add_argument(
+        "--ambient-target-per-provider",
+        type=int,
+        default=2000,
+        help="Requested original background windows per provider across all splits.",
+    )
+    parser.add_argument(
+        "--ambient-max-per-recording",
+        type=int,
+        default=20,
+        help="Maximum requested background windows from a non-Orcasound recording.",
+    )
+    parser.add_argument(
+        "--orcasound-ambient-max-per-recording",
+        type=int,
+        default=4,
+        help="Maximum windows from each 60-second Orcasound AB-only recording.",
+    )
+    parser.add_argument(
+        "--ambient-safety-margin-seconds",
+        type=float,
+        default=60.0,
+        help="Exclusion margin on both sides of annotations in long recordings.",
+    )
+    parser.add_argument(
+        "--ambient-min-spacing-seconds",
+        type=float,
+        default=15.0,
+        help="Minimum spacing between background windows from one recording.",
+    )
+    parser.add_argument(
+        "--disable-ambient-background",
+        action="store_true",
+        help="Plan event-centered annotated clips only.",
+    )
     parser.add_argument("--kaggle-owner", default=os.environ.get("KAGGLE_USERNAME", ""))
     parser.add_argument("--gcs-root", default=DEFAULT_GCS_ROOT)
     parser.add_argument(
@@ -621,6 +743,14 @@ def main() -> int:
         parser.error("train, validation, and test fractions must sum to 1")
     if args.clip_seconds <= 0 or args.sample_rate <= 0:
         parser.error("clip seconds and sample rate must be positive")
+    if (
+        args.ambient_target_per_provider < 0
+        or args.ambient_max_per_recording < 1
+        or args.orcasound_ambient_max_per_recording < 1
+        or args.ambient_safety_margin_seconds < 0
+        or args.ambient_min_spacing_seconds < args.clip_seconds
+    ):
+        parser.error("invalid ambient-background sampling settings")
 
     annotations_path = Path(args.annotations_csv)
     output_dir = Path(args.output_dir)
@@ -663,8 +793,31 @@ def main() -> int:
     for row in eligible:
         grouped[row["source_recording_id"]].append(row)
 
+    audited_grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in audited:
+        if row["Soundfile"] and row["Provider"] and row["Dataset"]:
+            audited_grouped[row["source_recording_id"]].append(row)
+
+    planning_grouped = dict(grouped)
+    if not args.disable_ambient_background:
+        for recording_id, rows in audited_grouped.items():
+            classes = {
+                clean_text(row.get("ClassSpecies"))
+                for row in rows
+                if clean_text(row.get("ClassSpecies"))
+            }
+            if (
+                rows[0]["Provider"].casefold() == "orcasound"
+                and classes == {"AB"}
+                and all(normalized_file_ok(row.get("FileOk")) for row in rows)
+                and recording_id not in planning_grouped
+            ):
+                # File-level AB rows do not create event-centered clips, but an
+                # AB-only 60-second recording is a useful original negative.
+                planning_grouped[recording_id] = [rows[0]]
+
     split_assignments = assign_recording_splits(
-        grouped,
+        planning_grouped,
         args.seed,
         args.train_fraction,
         args.validation_fraction,
@@ -678,20 +831,38 @@ def main() -> int:
         inventory_failures: list[dict[str, str]] = []
     else:
         audio_index, audio_stem_index, inventory_failures = inventory_gcs(
-            (rows[0]["Provider"] for rows in grouped.values()),
+            (rows[0]["Provider"] for rows in planning_grouped.values()),
             args.gcs_root,
             args.quiet_gcs,
         )
 
     recordings: list[dict[str, object]] = []
     missing_audio: list[dict[str, object]] = []
-    for recording_id, rows in grouped.items():
-        first = rows[0]
+    for recording_id, split_rows in planning_grouped.items():
+        positive_rows = grouped.get(recording_id, [])
+        all_rows = audited_grouped[recording_id]
+        first = split_rows[0]
         split = split_assignments[recording_id]
-        label_counts = Counter(row["model_source_label"] for row in rows)
+        label_counts = Counter(row["model_source_label"] for row in positive_rows)
         ecotype_counts = Counter(
-            row["clean_ecotype"] for row in rows if row["clean_ecotype"]
+            row["clean_ecotype"] for row in positive_rows if row["clean_ecotype"]
         )
+        annotation_classes = {
+            clean_text(row.get("ClassSpecies"))
+            for row in all_rows
+            if clean_text(row.get("ClassSpecies"))
+        }
+        all_files_ok = all(normalized_file_ok(row.get("FileOk")) for row in all_rows)
+        has_file_level = any(
+            clean_text(row.get("AnnotationLevel")) == "File" for row in all_rows
+        )
+        background_policy = ""
+        if not args.disable_ambient_background and all_files_ok:
+            if first["Provider"].casefold() == "orcasound":
+                if annotation_classes == {"AB"}:
+                    background_policy = "orcasound_abiotic_only"
+            elif not has_file_level:
+                background_policy = "standard_annotation_margin"
         if args.skip_gcs_inventory:
             gcs_path, source_size, match_status = "", 0, "inventory_skipped"
         else:
@@ -708,13 +879,16 @@ def main() -> int:
             "Dataset": first["Dataset"],
             "Soundfile": first["Soundfile"],
             "split": split,
-            "annotation_count": len(rows),
+            "annotation_count": len(positive_rows),
             **{f"count_{label}": label_counts[label] for label in MODEL_LABELS},
             **{f"count_ecotype_{label}": ecotype_counts[label] for label in sorted(VALID_ECOTYPES)},
             "gcs_path": gcs_path,
             "source_size_bytes": source_size,
             "audio_match_status": match_status,
-            "estimated_output_bytes": len(rows) * args.estimated_clip_bytes,
+            "background_policy": background_policy,
+            "ambient_windows_requested": 0,
+            "planned_clip_count": len(positive_rows),
+            "estimated_output_bytes": len(positive_rows) * args.estimated_clip_bytes,
         }
         if match_status not in {
             "matched",
@@ -738,8 +912,30 @@ def main() -> int:
             "inventory_skipped",
         }
     ]
-    shards = pack_shards(
+    allocate_background_requests(
         matched_recordings,
+        0 if args.disable_ambient_background else args.ambient_target_per_provider,
+        args.ambient_max_per_recording,
+        args.orcasound_ambient_max_per_recording,
+        args.seed,
+        {
+            "train": args.train_fraction,
+            "validation": args.validation_fraction,
+            "test": args.test_fraction,
+        },
+    )
+    for record in recordings:
+        planned_count = int(record["annotation_count"]) + int(
+            record["ambient_windows_requested"]
+        )
+        record["planned_clip_count"] = planned_count
+        record["estimated_output_bytes"] = planned_count * args.estimated_clip_bytes
+
+    extraction_recordings = [
+        row for row in matched_recordings if int(row["planned_clip_count"]) > 0
+    ]
+    shards = pack_shards(
+        extraction_recordings,
         int(args.target_shard_output_gb * 1024**3),
         int(args.max_working_gb * 1024**3),
         int(args.working_safety_gb * 1024**3),
@@ -759,6 +955,9 @@ def main() -> int:
         "gcs_path",
         "source_size_bytes",
         "audio_match_status",
+        "background_policy",
+        "ambient_windows_requested",
+        "planned_clip_count",
         "estimated_output_bytes",
         "extraction_mode",
         "working_source_bytes",
@@ -838,6 +1037,89 @@ def main() -> int:
         extraction_rows,
     )
 
+    background_rows: list[dict[str, object]] = []
+    for record in recordings:
+        requested = int(record["ambient_windows_requested"])
+        if requested <= 0 or not record.get("shard_id"):
+            continue
+        recording_id = str(record["source_recording_id"])
+        policy = str(record["background_policy"])
+        source_rows = audited_grouped[recording_id]
+        intervals = (
+            []
+            if policy == "orcasound_abiotic_only"
+            else merged_annotation_intervals(source_rows)
+        )
+        negative_subtype = (
+            "orcasound_abiotic_only_recording"
+            if policy == "orcasound_abiotic_only"
+            else "ambient_background"
+        )
+        background_rows.append(
+            {
+                "source_recording_id": recording_id,
+                "Provider": record["Provider"],
+                "Dataset": record["Dataset"],
+                "Soundfile": record["Soundfile"],
+                "split": record["split"],
+                "shard_id": record["shard_id"],
+                "storage_key": record["storage_key"],
+                "kaggle_dataset_id": record["kaggle_dataset_id"],
+                "gcs_path": record["gcs_path"],
+                "source_size_bytes": record["source_size_bytes"],
+                "extraction_mode": record["extraction_mode"],
+                "background_policy": policy,
+                "model_source_label": "Abiotic",
+                "negative_subtype": negative_subtype,
+                "requested_window_count": requested,
+                "window_duration_sec": args.clip_seconds,
+                "safety_margin_sec": (
+                    0.0
+                    if policy == "orcasound_abiotic_only"
+                    else args.ambient_safety_margin_seconds
+                ),
+                "minimum_spacing_sec": args.ambient_min_spacing_seconds,
+                "random_seed": int(
+                    stable_fraction(args.seed, f"background|{recording_id}")
+                    * (2**31 - 1)
+                ),
+                "blocked_annotation_count": len(source_rows),
+                "exclusion_intervals_json": json.dumps(
+                    intervals, separators=(",", ":")
+                ),
+                "relative_clip_directory": "clips/Abiotic",
+            }
+        )
+    background_fields = [
+        "source_recording_id",
+        "Provider",
+        "Dataset",
+        "Soundfile",
+        "split",
+        "shard_id",
+        "storage_key",
+        "kaggle_dataset_id",
+        "gcs_path",
+        "source_size_bytes",
+        "extraction_mode",
+        "background_policy",
+        "model_source_label",
+        "negative_subtype",
+        "requested_window_count",
+        "window_duration_sec",
+        "safety_margin_sec",
+        "minimum_spacing_sec",
+        "random_seed",
+        "blocked_annotation_count",
+        "exclusion_intervals_json",
+        "relative_clip_directory",
+    ]
+    write_csv(
+        output_dir / "multispecies_cetacean_background_plan.csv",
+        background_fields,
+        background_rows,
+    )
+
     shard_rows: list[dict[str, object]] = []
     for shard in shards:
         shard_rows.append(
@@ -868,15 +1150,27 @@ def main() -> int:
     split_summary: list[dict[str, object]] = []
     for split in ("train", "validation", "test"):
         split_rows = [row for row in extraction_rows if row["split"] == split]
+        split_recordings = [
+            row for row in extraction_recordings if row["split"] == split
+        ]
         counts = Counter(str(row["model_source_label"]) for row in split_rows)
+        ambient_count = sum(
+            int(row["ambient_windows_requested"]) for row in split_recordings
+        )
         split_summary.append(
             {
                 "split": split,
-                "recordings": len(
-                    {str(row["source_recording_id"]) for row in split_rows}
-                ),
+                "recordings": len(split_recordings),
                 "annotations": len(split_rows),
-                **{f"count_{label}": counts[label] for label in MODEL_LABELS},
+                "ambient_background": ambient_count,
+                "planned_clips": len(split_rows) + ambient_count,
+                "count_Abiotic_annotated": counts["Abiotic"],
+                "count_Abiotic": counts["Abiotic"] + ambient_count,
+                **{
+                    f"count_{label}": counts[label]
+                    for label in MODEL_LABELS
+                    if label != "Abiotic"
+                },
             }
         )
     write_csv(
@@ -885,6 +1179,9 @@ def main() -> int:
             "split",
             "recordings",
             "annotations",
+            "ambient_background",
+            "planned_clips",
+            "count_Abiotic_annotated",
             *[f"count_{label}" for label in MODEL_LABELS],
         ],
         split_summary,
@@ -908,16 +1205,26 @@ def main() -> int:
     print(f"Source annotation rows:       {len(audited):,}")
     print(f"Eligible annotation rows:     {len(eligible):,}")
     print(f"Excluded annotation rows:     {len(audited) - len(eligible):,}")
-    print(f"Eligible source recordings:   {len(recordings):,}")
+    print(f"Planned source recordings:    {len(recordings):,}")
     print(f"Matched source recordings:    {len(matched_recordings):,}")
     print(f"Unmatched/ambiguous audio:     {len(missing_audio):,}")
+    print(
+        "Requested ambient windows:   "
+        f"{sum(int(r['ambient_windows_requested']) for r in matched_recordings):,}"
+    )
+    print(
+        "Orcasound AB-only sources:   "
+        f"{sum(r.get('background_policy') == 'orcasound_abiotic_only' for r in matched_recordings):,}"
+    )
     print(f"Planned extraction shards:    {len(shards):,}")
     print(f"Estimated extracted storage:  {human_gb(sum(int(r['estimated_output_bytes']) for r in matched_recordings))}")
     print("\nSplit counts:")
     for row in split_summary:
         print(
             f"  {row['split']:<10} recordings={int(row['recordings']):,} "
-            f"clips={int(row['annotations']):,} "
+            f"annotated={int(row['annotations']):,} "
+            f"ambient={int(row['ambient_background']):,} "
+            f"planned={int(row['planned_clips']):,} "
             + " ".join(
                 f"{label}={int(row[f'count_{label}']):,}" for label in MODEL_LABELS
             )
