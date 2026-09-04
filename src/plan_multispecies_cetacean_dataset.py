@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
@@ -30,6 +31,18 @@ DEFAULT_GCS_ROOT = (
     "noaa-passive-bioacoustic/dclde/2027/"
     "dclde_2027_killer_whales"
 )
+PROVIDER_GCS_FOLDERS = {
+    "dfo_crp": "dfo_crp",
+    "dfo_wdlp": "dfo_wdlp",
+    "jasco_vfpa": "vfpa",
+    "jasco_vfpa_onc": "vfpa",
+    "onc": "onc",
+    "orcasound": "orcasound",
+    "simres": "simres",
+    "sio": "scripps",
+    "smruconsulting": "smru",
+    "uaf_ngos": "uaf",
+}
 
 
 def clean_text(value: Any) -> str:
@@ -204,12 +217,19 @@ def process_annotations(
 
 
 def provider_folder(provider: str) -> str:
-    return slug_component(provider).replace("-", "_")
+    key = provider.strip().casefold()
+    return PROVIDER_GCS_FOLDERS.get(
+        key, slug_component(provider).replace("-", "_")
+    )
 
 
 def inventory_gcs(
     providers: Iterable[str], root: str, quiet: bool
-) -> tuple[dict[tuple[str, str], list[dict[str, object]]], list[dict[str, str]]]:
+) -> tuple[
+    dict[tuple[str, str], list[dict[str, object]]],
+    dict[tuple[str, str], list[dict[str, object]]],
+    list[dict[str, str]],
+]:
     try:
         import gcsfs  # type: ignore
     except ImportError as exc:
@@ -219,13 +239,21 @@ def inventory_gcs(
 
     fs = gcsfs.GCSFileSystem(token="anon")
     by_provider_basename: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+    by_provider_stem: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
     failures: list[dict[str, str]] = []
 
+    folder_providers: dict[str, list[str]] = defaultdict(list)
     for provider in sorted(set(providers)):
-        folder = provider_folder(provider)
+        folder_providers[provider_folder(provider)].append(provider)
+
+    for folder, annotation_providers in sorted(folder_providers.items()):
         search_root = f"{root.rstrip('/')}/{folder}/audio"
         if not quiet:
-            print(f"Indexing provider {provider} ...")
+            print(
+                "Indexing bucket folder for "
+                + ", ".join(annotation_providers)
+                + " ..."
+            )
         try:
             found = fs.find(search_root, detail=True)
             if isinstance(found, list):
@@ -236,24 +264,31 @@ def inventory_gcs(
                 if suffix not in {".wav", ".flac", ".mp3", ".aif", ".aiff"}:
                     continue
                 size = int((info or {}).get("size", 0) or 0)
-                key = (provider.casefold(), PurePosixPath(path).name.casefold())
-                by_provider_basename[key].append(
-                    {"gcs_path": str(path), "source_size_bytes": size}
-                )
+                item = {"gcs_path": str(path), "source_size_bytes": size}
+                basename = PurePosixPath(path).name.casefold()
+                stem = PurePosixPath(path).stem.casefold()
+                for provider in annotation_providers:
+                    by_provider_basename[(provider.casefold(), basename)].append(item)
+                    by_provider_stem[(provider.casefold(), stem)].append(item)
                 count += 1
             if not quiet:
                 print(f"  indexed {count:,} audio objects")
         except Exception as exc:  # preserve other providers and report failure
-            failures.append(
-                {
-                    "Provider": provider,
-                    "search_root": search_root,
-                    "error": repr(exc),
-                }
+            for provider in annotation_providers:
+                failures.append(
+                    {
+                        "Provider": provider,
+                        "search_root": search_root,
+                        "error": repr(exc),
+                    }
+                )
+            print(
+                "WARNING: inventory failed for "
+                + ", ".join(annotation_providers)
+                + f": {exc}"
             )
-            print(f"WARNING: inventory failed for provider {provider}: {exc}")
 
-    return by_provider_basename, failures
+    return by_provider_basename, by_provider_stem, failures
 
 
 def choose_audio_match(
@@ -261,13 +296,21 @@ def choose_audio_match(
     dataset: str,
     soundfile: str,
     index: dict[tuple[str, str], list[dict[str, object]]],
+    stem_index: dict[tuple[str, str], list[dict[str, object]]],
 ) -> tuple[str, int, str]:
     candidates = index.get((provider.casefold(), soundfile.casefold()), [])
+    matched_by_stem = False
+    if not candidates:
+        candidates = stem_index.get(
+            (provider.casefold(), PurePosixPath(soundfile).stem.casefold()), []
+        )
+        matched_by_stem = bool(candidates)
     if not candidates:
         return "", 0, "missing"
     if len(candidates) == 1:
         item = candidates[0]
-        return str(item["gcs_path"]), int(item["source_size_bytes"]), "matched"
+        status = "matched_by_stem" if matched_by_stem else "matched"
+        return str(item["gcs_path"]), int(item["source_size_bytes"]), status
 
     dataset_token = slug_component(dataset).replace("-", "")
     narrowed = [
@@ -282,7 +325,7 @@ def choose_audio_match(
         return (
             str(item["gcs_path"]),
             int(item["source_size_bytes"]),
-            "matched_by_dataset",
+            "matched_by_dataset_and_stem" if matched_by_stem else "matched_by_dataset",
         )
     return "", 0, "ambiguous"
 
@@ -299,6 +342,119 @@ def assign_split(
     if value < train_fraction + validation_fraction:
         return "validation"
     return "test"
+
+
+def assign_recording_splits(
+    grouped: dict[str, list[dict[str, str]]],
+    seed: int,
+    train_fraction: float,
+    validation_fraction: float,
+    test_fraction: float,
+    search_trials: int,
+) -> dict[str, str]:
+    """Select a deterministic recording split with balanced evaluation labels.
+
+    Multiple seeded recording-level assignments are evaluated, and the one
+    closest to the requested fractions across source labels, KW ecotypes,
+    providers, sufficiently large datasets, total annotations, and recording
+    counts is retained. Audio from a source recording is never divided.
+    """
+    if search_trials < 1:
+        raise ValueError("search_trials must be at least 1")
+    fractions = {
+        "train": train_fraction,
+        "validation": validation_fraction,
+        "test": test_fraction,
+    }
+    recording_features: list[tuple[str, dict[str, int]]] = []
+    feature_totals: Counter[str] = Counter()
+    dataset_totals: Counter[str] = Counter()
+    for rows in grouped.values():
+        dataset_totals[rows[0]["Dataset"]] += len(rows)
+
+    for recording_id, rows in grouped.items():
+        label_counts = Counter(row["model_source_label"] for row in rows)
+        ecotype_counts = Counter(
+            row["clean_ecotype"] for row in rows if row["clean_ecotype"]
+        )
+        first = rows[0]
+        features: dict[str, int] = {"annotations": len(rows), "recordings": 1}
+        for label in MODEL_LABELS:
+            features[f"label:{label}"] = label_counts[label]
+        for ecotype in sorted(VALID_ECOTYPES):
+            features[f"ecotype:{ecotype}"] = ecotype_counts[ecotype]
+        features[f"provider:{first['Provider']}"] = len(rows)
+        if dataset_totals[first["Dataset"]] >= 100:
+            features[f"dataset:{first['Dataset']}"] = len(rows)
+        recording_features.append((recording_id, features))
+        feature_totals.update(features)
+
+    recording_features.sort(key=lambda item: item[0])
+    split_names = tuple(fractions)
+    best_score = math.inf
+    best_assignments: dict[str, str] = {}
+    best_trial = -1
+
+    for trial in range(search_trials):
+        rng = random.Random(f"{seed}|multispecies-cetacean-split|{trial}")
+        assignments: dict[str, str] = {}
+        split_features = {split: Counter() for split in split_names}
+        for recording_id, features in recording_features:
+            value = rng.random()
+            if value < train_fraction:
+                split = "train"
+            elif value < train_fraction + validation_fraction:
+                split = "validation"
+            else:
+                split = "test"
+            assignments[recording_id] = split
+            split_features[split].update(features)
+
+        grouped_errors: dict[str, list[float]] = defaultdict(list)
+        for feature, total in feature_totals.items():
+            if total <= 0:
+                continue
+            if feature.startswith("label:"):
+                group_name = "labels"
+            elif feature.startswith("ecotype:"):
+                group_name = "ecotypes"
+            elif feature.startswith("provider:"):
+                group_name = "providers"
+            elif feature.startswith("dataset:"):
+                group_name = "datasets"
+            else:
+                group_name = "totals"
+            for split, fraction in fractions.items():
+                expected = total * fraction
+                observed = split_features[split][feature]
+                grouped_errors[group_name].append(
+                    ((observed - expected) / expected) ** 2
+                )
+        group_weights = {
+            "totals": 0.10,
+            "labels": 0.25,
+            "ecotypes": 0.45,
+            "providers": 0.15,
+            "datasets": 0.05,
+        }
+        score = sum(
+            group_weights[name] * (sum(values) / len(values))
+            for name, values in grouped_errors.items()
+            if values
+        )
+        core_errors = grouped_errors["labels"] + grouped_errors["ecotypes"]
+        if core_errors:
+            score += 0.25 * max(core_errors)
+        if score < best_score:
+            best_score = score
+            best_assignments = assignments
+            best_trial = trial
+
+    print(
+        f"Selected recording-level split trial {best_trial} of {search_trials} "
+        f"(balance score {best_score:.8f})"
+    )
+    return best_assignments
 
 
 def make_dataset_names(split: str, number: int) -> tuple[str, str]:
@@ -429,6 +585,12 @@ def main() -> int:
         "--output-dir", default="/kaggle/working/multispecies_cetacean_plan"
     )
     parser.add_argument("--seed", type=int, default=401)
+    parser.add_argument(
+        "--split-search-trials",
+        type=int,
+        default=512,
+        help="Deterministic candidate recording splits evaluated for balance.",
+    )
     parser.add_argument("--train-fraction", type=float, default=0.80)
     parser.add_argument("--validation-fraction", type=float, default=0.10)
     parser.add_argument("--test-fraction", type=float, default=0.10)
@@ -501,11 +663,21 @@ def main() -> int:
     for row in eligible:
         grouped[row["source_recording_id"]].append(row)
 
+    split_assignments = assign_recording_splits(
+        grouped,
+        args.seed,
+        args.train_fraction,
+        args.validation_fraction,
+        args.test_fraction,
+        args.split_search_trials,
+    )
+
     if args.skip_gcs_inventory:
         audio_index: dict[tuple[str, str], list[dict[str, object]]] = {}
+        audio_stem_index: dict[tuple[str, str], list[dict[str, object]]] = {}
         inventory_failures: list[dict[str, str]] = []
     else:
-        audio_index, inventory_failures = inventory_gcs(
+        audio_index, audio_stem_index, inventory_failures = inventory_gcs(
             (rows[0]["Provider"] for rows in grouped.values()),
             args.gcs_root,
             args.quiet_gcs,
@@ -515,12 +687,7 @@ def main() -> int:
     missing_audio: list[dict[str, object]] = []
     for recording_id, rows in grouped.items():
         first = rows[0]
-        split = assign_split(
-            recording_id,
-            args.seed,
-            args.train_fraction,
-            args.validation_fraction,
-        )
+        split = split_assignments[recording_id]
         label_counts = Counter(row["model_source_label"] for row in rows)
         ecotype_counts = Counter(
             row["clean_ecotype"] for row in rows if row["clean_ecotype"]
@@ -529,7 +696,11 @@ def main() -> int:
             gcs_path, source_size, match_status = "", 0, "inventory_skipped"
         else:
             gcs_path, source_size, match_status = choose_audio_match(
-                first["Provider"], first["Dataset"], first["Soundfile"], audio_index
+                first["Provider"],
+                first["Dataset"],
+                first["Soundfile"],
+                audio_index,
+                audio_stem_index,
             )
         record: dict[str, object] = {
             "source_recording_id": recording_id,
@@ -545,7 +716,13 @@ def main() -> int:
             "audio_match_status": match_status,
             "estimated_output_bytes": len(rows) * args.estimated_clip_bytes,
         }
-        if match_status not in {"matched", "matched_by_dataset", "inventory_skipped"}:
+        if match_status not in {
+            "matched",
+            "matched_by_stem",
+            "matched_by_dataset",
+            "matched_by_dataset_and_stem",
+            "inventory_skipped",
+        }:
             missing_audio.append(record)
         recordings.append(record)
 
@@ -553,7 +730,13 @@ def main() -> int:
         row
         for row in recordings
         if row["audio_match_status"]
-        in {"matched", "matched_by_dataset", "inventory_skipped"}
+        in {
+            "matched",
+            "matched_by_stem",
+            "matched_by_dataset",
+            "matched_by_dataset_and_stem",
+            "inventory_skipped",
+        }
     ]
     shards = pack_shards(
         matched_recordings,
