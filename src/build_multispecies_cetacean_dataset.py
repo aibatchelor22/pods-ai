@@ -1161,6 +1161,37 @@ def main() -> int:
             print(f"[{position}/{len(selected_ids)}] already uploaded; skipping {shard_id}")
             continue
 
+        # A new Kaggle session normally starts with an empty /kaggle/working.
+        # Recover across session timeouts by checking durable remote shards
+        # before rebuilding anything locally.
+        if (
+            args.upload
+            and args.adopt_existing_dataset
+            and kaggle_dataset_exists(args.kaggle, shard["kaggle_dataset_id"])
+        ):
+            print(
+                f"[{position}/{len(selected_ids)}] checking existing dataset "
+                f"before build: {shard['kaggle_dataset_id']}"
+            )
+            status_output = upload_and_verify(
+                args.kaggle,
+                paths["shards"] / shard_id,
+                shard["kaggle_dataset_id"],
+                args.public,
+                args.status_timeout_seconds,
+                True,
+            )
+            state_shards[shard_id] = {
+                **prior,
+                "status": "uploaded",
+                "dataset_id": shard["kaggle_dataset_id"],
+                "adopted_at": time.time(),
+                "kaggle_status": status_output,
+            }
+            atomic_write_json(state_path, state)
+            print(f"Existing verified shard adopted; skipping build: {shard_id}")
+            continue
+
         state_shards[shard_id] = {
             **prior,
             "status": "building",
