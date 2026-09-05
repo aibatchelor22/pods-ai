@@ -746,7 +746,7 @@ def process_shard(
             expected_rate = args.sample_rate
             expected_frames = round(args.sample_rate * args.clip_seconds)
 
-            for row in positive_rows:
+            for positive_number, row in enumerate(positive_rows, start=1):
                 clip_id = row["annotation_id"]
                 relative_path = row["relative_clip_path"].replace("\\", "/")
                 output_path = expected_clip_path(shard_dir, relative_path)
@@ -764,6 +764,16 @@ def process_shard(
                             "source_duration_sec": source_duration,
                         },
                     )
+                    if remote and (
+                        positive_number == 1
+                        or positive_number == len(positive_rows)
+                        or positive_number % args.remote_clip_progress_every == 0
+                    ):
+                        print(
+                            f"    remote annotated clips: {positive_number:,}/"
+                            f"{len(positive_rows):,} for source {source_number:,}/"
+                            f"{len(source_ids):,}"
+                        )
                     continue
                 requested_start = float(row["clip_start_requested_sec"])
                 actual_start = min(
@@ -773,6 +783,16 @@ def process_shard(
                     try:
                         validate_and_measure_flac(output_path, expected_rate, expected_frames)
                         skipped += 1
+                        if remote and (
+                            positive_number == 1
+                            or positive_number == len(positive_rows)
+                            or positive_number % args.remote_clip_progress_every == 0
+                        ):
+                            print(
+                                f"    remote annotated clips: {positive_number:,}/"
+                                f"{len(positive_rows):,} for source {source_number:,}/"
+                                f"{len(source_ids):,}"
+                            )
                         continue
                     except Exception:
                         pass
@@ -794,6 +814,16 @@ def process_shard(
                 append_jsonl(jsonl_path, manifest_row)
                 existing[clip_id] = manifest_row
                 created += 1
+                if remote and (
+                    positive_number == 1
+                    or positive_number == len(positive_rows)
+                    or positive_number % args.remote_clip_progress_every == 0
+                ):
+                    print(
+                        f"    remote annotated clips: {positive_number:,}/"
+                        f"{len(positive_rows):,} for source {source_number:,}/"
+                        f"{len(source_ids):,}"
+                    )
 
             if background_row is not None:
                 requested_count = int(background_row["requested_window_count"])
@@ -978,11 +1008,19 @@ def verify_kaggle_dataset_files(kaggle: str, dataset_id: str) -> str:
         ]
     )
     output = (result.stdout + "\n" + result.stderr).strip()
-    missing = [
-        name
-        for name in ("clips.zip", MANIFEST_NAME, QC_SUMMARY_NAME)
-        if name.casefold() not in output.casefold()
-    ]
+    normalized = output.casefold().replace("\\", "/")
+    expanded_listing = "clips/" in normalized
+    missing = []
+    # An expanded archive can contain tens of thousands of members, so the
+    # first API page may not yet contain the top-level manifest/QC filenames.
+    if not expanded_listing:
+        missing.extend(
+            name
+            for name in (MANIFEST_NAME, QC_SUMMARY_NAME)
+            if name.casefold() not in normalized
+        )
+    if "clips.zip" not in normalized and not expanded_listing:
+        missing.append("clips.zip or expanded clips/")
     if missing:
         raise RuntimeError(
             f"Kaggle dataset {dataset_id} is ready but is missing expected files: "
@@ -1093,6 +1131,12 @@ def main() -> int:
     parser.add_argument("--download-chunk-mb", type=int, default=8)
     parser.add_argument("--minimum-free-gb", type=float, default=1.0)
     parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument(
+        "--remote-clip-progress-every",
+        type=int,
+        default=10,
+        help="Print progress every N annotated clips within remote-seek sources.",
+    )
     parser.add_argument("--status-timeout-seconds", type=int, default=1200)
     parser.add_argument("--license-name", default="CC-BY-4.0")
     args = parser.parse_args()
@@ -1105,6 +1149,8 @@ def main() -> int:
         parser.error("--public requires --upload")
     if args.sample_rate <= 0 or args.clip_seconds <= 0:
         parser.error("sample rate and clip seconds must be positive")
+    if args.remote_clip_progress_every <= 0:
+        parser.error("--remote-clip-progress-every must be positive")
 
     args.ffmpeg = require_executable(args.ffmpeg)
     args.ffprobe = require_executable(args.ffprobe)
@@ -1220,6 +1266,10 @@ def main() -> int:
             atomic_write_json(state_path, state)
 
             if args.upload:
+                print(
+                    f"Uploading {shard_id} to Kaggle dataset "
+                    f"{shard['kaggle_dataset_id']}..."
+                )
                 status_output = upload_and_verify(
                     args.kaggle,
                     shard_dir,
@@ -1235,6 +1285,10 @@ def main() -> int:
                     "kaggle_status": status_output,
                 }
                 atomic_write_json(state_path, state)
+                print(
+                    f"Kaggle upload ready and verified: "
+                    f"{shard['kaggle_dataset_id']}"
+                )
                 if args.delete_after_upload:
                     safe_remove_shard(paths["shards"], shard_dir)
                     state_shards[shard_id]["local_shard_deleted"] = True
