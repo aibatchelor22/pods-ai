@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -38,6 +39,12 @@ MATCHED_STATUSES = {
 }
 MANIFEST_NAME = "multispecies_cetacean_manifest.csv"
 QC_SUMMARY_NAME = "multispecies_cetacean_qc_summary.json"
+CHECKPOINT_STATE_NAME = "multispecies_cetacean_checkpoint_state.json"
+CHECKPOINT_JOURNAL_NAME = "multispecies_cetacean_checkpoint_manifest.jsonl"
+
+
+class CheckpointError(RuntimeError):
+    """A durable checkpoint could not be created or restored."""
 
 
 def clean_text(value: Any) -> str:
@@ -702,6 +709,26 @@ def process_shard(
     positive_failures = 0
     source_failures = 0
     shortfalls: list[dict[str, object]] = []
+    checkpoint_created = 0
+
+    def maybe_checkpoint(remote_clip_created: bool) -> None:
+        nonlocal checkpoint_created
+        if not remote_clip_created or args.checkpoint_every_remote_clips <= 0:
+            return
+        checkpoint_created += 1
+        if checkpoint_created < args.checkpoint_every_remote_clips:
+            return
+        write_checkpoint_snapshot(
+            shard,
+            annotation_rows,
+            background_rows,
+            existing,
+            jsonl_path,
+            shard_dir,
+            args,
+            complete=False,
+        )
+        checkpoint_created = 0
     print(
         f"\n[{shard_id}] sources={len(source_ids):,}, "
         f"annotated={len(annotation_rows):,}, "
@@ -814,6 +841,7 @@ def process_shard(
                 append_jsonl(jsonl_path, manifest_row)
                 existing[clip_id] = manifest_row
                 created += 1
+                maybe_checkpoint(remote)
                 if remote and (
                     positive_number == 1
                     or positive_number == len(positive_rows)
@@ -891,7 +919,10 @@ def process_shard(
                     append_jsonl(jsonl_path, manifest_row)
                     existing[clip_id] = manifest_row
                     created += 1
+                    maybe_checkpoint(remote)
 
+        except CheckpointError:
+            raise
         except Exception as exc:
             source_failures += 1
             append_jsonl(
@@ -983,6 +1014,259 @@ def write_dataset_metadata(
         ),
     }
     atomic_write_json(shard_dir / "dataset-metadata.json", payload)
+
+
+def shard_plan_hash(
+    shard: dict[str, str],
+    annotation_rows: list[dict[str, str]],
+    background_rows: list[dict[str, str]],
+) -> str:
+    payload = {
+        "shard_id": shard["shard_id"],
+        "dataset_id": shard["kaggle_dataset_id"],
+        "annotations": sorted(
+            (
+                row["annotation_id"],
+                row["source_recording_id"],
+                row["clip_start_requested_sec"],
+                row["relative_clip_path"],
+            )
+            for row in annotation_rows
+        ),
+        "background": sorted(
+            (
+                row["source_recording_id"],
+                row["requested_window_count"],
+                row["random_seed"],
+                row["exclusion_intervals_json"],
+            )
+            for row in background_rows
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def wait_for_kaggle_dataset(
+    kaggle: str, dataset_id: str, timeout_seconds: int
+) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    last_output = ""
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [kaggle, "datasets", "status", dataset_id],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        last_output = (result.stdout + "\n" + result.stderr).strip()
+        normalized = last_output.casefold()
+        if result.returncode == 0 and any(
+            marker in normalized for marker in ("ready", "complete", "active")
+        ):
+            return last_output
+        if any(marker in normalized for marker in ("error", "failed")):
+            raise CheckpointError(f"Kaggle dataset processing failed: {last_output}")
+        time.sleep(15)
+    raise CheckpointError(
+        f"Timed out waiting for Kaggle dataset {dataset_id}; last status: {last_output}"
+    )
+
+
+def write_checkpoint_snapshot(
+    shard: dict[str, str],
+    annotation_rows: list[dict[str, str]],
+    background_rows: list[dict[str, str]],
+    existing: dict[str, dict[str, object]],
+    jsonl_path: Path,
+    shard_dir: Path,
+    args: argparse.Namespace,
+    *,
+    complete: bool,
+) -> str:
+    """Upload the current shard snapshot as a new recoverable Kaggle version."""
+    manifest_rows = sorted(
+        existing.values(),
+        key=lambda row: (
+            clean_text(row.get("source_recording_id")),
+            float(row.get("actual_clip_start_sec") or 0.0),
+            clean_text(row.get("clip_id")),
+        ),
+    )
+    write_csv_union(shard_dir / MANIFEST_NAME, manifest_rows)
+    if jsonl_path.exists():
+        shutil.copy2(jsonl_path, shard_dir / CHECKPOINT_JOURNAL_NAME)
+    else:
+        (shard_dir / CHECKPOINT_JOURNAL_NAME).write_text("", encoding="utf-8")
+
+    expected_clips = len(annotation_rows) + sum(
+        int(row["requested_window_count"]) for row in background_rows
+    )
+    checkpoint_state = {
+        "format_version": 1,
+        "shard_id": shard["shard_id"],
+        "dataset_id": shard["kaggle_dataset_id"],
+        "plan_hash": shard_plan_hash(shard, annotation_rows, background_rows),
+        "complete": complete,
+        "completed_manifest_rows": len(manifest_rows),
+        "expected_manifest_rows": expected_clips,
+        "updated_at_unix": time.time(),
+    }
+    atomic_write_json(shard_dir / CHECKPOINT_STATE_NAME, checkpoint_state)
+    if not (shard_dir / QC_SUMMARY_NAME).exists():
+        atomic_write_json(
+            shard_dir / QC_SUMMARY_NAME,
+            {
+                "shard_id": shard["shard_id"],
+                "checkpoint_partial": not complete,
+                "manifest_rows": len(manifest_rows),
+                "expected_manifest_rows": expected_clips,
+            },
+        )
+    write_dataset_metadata(shard_dir, shard, args.license_name, args.public)
+
+    dataset_id = shard["kaggle_dataset_id"]
+    exists = kaggle_dataset_exists(args.kaggle, dataset_id)
+    if exists:
+        command = [
+            args.kaggle,
+            "datasets",
+            "version",
+            "-p",
+            str(shard_dir),
+            "-m",
+            (
+                f"Completed shard with {len(manifest_rows)} clips"
+                if complete
+                else f"Resumable checkpoint with {len(manifest_rows)} clips"
+            ),
+            "-q",
+            "-t",
+            "-r",
+            "zip",
+        ]
+    else:
+        command = [
+            args.kaggle,
+            "datasets",
+            "create",
+            "-p",
+            str(shard_dir),
+            "-q",
+            "-t",
+            "-r",
+            "zip",
+        ]
+        if args.public:
+            command.append("--public")
+
+    action = "final version" if complete else "checkpoint"
+    print(f"    Uploading {action}: {dataset_id} ({len(manifest_rows):,} clips)")
+    try:
+        run_command(command, capture=True)
+        status = wait_for_kaggle_dataset(
+            args.kaggle, dataset_id, args.status_timeout_seconds
+        )
+        verify_kaggle_dataset_files(args.kaggle, dataset_id)
+    except Exception as exc:
+        raise CheckpointError(f"Unable to upload {action} for {dataset_id}: {exc}") from exc
+    print(f"    Kaggle {action} ready: {dataset_id}")
+    return status
+
+
+def safe_extract_zip(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_root = destination.resolve()
+    with zipfile.ZipFile(archive) as handle:
+        for member in handle.infolist():
+            target = (destination / member.filename).resolve()
+            if target != destination_root and destination_root not in target.parents:
+                raise CheckpointError(f"Unsafe archive member: {member.filename}")
+        handle.extractall(destination)
+
+
+def restore_kaggle_checkpoint(
+    shard: dict[str, str],
+    annotation_rows: list[dict[str, str]],
+    background_rows: list[dict[str, str]],
+    args: argparse.Namespace,
+    paths: dict[str, Path],
+) -> str:
+    """Restore the latest partial snapshot. Returns partial, complete, or absent."""
+    dataset_id = shard["kaggle_dataset_id"]
+    if not kaggle_dataset_exists(args.kaggle, dataset_id):
+        return "absent"
+    if not args.adopt_existing_dataset:
+        raise CheckpointError(
+            f"Checkpoint dataset already exists: {dataset_id}. Add "
+            "--adopt-existing-dataset to verify and resume it."
+        )
+
+    restore_root = paths["root"] / "checkpoint_restore" / shard["shard_id"]
+    if restore_root.exists():
+        shutil.rmtree(restore_root)
+    restore_root.mkdir(parents=True, exist_ok=True)
+    print(f"Restoring latest Kaggle checkpoint: {dataset_id}")
+    try:
+        run_command(
+            [
+                args.kaggle,
+                "datasets",
+                "download",
+                "-d",
+                dataset_id,
+                "-p",
+                str(restore_root),
+                "--unzip",
+            ],
+            capture=True,
+        )
+        state_candidates = list(restore_root.rglob(CHECKPOINT_STATE_NAME))
+        if len(state_candidates) != 1:
+            raise CheckpointError(
+                f"Expected one {CHECKPOINT_STATE_NAME}, found {len(state_candidates)}"
+            )
+        checkpoint_root = state_candidates[0].parent
+        checkpoint_state = json.loads(state_candidates[0].read_text(encoding="utf-8"))
+        expected_hash = shard_plan_hash(shard, annotation_rows, background_rows)
+        if checkpoint_state.get("shard_id") != shard["shard_id"]:
+            raise CheckpointError("Checkpoint shard_id does not match the selected shard")
+        if checkpoint_state.get("plan_hash") != expected_hash:
+            raise CheckpointError(
+                "Checkpoint plan hash does not match this plan; refusing unsafe resume"
+            )
+        if checkpoint_state.get("complete") is True:
+            verify_kaggle_dataset_files(args.kaggle, dataset_id)
+            return "complete"
+
+        shard_dir = paths["shards"] / shard["shard_id"]
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        clips_archive = checkpoint_root / "clips.zip"
+        expanded_clips = checkpoint_root / "clips"
+        if clips_archive.exists():
+            safe_extract_zip(clips_archive, shard_dir)
+        elif expanded_clips.exists():
+            shutil.copytree(expanded_clips, shard_dir / "clips", dirs_exist_ok=True)
+        else:
+            raise CheckpointError("Checkpoint contains neither clips.zip nor clips/")
+
+        checkpoint_journal = checkpoint_root / CHECKPOINT_JOURNAL_NAME
+        if not checkpoint_journal.exists():
+            raise CheckpointError(f"Checkpoint is missing {CHECKPOINT_JOURNAL_NAME}")
+        local_journal = paths["manifests"] / f"{shard['shard_id']}.jsonl"
+        local_count = len(read_jsonl_latest(local_journal, "clip_id"))
+        checkpoint_count = len(read_jsonl_latest(checkpoint_journal, "clip_id"))
+        if checkpoint_count > local_count:
+            local_journal.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(checkpoint_journal, local_journal)
+        print(
+            f"Restored {max(local_count, checkpoint_count):,} completed clips "
+            f"for {shard['shard_id']}"
+        )
+        return "partial"
+    finally:
+        if restore_root.exists():
+            shutil.rmtree(restore_root)
 
 
 def kaggle_dataset_exists(kaggle: str, dataset_id: str) -> bool:
@@ -1137,6 +1421,15 @@ def main() -> int:
         default=10,
         help="Print progress every N annotated clips within remote-seek sources.",
     )
+    parser.add_argument(
+        "--checkpoint-every-remote-clips",
+        type=int,
+        default=0,
+        help=(
+            "Upload a resumable Kaggle dataset version after every N newly "
+            "created remote clips. Zero disables partial checkpoints."
+        ),
+    )
     parser.add_argument("--status-timeout-seconds", type=int, default=1200)
     parser.add_argument("--license-name", default="CC-BY-4.0")
     args = parser.parse_args()
@@ -1151,6 +1444,10 @@ def main() -> int:
         parser.error("sample rate and clip seconds must be positive")
     if args.remote_clip_progress_every <= 0:
         parser.error("--remote-clip-progress-every must be positive")
+    if args.checkpoint_every_remote_clips < 0:
+        parser.error("--checkpoint-every-remote-clips cannot be negative")
+    if args.checkpoint_every_remote_clips and not args.upload:
+        parser.error("--checkpoint-every-remote-clips requires --upload")
 
     args.ffmpeg = require_executable(args.ffmpeg)
     args.ffprobe = require_executable(args.ffprobe)
@@ -1202,10 +1499,40 @@ def main() -> int:
 
     for position, shard_id in enumerate(selected_ids, start=1):
         shard = shards_by_id[shard_id]
+        shard_annotations = annotations_by_shard[shard_id]
+        shard_backgrounds = backgrounds_by_shard[shard_id]
+        checkpointed_remote = (
+            args.checkpoint_every_remote_clips > 0
+            and any(
+                row.get("extraction_mode") == "remote_seek"
+                for row in shard_annotations + shard_backgrounds
+            )
+        )
         prior = state_shards.get(shard_id, {})
         if prior.get("status") == "uploaded":
             print(f"[{position}/{len(selected_ids)}] already uploaded; skipping {shard_id}")
             continue
+
+        if checkpointed_remote and args.upload and kaggle_dataset_exists(
+            args.kaggle, shard["kaggle_dataset_id"]
+        ):
+            restored = restore_kaggle_checkpoint(
+                shard,
+                shard_annotations,
+                shard_backgrounds,
+                args,
+                paths,
+            )
+            if restored == "complete":
+                state_shards[shard_id] = {
+                    **prior,
+                    "status": "uploaded",
+                    "dataset_id": shard["kaggle_dataset_id"],
+                    "adopted_at": time.time(),
+                }
+                atomic_write_json(state_path, state)
+                print(f"Completed checkpointed shard adopted: {shard_id}")
+                continue
 
         # A new Kaggle session normally starts with an empty /kaggle/working.
         # Recover across session timeouts by checking durable remote shards
@@ -1213,6 +1540,7 @@ def main() -> int:
         if (
             args.upload
             and args.adopt_existing_dataset
+            and not checkpointed_remote
             and kaggle_dataset_exists(args.kaggle, shard["kaggle_dataset_id"])
         ):
             print(
@@ -1248,8 +1576,8 @@ def main() -> int:
         try:
             summary = process_shard(
                 shard,
-                annotations_by_shard[shard_id],
-                backgrounds_by_shard[shard_id],
+                shard_annotations,
+                shard_backgrounds,
                 args,
                 paths,
             )
@@ -1266,18 +1594,32 @@ def main() -> int:
             atomic_write_json(state_path, state)
 
             if args.upload:
-                print(
-                    f"Uploading {shard_id} to Kaggle dataset "
-                    f"{shard['kaggle_dataset_id']}..."
-                )
-                status_output = upload_and_verify(
-                    args.kaggle,
-                    shard_dir,
-                    shard["kaggle_dataset_id"],
-                    args.public,
-                    args.status_timeout_seconds,
-                    args.adopt_existing_dataset,
-                )
+                if checkpointed_remote:
+                    status_output = write_checkpoint_snapshot(
+                        shard,
+                        shard_annotations,
+                        shard_backgrounds,
+                        read_jsonl_latest(
+                            paths["manifests"] / f"{shard_id}.jsonl", "clip_id"
+                        ),
+                        paths["manifests"] / f"{shard_id}.jsonl",
+                        shard_dir,
+                        args,
+                        complete=True,
+                    )
+                else:
+                    print(
+                        f"Uploading {shard_id} to Kaggle dataset "
+                        f"{shard['kaggle_dataset_id']}..."
+                    )
+                    status_output = upload_and_verify(
+                        args.kaggle,
+                        shard_dir,
+                        shard["kaggle_dataset_id"],
+                        args.public,
+                        args.status_timeout_seconds,
+                        args.adopt_existing_dataset,
+                    )
                 state_shards[shard_id] = {
                     **state_shards[shard_id],
                     "status": "uploaded",

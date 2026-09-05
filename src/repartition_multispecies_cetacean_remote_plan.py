@@ -5,9 +5,10 @@ This script consumes the three CSV files used by
 ``build_multispecies_cetacean_dataset.py`` plus the source-recording plan. It
 does not download or alter audio. Ordinary sources remain grouped into their
 existing shards unless their original shard also contained remote sources; in
-that case the ordinary remainder receives a ``*_local_*`` shard name. Each
-remote recording is divided into independent shards containing no more than
-``--remote-clips-per-shard`` planned clips.
+that case the ordinary remainder receives a ``*_local_*`` shard name. Remote
+sources are balanced across a fixed number of checkpointable datasets by
+default. A many-small-shard mode remains available through
+``--remote-clips-per-shard``.
 
 The resulting directory can be passed directly to the existing builder with
 ``--plan-dir``. Use a fresh builder ``--work-dir`` because shard identifiers
@@ -154,13 +155,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan-dir", required=True, help="Existing complete plan directory.")
     parser.add_argument("--output-dir", required=True, help="Directory for the repartitioned plan.")
-    parser.add_argument(
+    remote_group = parser.add_mutually_exclusive_group()
+    remote_group.add_argument(
         "--remote-clips-per-shard",
         type=int,
-        default=100,
         help=(
             "Maximum annotated plus requested background clips in a remote "
-            "partition (default: 100)."
+            "partition. This produces many independent datasets instead of "
+            "checkpointed fixed-count datasets."
+        ),
+    )
+    remote_group.add_argument(
+        "--remote-dataset-count",
+        type=int,
+        help=(
+            "Total checkpointable remote datasets across all splits "
+            "(default: 6, producing about 15 datasets with the current plan)."
         ),
     )
     parser.add_argument(
@@ -178,8 +188,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.remote_clips_per_shard <= 0:
+    if args.remote_clips_per_shard is None and args.remote_dataset_count is None:
+        args.remote_dataset_count = 6
+    if args.remote_clips_per_shard is not None and args.remote_clips_per_shard <= 0:
         parser.error("--remote-clips-per-shard must be positive")
+    if args.remote_dataset_count is not None and args.remote_dataset_count <= 0:
+        parser.error("--remote-dataset-count must be positive")
 
     plan_dir = Path(args.plan_dir)
     output_dir = Path(args.output_dir)
@@ -306,50 +320,109 @@ def main() -> int:
         remote_by_split[source_lookup[source_id]["split"]].append(source_id)
 
     remote_partition_count = 0
-    for split in sorted(remote_by_split, key=split_order):
-        for source_ordinal, source_id in enumerate(sorted(remote_by_split[split])):
-            source = source_lookup[source_id]
-            original_id = source["shard_id"]
-            annotations = sorted(
-                annotations_by_source[source_id],
-                key=lambda row: (
-                    float_value(row.get("clip_start_requested_sec")),
-                    row.get("annotation_id", ""),
+    if args.remote_dataset_count is not None:
+        split_names = sorted(remote_by_split, key=split_order)
+        if args.remote_dataset_count < len(split_names):
+            raise ValueError(
+                f"--remote-dataset-count must be at least {len(split_names)} "
+                "to keep train, validation, and test separate"
+            )
+
+        source_weights = {
+            source_id: (
+                len(annotations_by_source[source_id])
+                + sum(
+                    int_value(row.get("requested_window_count"))
+                    for row in backgrounds_by_source[source_id]
+                )
+            )
+            for source_id in remote_sources
+        }
+        datasets_per_split = {split: 1 for split in split_names}
+        remaining = args.remote_dataset_count - len(split_names)
+        while remaining:
+            # Allocate the next dataset where it most reduces clips per dataset.
+            selected_split = max(
+                split_names,
+                key=lambda split: (
+                    sum(source_weights[source] for source in remote_by_split[split])
+                    / datasets_per_split[split]
                 ),
             )
-            backgrounds = backgrounds_by_source[source_id]
-            background_count = sum(
-                int_value(row.get("requested_window_count")) for row in backgrounds
-            )
-            if background_count > args.remote_clips_per_shard:
-                raise ValueError(
-                    f"Remote source {source_id} requests {background_count} background clips, "
-                    f"which exceeds --remote-clips-per-shard={args.remote_clips_per_shard}. "
-                    "Background sampling cannot be divided without changing its deterministic "
-                    "selection; increase the limit."
-                )
+            datasets_per_split[selected_split] += 1
+            remaining -= 1
 
-            chunks: list[tuple[list[dict[str, str]], list[dict[str, str]]]] = []
-            first_capacity = args.remote_clips_per_shard - background_count
-            if backgrounds or annotations:
-                first_annotations = annotations[:first_capacity]
-                chunks.append((first_annotations, backgrounds))
-                annotations = annotations[first_capacity:]
-            while annotations:
-                chunks.append((annotations[: args.remote_clips_per_shard], []))
-                annotations = annotations[args.remote_clips_per_shard :]
+        for split in split_names:
+            bin_count = datasets_per_split[split]
+            bins = [
+                {"weight": 0, "sources": []}
+                for _ in range(bin_count)
+            ]
+            for source_id in sorted(
+                remote_by_split[split],
+                key=lambda source: (-source_weights[source], source),
+            ):
+                selected_bin = min(
+                    enumerate(bins), key=lambda item: (item[1]["weight"], item[0])
+                )[1]
+                selected_bin["sources"].append(source_id)
+                selected_bin["weight"] += source_weights[source_id]
 
-            for partition_index, (ann_chunk, bg_chunk) in enumerate(chunks):
-                shard_id = (
-                    f"{split}_remote_{source_ordinal:03d}_p{partition_index:02d}"
-                )
-                target = assignment(shard_id, split, original_id)
-                target["annotations"].extend(ann_chunk)
-                target["backgrounds"].extend(bg_chunk)
-                target["remote_source_id"] = source_id
-                target["remote_partition_index"] = partition_index
-                target["remote_partition_count"] = len(chunks)
+            for bin_index, bin_value in enumerate(bins):
+                shard_id = f"{split}_remote_{bin_index:02d}"
+                for source_id in sorted(bin_value["sources"]):
+                    source = source_lookup[source_id]
+                    target = assignment(shard_id, split, source["shard_id"])
+                    target["annotations"].extend(annotations_by_source[source_id])
+                    target["backgrounds"].extend(backgrounds_by_source[source_id])
                 remote_partition_count += 1
+    else:
+        assert args.remote_clips_per_shard is not None
+        for split in sorted(remote_by_split, key=split_order):
+            for source_ordinal, source_id in enumerate(sorted(remote_by_split[split])):
+                source = source_lookup[source_id]
+                original_id = source["shard_id"]
+                annotations = sorted(
+                    annotations_by_source[source_id],
+                    key=lambda row: (
+                        float_value(row.get("clip_start_requested_sec")),
+                        row.get("annotation_id", ""),
+                    ),
+                )
+                backgrounds = backgrounds_by_source[source_id]
+                background_count = sum(
+                    int_value(row.get("requested_window_count")) for row in backgrounds
+                )
+                if background_count > args.remote_clips_per_shard:
+                    raise ValueError(
+                        f"Remote source {source_id} requests {background_count} background clips, "
+                        f"which exceeds --remote-clips-per-shard={args.remote_clips_per_shard}. "
+                        "Background sampling cannot be divided without changing its deterministic "
+                        "selection; increase the limit."
+                    )
+
+                chunks: list[tuple[list[dict[str, str]], list[dict[str, str]]]] = []
+                first_capacity = args.remote_clips_per_shard - background_count
+                if backgrounds or annotations:
+                    first_annotations = annotations[:first_capacity]
+                    chunks.append((first_annotations, backgrounds))
+                    annotations = annotations[first_capacity:]
+                while annotations:
+                    chunks.append((annotations[: args.remote_clips_per_shard], []))
+                    annotations = annotations[args.remote_clips_per_shard :]
+
+                for partition_index, (ann_chunk, bg_chunk) in enumerate(chunks):
+                    shard_id = (
+                        f"{split}_remote_c{args.remote_clips_per_shard}_"
+                        f"{source_ordinal:03d}_p{partition_index:02d}"
+                    )
+                    target = assignment(shard_id, split, original_id)
+                    target["annotations"].extend(ann_chunk)
+                    target["backgrounds"].extend(bg_chunk)
+                    target["remote_source_id"] = source_id
+                    target["remote_partition_index"] = partition_index
+                    target["remote_partition_count"] = len(chunks)
+                    remote_partition_count += 1
 
     # Derive the planner's nominal FLAC size and safety reserve from original summaries.
     bytes_per_clip_values = [
@@ -519,6 +592,7 @@ def main() -> int:
     report = {
         "source_plan_directory": str(plan_dir),
         "remote_clips_per_shard": args.remote_clips_per_shard,
+        "remote_dataset_count_requested": args.remote_dataset_count,
         "remote_source_recordings": len(remote_sources),
         "changed_original_shards": sorted(changed_original_shards),
         "output_shards": len(new_shards),
