@@ -41,6 +41,7 @@ MANIFEST_NAME = "multispecies_cetacean_manifest.csv"
 QC_SUMMARY_NAME = "multispecies_cetacean_qc_summary.json"
 CHECKPOINT_STATE_NAME = "multispecies_cetacean_checkpoint_state.json"
 CHECKPOINT_JOURNAL_NAME = "multispecies_cetacean_checkpoint_manifest.jsonl"
+FAILURE_AUDIT_NAME = "multispecies_cetacean_extraction_failures.jsonl"
 
 
 class CheckpointError(RuntimeError):
@@ -780,16 +781,24 @@ def process_shard(
                 annotation_end = parse_float(row.get("FileEndSec"))
                 if annotation_end is not None and annotation_end > source_duration + 1.0:
                     positive_failures += 1
+                    failure_record = {
+                        "kind": "annotated",
+                        "clip_id": clip_id,
+                        "source_recording_id": recording_id,
+                        "gcs_path": gcs_path,
+                        "reason": "annotation_outside_source_duration",
+                        "annotation_end_sec": annotation_end,
+                        "source_duration_sec": source_duration,
+                    }
                     append_jsonl(
                         failure_path,
-                        {
-                            "kind": "annotated",
-                            "clip_id": clip_id,
-                            "source_recording_id": recording_id,
-                            "reason": "annotation_outside_source_duration",
-                            "annotation_end_sec": annotation_end,
-                            "source_duration_sec": source_duration,
-                        },
+                        failure_record,
+                    )
+                    print(
+                        "WARNING: omitting annotation outside source duration: "
+                        f"clip_id={clip_id}, source={recording_id}, "
+                        f"annotation_end={annotation_end:.6f}, "
+                        f"source_duration={source_duration:.6f}"
                     )
                     if remote and (
                         positive_number == 1
@@ -959,6 +968,8 @@ def process_shard(
         write_csv_union(shortfall_path, shortfalls)
     elif shortfall_path.exists():
         shortfall_path.unlink()
+    if failure_path.exists():
+        shutil.copy2(failure_path, shard_dir / FAILURE_AUDIT_NAME)
 
     label_counts = Counter(clean_text(row.get("model_source_label")) for row in manifest_rows)
     kind_counts = Counter(clean_text(row.get("clip_kind")) for row in manifest_rows)
@@ -972,18 +983,25 @@ def process_shard(
         "background_shortfall_sources": len(shortfalls),
         "source_failures_this_run": source_failures,
         "annotated_failures_this_run": positive_failures,
+        "planned_annotated_clips": len(annotation_rows),
+        "omitted_annotated_clips": positive_failures,
         "created_this_run": created,
         "resumed_this_run": skipped,
     }
     atomic_write_json(shard_dir / QC_SUMMARY_NAME, qc_summary)
 
-    if source_failures or positive_failures:
+    fatal_annotated_failures = (
+        positive_failures if not args.allow_annotation_outside_source else 0
+    )
+    if source_failures or fatal_annotated_failures:
         raise RuntimeError(
             f"{shard_id} has {source_failures} source failures and "
             f"{positive_failures} annotated-clip failures; refusing upload"
         )
     if args.max_recordings is None:
-        expected_annotations = len(annotation_rows)
+        expected_annotations = len(annotation_rows) - (
+            positive_failures if args.allow_annotation_outside_source else 0
+        )
         actual_annotations = kind_counts["annotated"]
         if actual_annotations != expected_annotations:
             raise RuntimeError(
@@ -1102,6 +1120,12 @@ def write_checkpoint_snapshot(
     expected_clips = len(annotation_rows) + sum(
         int(row["requested_window_count"]) for row in background_rows
     )
+    omitted_clips = 0
+    if complete and args.allow_annotation_outside_source:
+        omitted_clips = len(
+            read_jsonl_latest(shard_dir / FAILURE_AUDIT_NAME, "clip_id")
+        )
+        expected_clips -= omitted_clips
     checkpoint_state = {
         "format_version": 1,
         "shard_id": shard["shard_id"],
@@ -1110,6 +1134,7 @@ def write_checkpoint_snapshot(
         "complete": complete,
         "completed_manifest_rows": len(manifest_rows),
         "expected_manifest_rows": expected_clips,
+        "omitted_annotated_clips": omitted_clips,
         "updated_at_unix": time.time(),
     }
     atomic_write_json(shard_dir / CHECKPOINT_STATE_NAME, checkpoint_state)
@@ -1430,6 +1455,22 @@ def main() -> int:
             "created remote clips. Zero disables partial checkpoints."
         ),
     )
+    parser.add_argument(
+        "--allow-annotation-outside-source",
+        action="store_true",
+        help=(
+            "Audit and omit annotations whose end time is beyond the probed "
+            "recording duration instead of failing the entire shard."
+        ),
+    )
+    parser.add_argument(
+        "--continue-on-shard-failure",
+        action="store_true",
+        help=(
+            "Record a failed shard and continue processing later shards. The "
+            "process exits nonzero after attempting all selected shards."
+        ),
+    )
     parser.add_argument("--status-timeout-seconds", type=int, default=1200)
     parser.add_argument("--license-name", default="CC-BY-4.0")
     args = parser.parse_args()
@@ -1496,6 +1537,7 @@ def main() -> int:
     state_path = work_root / "multispecies_cetacean_build_state.json"
     state = load_state(state_path)
     state_shards: dict[str, dict[str, object]] = state["shards"]  # type: ignore[assignment]
+    failed_shards: list[dict[str, object]] = []
 
     for position, shard_id in enumerate(selected_ids, start=1):
         shard = shards_by_id[shard_id]
@@ -1645,6 +1687,10 @@ def main() -> int:
             }
             atomic_write_json(state_path, state)
             print(f"ERROR: shard failed: {shard_id}: {exc}", file=sys.stderr)
+            failed_shards.append({"shard_id": shard_id, "error": repr(exc)})
+            if args.continue_on_shard_failure:
+                print("Continuing with the next shard as requested.", file=sys.stderr)
+                continue
             return 1
 
     # Preserve a portable combined manifest outside deletable shard directories.
@@ -1665,6 +1711,11 @@ def main() -> int:
         )
     print(f"\nBuild state: {state_path}")
     print(f"Portable combined manifest: {work_root / 'multispecies_cetacean_combined_manifest.csv'}")
+    if failed_shards:
+        failure_summary = work_root / "multispecies_cetacean_failed_shards.json"
+        atomic_write_json(failure_summary, {"failed_shards": failed_shards})
+        print(f"Failed-shard summary: {failure_summary}", file=sys.stderr)
+        return 1
     return 0
 
 
