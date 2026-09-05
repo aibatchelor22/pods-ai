@@ -1083,6 +1083,16 @@ def wait_for_kaggle_dataset(
             marker in normalized for marker in ("ready", "complete", "active")
         ):
             return last_output
+        if result.returncode != 0 and "403" in normalized:
+            # Kaggle CLI 2.0.x can upload successfully but receive 403 from the
+            # newer GetDatasetStatus endpoint. A visible, valid file listing is
+            # sufficient evidence that dataset processing completed.
+            try:
+                verify_kaggle_dataset_files(kaggle, dataset_id)
+                return "Status endpoint returned 403; dataset files verified instead."
+            except Exception:
+                time.sleep(15)
+                continue
         if any(marker in normalized for marker in ("error", "failed")):
             raise CheckpointError(f"Kaggle dataset processing failed: {last_output}")
         time.sleep(15)
@@ -1301,7 +1311,20 @@ def kaggle_dataset_exists(kaggle: str, dataset_id: str) -> bool:
         text=True,
         capture_output=True,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    output = (result.stdout + "\n" + result.stderr).casefold()
+    if "403" not in output:
+        return False
+    # Compatibility fallback for Kaggle CLI 2.0.x, whose status request can be
+    # forbidden even though ordinary dataset file access is authorized.
+    files_result = subprocess.run(
+        [kaggle, "datasets", "files", dataset_id],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return files_result.returncode == 0
 
 
 def verify_kaggle_dataset_files(kaggle: str, dataset_id: str) -> str:
@@ -1385,6 +1408,13 @@ def upload_and_verify(
         ):
             verify_kaggle_dataset_files(kaggle, dataset_id)
             return last_output
+        if result.returncode != 0 and "403" in normalized:
+            try:
+                verify_kaggle_dataset_files(kaggle, dataset_id)
+                return "Status endpoint returned 403; dataset files verified instead."
+            except Exception:
+                time.sleep(15)
+                continue
         if any(marker in normalized for marker in ("error", "failed")):
             raise RuntimeError(f"Kaggle dataset processing failed: {last_output}")
         time.sleep(15)
