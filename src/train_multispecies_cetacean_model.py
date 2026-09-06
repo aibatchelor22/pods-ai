@@ -14,7 +14,10 @@ all four classes. Ecotype loss is computed only for eligible KW annotations.
 Use ``--freeze-backbone`` for the first-stage cached-embedding head baseline.
 Without it, the script fine-tunes the AST and heads together. Checkpoint
 loading, legacy AST key compatibility, and strict backbone validation are
-implemented here so the script has no project-local Python dependencies.
+implemented here so the script has no project-local Python dependencies. An
+annotation sidecar can independently mask ambiguous trigger, source, or
+ecotype supervision and optionally balance repeated windows from the same
+annotated event.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ import torch
 from scipy.signal import butter, sosfilt, sosfiltfilt
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset, WeightedRandomSampler
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import (
@@ -191,8 +194,14 @@ class ArchiveAudioCollator:
         features["source_labels"] = torch.tensor(
             [row["source_label"] for row in rows], dtype=torch.long
         )
+        features["source_original_labels"] = torch.tensor(
+            [row["source_original_label"] for row in rows], dtype=torch.long
+        )
         features["ecotype_labels"] = torch.tensor(
             [row["ecotype_label"] for row in rows], dtype=torch.long
+        )
+        features["event_group_sizes"] = torch.tensor(
+            [row["event_group_size"] for row in rows], dtype=torch.long
         )
         features["clip_ids"] = [row["clip_id"] for row in rows]
         return features
@@ -454,11 +463,72 @@ def trigger_label(source: str, undbio_policy: str) -> int:
     raise ValueError(f"Unknown source label: {source!r}")
 
 
+def load_overlap_audit(path: Path | None) -> dict[str, dict[str, str]]:
+    """Load deterministic per-head supervision actions keyed by annotation_id."""
+    if path is None:
+        return {}
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    required = {
+        "annotation_id",
+        "source_recording_id",
+        "model_source_label",
+        "recommended_source_action",
+        "recommended_trigger_action",
+        "recommended_ecotype_action",
+        "event_group_id",
+        "event_group_size",
+    }
+    result: dict[str, dict[str, str]] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"Overlap audit missing columns: {sorted(missing)}")
+        for row_number, row in enumerate(reader, start=2):
+            annotation_id = clean(row.get("annotation_id"))
+            if not annotation_id or annotation_id in result:
+                raise ValueError(
+                    f"Overlap audit has a missing or duplicate annotation_id at row {row_number}"
+                )
+            for field in (
+                "recommended_source_action",
+                "recommended_trigger_action",
+                "recommended_ecotype_action",
+            ):
+                action = clean(row.get(field)).casefold()
+                if action not in {"keep", "mask"}:
+                    raise ValueError(
+                        f"Overlap audit row {row_number} has invalid {field}: {action!r}"
+                    )
+                row[field] = action
+            event_group_id = clean(row.get("event_group_id"))
+            try:
+                event_group_size = int(clean(row.get("event_group_size")))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Overlap audit row {row_number} has invalid event_group_size"
+                ) from exc
+            if not event_group_id or event_group_size < 1:
+                raise ValueError(
+                    f"Overlap audit row {row_number} has an invalid event group"
+                )
+            row["event_group_id"] = event_group_id
+            row["event_group_size"] = str(event_group_size)
+            result[annotation_id] = row
+    print(f"Loaded overlap sidecar: {len(result):,} annotated clips from {path}")
+    return result
+
+
 def discover_rows(
     roots: list[Path],
     split: str,
     manifest_name: str,
     undbio_policy: str,
+    overlap_audit: dict[str, dict[str, str]],
+    conflict_policy: str,
+    require_audit_coverage: bool,
+    audit_usage: Counter[str],
 ) -> tuple[list[dict[str, Any]], list[Path], list[Path]]:
     manifests = sorted({path.resolve() for root in roots for path in root.rglob(manifest_name)})
     if not manifests:
@@ -485,14 +555,36 @@ def discover_rows(
             for raw in reader:
                 if clean(raw.get("split")).casefold() != split.casefold():
                     continue
-                if "source_head_eligible" in raw and not bool_value(raw["source_head_eligible"]):
-                    continue
                 source = clean(raw["model_source_label"])
                 if source not in SOURCE_LABELS:
                     raise ValueError(f"{manifest}: unknown model_source_label {source!r}")
                 clip_id = clean(raw["clip_id"])
                 if not clip_id or clip_id in clip_ids:
                     raise ValueError(f"Missing or duplicate clip_id: {clip_id!r}")
+                annotated = clean(raw.get("clip_kind")).casefold() == "annotated" or clip_id.startswith("ann_")
+                audit_row = overlap_audit.get(clip_id)
+                if overlap_audit and annotated and audit_row is None:
+                    audit_usage[f"{split}_missing_annotated"] += 1
+                    if require_audit_coverage:
+                        raise ValueError(
+                            f"Annotated clip {clip_id!r} from {manifest} is absent from the overlap audit"
+                        )
+                if audit_row is not None:
+                    if clean(audit_row.get("source_recording_id")) != clean(raw.get("source_recording_id")):
+                        raise ValueError(f"Overlap audit source_recording_id mismatch for {clip_id}")
+                    if clean(audit_row.get("model_source_label")) != source:
+                        raise ValueError(f"Overlap audit source label mismatch for {clip_id}")
+                    audit_usage[f"{split}_matched"] += 1
+                    if conflict_policy == "exclude" and any(
+                        audit_row[field] == "mask"
+                        for field in (
+                            "recommended_source_action",
+                            "recommended_trigger_action",
+                            "recommended_ecotype_action",
+                        )
+                    ):
+                        audit_usage[f"{split}_excluded"] += 1
+                        continue
                 clip_ids.add(clip_id)
                 archive = (manifest.parent / clean(raw["archive_path"])).resolve()
                 member_path = clean(raw["archive_member_path"]).replace("\\", "/")
@@ -526,15 +618,36 @@ def discover_rows(
                     and ecotype in ECOTYPE_LABELS
                     and ("ecotype_head_eligible" not in raw or bool_value(raw["ecotype_head_eligible"]))
                 )
+                source_eligible = (
+                    "source_head_eligible" not in raw or bool_value(raw["source_head_eligible"])
+                )
+                trigger_value = trigger_label(source, undbio_policy)
+                source_value = SOURCE_LABELS[source] if source_eligible else IGNORE_INDEX
+                ecotype_value = ECOTYPE_LABELS[ecotype] if ecotype_eligible else IGNORE_INDEX
+                if audit_row is not None and conflict_policy == "mask":
+                    if audit_row["recommended_trigger_action"] == "mask":
+                        trigger_value = IGNORE_INDEX
+                        audit_usage[f"{split}_trigger_masked"] += 1
+                    if audit_row["recommended_source_action"] == "mask":
+                        source_value = IGNORE_INDEX
+                        audit_usage[f"{split}_source_masked"] += 1
+                    if audit_row["recommended_ecotype_action"] == "mask":
+                        ecotype_value = IGNORE_INDEX
+                        audit_usage[f"{split}_ecotype_masked"] += 1
                 rows.append(
                     {
                         "clip_id": clip_id,
                         "archive_file": archive_file,
                         "audio_file": audio_file,
                         "archive_member_path": member_path,
-                        "trigger_label": trigger_label(source, undbio_policy),
-                        "source_label": SOURCE_LABELS[source],
-                        "ecotype_label": ECOTYPE_LABELS[ecotype] if ecotype_eligible else IGNORE_INDEX,
+                        "trigger_label": trigger_value,
+                        "source_label": source_value,
+                        "source_original_label": SOURCE_LABELS[source],
+                        "ecotype_label": ecotype_value,
+                        "event_group_id": clean(audit_row.get("event_group_id")) if audit_row else "",
+                        "event_group_size": (
+                            max(1, int(audit_row["event_group_size"])) if audit_row else 1
+                        ),
                     }
                 )
                 used = True
@@ -590,6 +703,12 @@ def cache_signature(
     rows: list[dict[str, Any]],
     seed: int,
 ) -> dict[str, Any]:
+    supervision = "\n".join(
+        f"{row['clip_id']}|{row['trigger_label']}|{row['source_label']}|"
+        f"{row['source_original_label']}|{row['ecotype_label']}|"
+        f"{row['event_group_size']}"
+        for row in rows
+    )
     return {
         "split": split,
         "manifests": [file_identity(path) for path in manifests],
@@ -598,6 +717,7 @@ def cache_signature(
         "preprocessing": preprocessing,
         "rows": len(rows),
         "clip_id_digest": hashlib.sha256("\n".join(row["clip_id"] for row in rows).encode()).hexdigest(),
+        "supervision_digest": hashlib.sha256(supervision.encode()).hexdigest(),
         "seed": seed,
     }
 
@@ -622,7 +742,10 @@ def load_cache(
     embeddings = np.load(embedding_path, mmap_mode="r")
     label_file = np.load(label_path, allow_pickle=False)
     labels = {name: label_file[name] for name in label_file.files}
-    if len(embeddings) != len(labels["source"]):
+    required_labels = {
+        "trigger", "source", "source_original", "ecotype", "event_group_size", "clip_id"
+    }
+    if not required_labels.issubset(labels) or len(embeddings) != len(labels["source"]):
         return None
     print(f"Reusing {split} embedding cache: {len(embeddings):,} clips")
     return embeddings, labels
@@ -646,7 +769,9 @@ def extract_embeddings(
     )
     trigger = np.empty(len(dataset), dtype=np.int64)
     source = np.empty(len(dataset), dtype=np.int64)
+    source_original = np.empty(len(dataset), dtype=np.int64)
     ecotype = np.empty(len(dataset), dtype=np.int64)
+    event_group_size = np.empty(len(dataset), dtype=np.int64)
     clip_ids: list[str] = []
     loader = DataLoader(
         dataset,
@@ -672,7 +797,9 @@ def extract_embeddings(
             embeddings[offset : offset + count] = pooled.float().cpu().numpy()
             trigger[offset : offset + count] = batch["trigger_labels"].numpy()
             source[offset : offset + count] = batch["source_labels"].numpy()
+            source_original[offset : offset + count] = batch["source_original_labels"].numpy()
             ecotype[offset : offset + count] = batch["ecotype_labels"].numpy()
+            event_group_size[offset : offset + count] = batch["event_group_sizes"].numpy()
             clip_ids.extend(batch["clip_ids"])
             offset += count
             if batch_index % 250 == 0 or offset == len(dataset):
@@ -682,7 +809,9 @@ def extract_embeddings(
         label_path,
         trigger=trigger,
         source=source,
+        source_original=source_original,
         ecotype=ecotype,
+        event_group_size=event_group_size,
         clip_id=np.asarray(clip_ids, dtype=str),
     )
     atomic_json(
@@ -692,7 +821,9 @@ def extract_embeddings(
     return np.load(embedding_path, mmap_mode="r"), {
         "trigger": trigger,
         "source": source,
+        "source_original": source_original,
         "ecotype": ecotype,
+        "event_group_size": event_group_size,
         "clip_id": np.asarray(clip_ids, dtype=str),
     }
 
@@ -718,19 +849,40 @@ def metrics_for_predictions(
 ) -> dict[str, float]:
     result: dict[str, float] = {}
     trigger_mask = labels["trigger"] != IGNORE_INDEX
-    result["trigger_accuracy"] = float(
-        accuracy_score(labels["trigger"][trigger_mask], predictions["trigger"][trigger_mask])
-    )
-    result["trigger_f1"] = f1(
-        labels["trigger"][trigger_mask],
-        predictions["trigger"][trigger_mask],
-        "binary",
-        pos_label=TRIGGER_LABELS["known_whale"],
-    )
-    result["source_accuracy"] = float(accuracy_score(labels["source"], predictions["source"]))
-    result["source_macro_f1"] = f1(labels["source"], predictions["source"], "macro")
-    for class_id, name in SOURCE_ID2LABEL.items():
-        result[f"source_f1_{name}"] = class_f1(labels["source"], predictions["source"], class_id)
+    if np.any(trigger_mask):
+        trigger_true = labels["trigger"][trigger_mask]
+        trigger_pred = predictions["trigger"][trigger_mask]
+        result["trigger_accuracy"] = float(accuracy_score(trigger_true, trigger_pred))
+        result["trigger_f1"] = f1(
+            trigger_true,
+            trigger_pred,
+            "binary",
+            pos_label=TRIGGER_LABELS["known_whale"],
+        )
+    else:
+        result["trigger_accuracy"] = 0.0
+        result["trigger_f1"] = 0.0
+    source_mask = labels["source"] != IGNORE_INDEX
+    if np.any(source_mask):
+        source_true = labels["source"][source_mask]
+        source_pred = predictions["source"][source_mask]
+        result["source_accuracy"] = float(accuracy_score(source_true, source_pred))
+        result["source_macro_f1"] = f1(source_true, source_pred, "macro")
+        for class_id, name in SOURCE_ID2LABEL.items():
+            result[f"source_f1_{name}"] = class_f1(source_true, source_pred, class_id)
+    else:
+        result["source_accuracy"] = 0.0
+        result["source_macro_f1"] = 0.0
+        for name in SOURCE_ID2LABEL.values():
+            result[f"source_f1_{name}"] = 0.0
+    if "source_original" in labels:
+        original_true = labels["source_original"]
+        result["source_all_rows_accuracy"] = float(
+            accuracy_score(original_true, predictions["source"])
+        )
+        result["source_all_rows_macro_f1"] = f1(
+            original_true, predictions["source"], "macro"
+        )
     ecotype_mask = labels["ecotype"] != IGNORE_INDEX
     if np.any(ecotype_mask):
         true = labels["ecotype"][ecotype_mask]
@@ -793,6 +945,23 @@ def weight_tensor(values: list[float] | None, device: torch.device) -> torch.Ten
     return None if values is None else torch.tensor(values, dtype=torch.float32, device=device)
 
 
+def event_group_sampler(
+    group_sizes: Collection[int], mode: str, seed: int
+) -> WeightedRandomSampler | None:
+    if mode == "none":
+        return None
+    sizes = np.asarray(list(group_sizes), dtype=np.float64)
+    if len(sizes) == 0 or np.any(sizes < 1):
+        raise ValueError("Event group sizes must be positive")
+    weights = torch.from_numpy(1.0 / sizes)
+    return WeightedRandomSampler(
+        weights,
+        num_samples=len(weights),
+        replacement=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+
 def train_head(
     args: argparse.Namespace,
     head: FrozenMultispeciesHeads,
@@ -809,11 +978,15 @@ def train_head(
         torch.from_numpy(train_labels["source"]),
         torch.from_numpy(train_labels["ecotype"]),
     )
+    sampler = event_group_sampler(
+        train_labels["event_group_size"], args.event_group_sampling, args.seed
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.head_batch_size,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(args.seed),
+        shuffle=sampler is None,
+        sampler=sampler,
+        generator=torch.Generator().manual_seed(args.seed) if sampler is None else None,
         pin_memory=device.type == "cuda",
     )
     head.to(device)
@@ -844,27 +1017,14 @@ def train_head(
             ecotype = ecotype.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             trigger_logits, source_logits, ecotype_logits = head(features)
-            losses = [
-                args.source_loss_weight
-                * nn.functional.cross_entropy(source_logits, source, weight=tensors["source"])
-            ]
-            trigger_mask = trigger != IGNORE_INDEX
-            if torch.any(trigger_mask):
-                losses.append(
-                    args.trigger_loss_weight
-                    * nn.functional.cross_entropy(
-                        trigger_logits[trigger_mask], trigger[trigger_mask], weight=tensors["trigger"]
-                    )
-                )
-            ecotype_mask = ecotype != IGNORE_INDEX
-            if torch.any(ecotype_mask):
-                losses.append(
-                    args.ecotype_loss_weight
-                    * nn.functional.cross_entropy(
-                        ecotype_logits[ecotype_mask], ecotype[ecotype_mask], weight=tensors["ecotype"]
-                    )
-                )
-            loss = torch.stack(losses).sum()
+            loss = multitask_loss(
+                (trigger_logits, source_logits, ecotype_logits),
+                trigger,
+                source,
+                ecotype,
+                tensors,
+                args,
+            )
             loss.backward()
             optimizer.step()
             total_loss += float(loss.detach()) * len(features)
@@ -906,10 +1066,15 @@ def multitask_loss(
     args: argparse.Namespace,
 ) -> torch.Tensor:
     trigger_logits, source_logits, ecotype_logits = logits
-    losses = [
-        args.source_loss_weight
-        * nn.functional.cross_entropy(source_logits, source, weight=weights["source"])
-    ]
+    losses: list[torch.Tensor] = []
+    source_mask = source != IGNORE_INDEX
+    if torch.any(source_mask):
+        losses.append(
+            args.source_loss_weight
+            * nn.functional.cross_entropy(
+                source_logits[source_mask], source[source_mask], weight=weights["source"]
+            )
+        )
     trigger_mask = trigger != IGNORE_INDEX
     if torch.any(trigger_mask):
         losses.append(
@@ -930,6 +1095,8 @@ def multitask_loss(
                 weight=weights["ecotype"],
             )
         )
+    if not losses:
+        return sum(value.sum() for value in logits) * 0.0
     return torch.stack(losses).sum()
 
 
@@ -954,7 +1121,9 @@ def evaluate_audio_model(
     )
     weights = {name: weight_tensor(value, device) for name, value in weight_values.items()}
     logit_parts: list[list[np.ndarray]] = [[], [], []]
-    label_parts: dict[str, list[np.ndarray]] = {"trigger": [], "source": [], "ecotype": []}
+    label_parts: dict[str, list[np.ndarray]] = {
+        "trigger": [], "source": [], "source_original": [], "ecotype": []
+    }
     clip_ids: list[str] = []
     total_loss = 0.0
     examples = 0
@@ -964,6 +1133,7 @@ def evaluate_audio_model(
             values = batch["input_values"].to(device, non_blocking=True)
             trigger = batch["trigger_labels"].to(device, non_blocking=True)
             source = batch["source_labels"].to(device, non_blocking=True)
+            source_original = batch["source_original_labels"]
             ecotype = batch["ecotype_labels"].to(device, non_blocking=True)
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"
@@ -976,6 +1146,7 @@ def evaluate_audio_model(
                 logit_parts[index].append(value.float().cpu().numpy())
             label_parts["trigger"].append(trigger.cpu().numpy())
             label_parts["source"].append(source.cpu().numpy())
+            label_parts["source_original"].append(source_original.numpy())
             label_parts["ecotype"].append(ecotype.cpu().numpy())
             clip_ids.extend(batch["clip_ids"])
     logits = [np.concatenate(group) for group in logit_parts]
@@ -1003,11 +1174,17 @@ def train_audio_model(
     weight_values: dict[str, list[float] | None],
     device: torch.device,
 ) -> tuple[dict[str, torch.Tensor], pd.DataFrame, dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]]:
+    sampler = event_group_sampler(
+        (row["event_group_size"] for row in train_dataset.rows),
+        args.event_group_sampling,
+        args.seed,
+    )
     loader = DataLoader(
         train_dataset,
         batch_size=args.embedding_batch_size,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(args.seed),
+        shuffle=sampler is None,
+        sampler=sampler,
+        generator=torch.Generator().manual_seed(args.seed) if sampler is None else None,
         collate_fn=collator,
         num_workers=args.preprocessing_workers,
         pin_memory=device.type == "cuda",
@@ -1149,6 +1326,36 @@ def parse_args() -> argparse.Namespace:
         help="Root searched recursively for shard manifests; repeatable (default: /kaggle/input).",
     )
     parser.add_argument("--manifest-name", default="multispecies_cetacean_manifest.csv")
+    parser.add_argument(
+        "--overlap-audit-csv",
+        type=Path,
+        help="Optional annotation_id-keyed overlap sidecar used for per-head masking.",
+    )
+    parser.add_argument(
+        "--overlap-conflict-policy",
+        choices=["mask", "exclude", "include"],
+        default="mask",
+        help=(
+            "How to apply sidecar recommendations: mask only affected head losses "
+            "(default), exclude conflicting clips entirely, or include all supervision."
+        ),
+    )
+    parser.add_argument(
+        "--require-overlap-audit-coverage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require every annotated shard row to occur in the supplied sidecar.",
+    )
+    parser.add_argument(
+        "--event-group-sampling",
+        choices=["none", "inverse_size"],
+        default="none",
+        help=(
+            "Optional training sampler based on the sidecar event groups. "
+            "inverse_size gives each annotated event approximately equal total "
+            "sampling weight; ambient background rows remain singleton groups."
+        ),
+    )
     parser.add_argument("--model-name", required=True)
     parser.add_argument(
         "--output-dir",
@@ -1250,11 +1457,38 @@ def main() -> int:
     cache_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    overlap_audit_path = (
+        args.overlap_audit_csv.expanduser().resolve()
+        if args.overlap_audit_csv is not None
+        else None
+    )
+    overlap_audit = load_overlap_audit(overlap_audit_path)
+    if args.event_group_sampling != "none" and not overlap_audit:
+        raise ValueError(
+            "--event-group-sampling requires --overlap-audit-csv so event groups "
+            "can be identified"
+        )
+    audit_usage: Counter[str] = Counter()
+
     train_rows, train_manifests, train_archives = discover_rows(
-        roots, "train", args.manifest_name, args.undbio_trigger_policy
+        roots,
+        "train",
+        args.manifest_name,
+        args.undbio_trigger_policy,
+        overlap_audit,
+        args.overlap_conflict_policy,
+        args.require_overlap_audit_coverage,
+        audit_usage,
     )
     val_rows, val_manifests, val_archives = discover_rows(
-        roots, "validation", args.manifest_name, args.undbio_trigger_policy
+        roots,
+        "validation",
+        args.manifest_name,
+        args.undbio_trigger_policy,
+        overlap_audit,
+        args.overlap_conflict_policy,
+        args.require_overlap_audit_coverage,
+        audit_usage,
     )
     train_rows = random_subset(train_rows, args.max_train_files, args.seed)
     val_rows = random_subset(val_rows, args.max_val_files, args.seed + 1)
@@ -1287,6 +1521,11 @@ def main() -> int:
     print(f"Train shard archives:   {len(train_archives)}")
     print(f"Validation archives:    {len(val_archives)}")
     print(f"UndBio trigger policy:  {args.undbio_trigger_policy}")
+    print(f"Overlap audit:          {overlap_audit_path or 'none'}")
+    print(f"Overlap policy:         {args.overlap_conflict_policy}")
+    print(f"Event-group sampling:   {args.event_group_sampling}")
+    if overlap_audit:
+        print(f"Overlap audit usage:    {dict(sorted(audit_usage.items()))}")
     print(f"Mean subtraction:       {preprocessing['mean_subtract']}")
     print(f"High-pass filter:       {preprocessing['high_pass_filter']}")
     if preprocessing["high_pass_filter"]:
@@ -1314,12 +1553,15 @@ def main() -> int:
         if weights["trigger"] is None:
             weights["trigger"] = automatic_weights(train_label_values["trigger"], 2, IGNORE_INDEX)
         if weights["source"] is None:
-            weights["source"] = automatic_weights(train_label_values["source"], 4)
+            weights["source"] = automatic_weights(
+                train_label_values["source"], 4, IGNORE_INDEX
+            )
         if weights["ecotype"] is None:
             weights["ecotype"] = automatic_weights(train_label_values["ecotype"], 5, IGNORE_INDEX)
 
     print(f"Train trigger counts:   {label_counts(train_label_values['trigger'][train_label_values['trigger'] != IGNORE_INDEX], TRIGGER_ID2LABEL)}")
-    print(f"Train source counts:    {label_counts(train_label_values['source'], SOURCE_ID2LABEL)}")
+    print(f"Train source counts:    {label_counts(train_label_values['source'][train_label_values['source'] != IGNORE_INDEX], SOURCE_ID2LABEL)}")
+    print(f"Train source masks:     {int(np.sum(train_label_values['source'] == IGNORE_INDEX)):,}")
     print(f"Train ecotype counts:   {label_counts(train_label_values['ecotype'][train_label_values['ecotype'] != IGNORE_INDEX], ECOTYPE_ID2LABEL)}")
     print(f"Class weights:          {weights}")
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
@@ -1391,9 +1633,13 @@ def main() -> int:
     confusion_frame(
         val_labels["trigger"][trigger_mask], predictions["trigger"][trigger_mask], TRIGGER_ID2LABEL
     ).to_csv(output_dir / "trigger_confusion_matrix.csv")
+    source_mask = val_labels["source"] != IGNORE_INDEX
     confusion_frame(
-        val_labels["source"], predictions["source"], SOURCE_ID2LABEL
+        val_labels["source"][source_mask], predictions["source"][source_mask], SOURCE_ID2LABEL
     ).to_csv(output_dir / "source_confusion_matrix.csv")
+    confusion_frame(
+        val_labels["source_original"], predictions["source"], SOURCE_ID2LABEL
+    ).to_csv(output_dir / "source_confusion_matrix_all_rows.csv")
     ecotype_mask = val_labels["ecotype"] != IGNORE_INDEX
     confusion_frame(
         val_labels["ecotype"][ecotype_mask], predictions["ecotype"][ecotype_mask], ECOTYPE_ID2LABEL
@@ -1407,7 +1653,9 @@ def main() -> int:
         "trigger_true": val_labels["trigger"],
         "trigger_pred": predictions["trigger"],
         "trigger_probability_known_whale": trigger_prob[:, 1],
-        "source_true": val_labels["source"],
+        "source_true": val_labels["source_original"],
+        "source_supervision_label": val_labels["source"],
+        "source_evaluation_eligible": source_mask,
         "source_pred": predictions["source"],
         "ecotype_true": val_labels["ecotype"],
         "ecotype_pred": predictions["ecotype"],
@@ -1432,6 +1680,13 @@ def main() -> int:
         "source_labels": SOURCE_LABELS,
         "ecotype_labels": ECOTYPE_LABELS,
         "undbio_trigger_policy": args.undbio_trigger_policy,
+        "overlap_audit": (
+            file_identity(overlap_audit_path) if overlap_audit_path is not None else None
+        ),
+        "overlap_conflict_policy": args.overlap_conflict_policy,
+        "require_overlap_audit_coverage": args.require_overlap_audit_coverage,
+        "event_group_sampling": args.event_group_sampling,
+        "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
         "class_weights": weights,
         "learning_rate": args.learning_rate,
