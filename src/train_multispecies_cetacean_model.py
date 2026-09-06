@@ -108,6 +108,78 @@ class ArchiveManifestDataset(Dataset):
         return self.rows[index]
 
 
+class WaveformAugmenter:
+    """Training-only random gain and zero-padded time-shift augmentation."""
+
+    def __init__(
+        self,
+        sample_rate: int,
+        random_gain: bool = False,
+        random_gain_prob: float = 1.0,
+        gain_db: float = 6.0,
+        gain_clipping_mode: str = "clip",
+        time_shift: bool = False,
+        time_shift_prob: float = 1.0,
+        max_shift_ms: float = 250.0,
+        time_shift_fade_ms: float = 0.0,
+    ) -> None:
+        self.random_gain = random_gain
+        self.random_gain_prob = random_gain_prob
+        self.gain_db = gain_db
+        self.gain_clipping_mode = gain_clipping_mode
+        self.time_shift = time_shift
+        self.time_shift_prob = time_shift_prob
+        self.max_shift = round(sample_rate * max_shift_ms / 1000.0)
+        self.time_shift_fade = round(sample_rate * time_shift_fade_ms / 1000.0)
+
+    @staticmethod
+    def _zero_pad_shift(audio: np.ndarray, shift: int, fade_samples: int) -> np.ndarray:
+        if shift == 0:
+            return audio
+        if abs(shift) >= len(audio):
+            return np.zeros_like(audio)
+        shifted = np.zeros_like(audio)
+        if shift > 0:
+            shifted[shift:] = audio[:-shift]
+            fade_len = min(fade_samples, len(shifted) - shift)
+            if fade_len:
+                shifted[shift : shift + fade_len] *= np.linspace(
+                    0.0, 1.0, fade_len, endpoint=True, dtype=shifted.dtype
+                )
+        else:
+            shifted[:shift] = audio[-shift:]
+            fade_len = min(fade_samples, len(shifted) + shift)
+            if fade_len:
+                fade_end = len(shifted) + shift
+                shifted[fade_end - fade_len : fade_end] *= np.linspace(
+                    1.0, 0.0, fade_len, endpoint=True, dtype=shifted.dtype
+                )
+        return shifted
+
+    def __call__(self, audio: np.ndarray) -> np.ndarray:
+        output = audio.astype(np.float32, copy=True)
+        if self.random_gain and random.random() < self.random_gain_prob:
+            gain = 10.0 ** (random.uniform(-self.gain_db, self.gain_db) / 20.0)
+            if self.gain_clipping_mode == "safe":
+                peak = float(np.max(np.abs(output)))
+                if peak > 0.0:
+                    gain = min(gain, 1.0 / peak)
+            output *= gain
+            if self.gain_clipping_mode == "normalize":
+                peak = float(np.max(np.abs(output)))
+                if peak > 1.0:
+                    output /= peak
+            elif self.gain_clipping_mode == "soft":
+                output = np.tanh(output)
+        if self.time_shift and self.max_shift > 0 and random.random() < self.time_shift_prob:
+            output = self._zero_pad_shift(
+                output,
+                random.randint(-self.max_shift, self.max_shift),
+                self.time_shift_fade,
+            )
+        return np.clip(output, -1.0, 1.0).astype(np.float32, copy=False)
+
+
 class ArchiveAudioCollator:
     """Load only requested ZIP members and convert waveforms to AST features."""
 
@@ -118,10 +190,12 @@ class ArchiveAudioCollator:
         mean_subtract: bool,
         high_pass_cutoff_hz: float | None,
         high_pass_order: int,
+        augmenter: WaveformAugmenter | None = None,
     ) -> None:
         self.feature_extractor = feature_extractor
         self.target_samples = round(clip_seconds * SAMPLE_RATE)
         self.mean_subtract = mean_subtract
+        self.augmenter = augmenter
         self.handles: dict[str, zipfile.ZipFile] = {}
         self.high_pass_sos: np.ndarray | None = None
         if high_pass_cutoff_hz is not None:
@@ -178,6 +252,8 @@ class ArchiveAudioCollator:
                 audio = sosfiltfilt(self.high_pass_sos, audio).astype(np.float32)
             except ValueError:
                 audio = sosfilt(self.high_pass_sos, audio).astype(np.float32)
+        if self.augmenter is not None:
+            audio = self.augmenter(audio)
         return audio
 
     def __call__(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1170,7 +1246,8 @@ def train_audio_model(
     model: MultispeciesCetaceanModel,
     train_dataset: ArchiveManifestDataset,
     val_dataset: ArchiveManifestDataset,
-    collator: ArchiveAudioCollator,
+    train_collator: ArchiveAudioCollator,
+    validation_collator: ArchiveAudioCollator,
     weight_values: dict[str, list[float] | None],
     device: torch.device,
 ) -> tuple[dict[str, torch.Tensor], pd.DataFrame, dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]]:
@@ -1185,7 +1262,7 @@ def train_audio_model(
         shuffle=sampler is None,
         sampler=sampler,
         generator=torch.Generator().manual_seed(args.seed) if sampler is None else None,
-        collate_fn=collator,
+        collate_fn=train_collator,
         num_workers=args.preprocessing_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.preprocessing_workers > 0,
@@ -1266,7 +1343,7 @@ def train_audio_model(
         evaluation = evaluate_audio_model(
             training_model,
             val_dataset,
-            collator,
+            validation_collator,
             args.embedding_batch_size,
             args.preprocessing_workers,
             device,
@@ -1421,6 +1498,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--high-pass-cutoff-hz", type=float)
     parser.add_argument("--high-pass-order", type=int)
+    parser.add_argument(
+        "--random-gain",
+        action="store_true",
+        help="Apply random waveform gain during full-backbone training only.",
+    )
+    parser.add_argument("--random-gain-prob", type=float, default=1.0)
+    parser.add_argument("--gain-db", type=float, default=6.0)
+    parser.add_argument(
+        "--gain-clipping-mode",
+        choices=["clip", "safe", "normalize", "soft"],
+        default="clip",
+    )
+    parser.add_argument(
+        "--time-shift",
+        action="store_true",
+        help="Apply a zero-padded random time shift during full-backbone training only.",
+    )
+    parser.add_argument("--time-shift-prob", type=float, default=1.0)
+    parser.add_argument("--max-shift-ms", type=float, default=250.0)
+    parser.add_argument("--time-shift-fade-ms", type=float, default=0.0)
     args = parser.parse_args()
     args.data_root = args.data_root or ["/kaggle/input"]
     if min(
@@ -1442,6 +1539,23 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-grad-norm must be positive")
     if args.clip_seconds <= 0:
         parser.error("--clip-seconds must be positive")
+    for value, name in (
+        (args.random_gain_prob, "--random-gain-prob"),
+        (args.time_shift_prob, "--time-shift-prob"),
+    ):
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"{name} must be between 0 and 1")
+    if args.gain_db < 0:
+        parser.error("--gain-db cannot be negative")
+    if args.max_shift_ms < 0 or args.time_shift_fade_ms < 0:
+        parser.error("time-shift durations cannot be negative")
+    if args.max_shift_ms >= args.clip_seconds * 1000.0:
+        parser.error("--max-shift-ms must be shorter than --clip-seconds")
+    if args.freeze_backbone and (args.random_gain or args.time_shift):
+        parser.error(
+            "stochastic waveform augmentation is unavailable with --freeze-backbone "
+            "because each clip is embedded only once"
+        )
     return args
 
 
@@ -1503,12 +1617,35 @@ def main() -> int:
         feature_extractor = AutoFeatureExtractor.from_pretrained(feature_source)
     except Exception:
         feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_name)
-    collator = ArchiveAudioCollator(
+    validation_collator = ArchiveAudioCollator(
         feature_extractor,
         args.clip_seconds,
         preprocessing["mean_subtract"],
         preprocessing["high_pass_cutoff_hz"] if preprocessing["high_pass_filter"] else None,
         preprocessing["high_pass_order"],
+    )
+    waveform_augmenter = (
+        WaveformAugmenter(
+            sample_rate=SAMPLE_RATE,
+            random_gain=args.random_gain,
+            random_gain_prob=args.random_gain_prob,
+            gain_db=args.gain_db,
+            gain_clipping_mode=args.gain_clipping_mode,
+            time_shift=args.time_shift,
+            time_shift_prob=args.time_shift_prob,
+            max_shift_ms=args.max_shift_ms,
+            time_shift_fade_ms=args.time_shift_fade_ms,
+        )
+        if args.random_gain or args.time_shift
+        else None
+    )
+    training_collator = ArchiveAudioCollator(
+        feature_extractor,
+        args.clip_seconds,
+        preprocessing["mean_subtract"],
+        preprocessing["high_pass_cutoff_hz"] if preprocessing["high_pass_filter"] else None,
+        preprocessing["high_pass_order"],
+        augmenter=waveform_augmenter,
     )
 
     print("\nMultispecies Cetacean training")
@@ -1533,6 +1670,13 @@ def main() -> int:
             f"High-pass settings:     {preprocessing['high_pass_cutoff_hz']:g} Hz, "
             f"order {preprocessing['high_pass_order']}"
         )
+    print(
+        "Training augmentation:   "
+        f"random_gain={args.random_gain} (p={args.random_gain_prob:g}, "
+        f"±{args.gain_db:g} dB, {args.gain_clipping_mode}); "
+        f"time_shift={args.time_shift} (p={args.time_shift_prob:g}, "
+        f"max={args.max_shift_ms:g} ms, fade={args.time_shift_fade_ms:g} ms)"
+    )
 
     train_label_values = {
         name: np.asarray([row[f"{name}_label"] for row in train_rows], dtype=np.int64)
@@ -1587,12 +1731,12 @@ def main() -> int:
         model.to(device)
         if train_cache is None:
             train_cache = extract_embeddings(
-                "train", train_dataset, model, collator, device, cache_dir,
+                "train", train_dataset, model, validation_collator, device, cache_dir,
                 train_signature, args.embedding_batch_size, args.preprocessing_workers
             )
         if val_cache is None:
             val_cache = extract_embeddings(
-                "validation", val_dataset, model, collator, device, cache_dir,
+                "validation", val_dataset, model, validation_collator, device, cache_dir,
                 val_signature, args.embedding_batch_size, args.preprocessing_workers
             )
         train_embeddings, train_labels = train_cache
@@ -1622,7 +1766,14 @@ def main() -> int:
         }
     else:
         full_state, history, best_metrics, predictions, val_labels = train_audio_model(
-            args, model, train_dataset, val_dataset, collator, weights, device
+            args,
+            model,
+            train_dataset,
+            val_dataset,
+            training_collator,
+            validation_collator,
+            weights,
+            device,
         )
         model.load_state_dict(full_state)
         model.to("cpu")
@@ -1688,6 +1839,16 @@ def main() -> int:
         "event_group_sampling": args.event_group_sampling,
         "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
+        "training_augmentation": {
+            "random_gain": args.random_gain,
+            "random_gain_probability": args.random_gain_prob,
+            "gain_db": args.gain_db,
+            "gain_clipping_mode": args.gain_clipping_mode,
+            "time_shift": args.time_shift,
+            "time_shift_probability": args.time_shift_prob,
+            "max_shift_ms": args.max_shift_ms,
+            "time_shift_fade_ms": args.time_shift_fade_ms,
+        },
         "class_weights": weights,
         "learning_rate": args.learning_rate,
         "backbone_learning_rate": args.backbone_learning_rate,
