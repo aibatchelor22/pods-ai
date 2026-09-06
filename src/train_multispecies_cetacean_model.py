@@ -29,6 +29,7 @@ import io
 import json
 import math
 import random
+import time
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -79,6 +80,13 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{seconds:02d}"
 
 
 def file_identity(path: Path) -> dict[str, Any]:
@@ -978,6 +986,37 @@ def metrics_for_predictions(
     return result
 
 
+def print_epoch_metrics(
+    epoch: int, train_loss: float, metrics: dict[str, float]
+) -> None:
+    """Print a complete, consistently ordered validation report."""
+    print(f"\nValidation metrics after epoch {epoch}")
+    print(f"  {'train_loss':31s}: {train_loss:.6f}")
+    ordered_names = [
+        "loss",
+        "trigger_accuracy",
+        "trigger_f1",
+        "source_accuracy",
+        "source_macro_f1",
+        *[f"source_f1_{name}" for name in SOURCE_LABELS],
+        "source_all_rows_accuracy",
+        "source_all_rows_macro_f1",
+        "ecotype_accuracy",
+        "ecotype_macro_f1",
+        *[f"ecotype_f1_{name}" for name in ECOTYPE_LABELS],
+        "combined_score",
+    ]
+    printed: set[str] = set()
+    for name in ordered_names:
+        if name in metrics:
+            label = "validation_loss" if name == "loss" else name
+            print(f"  {label:31s}: {metrics[name]:.6f}")
+            printed.add(name)
+    for name in sorted(metrics):
+        if name not in printed:
+            print(f"  {name:31s}: {metrics[name]:.6f}")
+
+
 def predict(
     head: FrozenMultispeciesHeads,
     embeddings: np.ndarray,
@@ -1110,13 +1149,7 @@ def train_head(
         )
         row = {"epoch": float(epoch), "train_loss": total_loss / max(examples, 1), **metrics}
         history.append(row)
-        print(
-            f"Epoch {epoch:02d}: loss={row['train_loss']:.5f}, "
-            f"trigger_f1={metrics['trigger_f1']:.4f}, "
-            f"source_macro_f1={metrics['source_macro_f1']:.4f}, "
-            f"ecotype_macro_f1={metrics['ecotype_macro_f1']:.4f}, "
-            f"combined={metrics['combined_score']:.4f}"
-        )
+        print_epoch_metrics(epoch, row["train_loss"], metrics)
         if metrics["combined_score"] > best_score + 1e-8:
             best_score = metrics["combined_score"]
             best_state = {
@@ -1310,9 +1343,12 @@ def train_audio_model(
     stale = 0
     for epoch in range(1, args.epochs + 1):
         training_model.train()
+        epoch_started = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         examples = 0
+        interval_loss = 0.0
+        interval_examples = 0
         for batch_index, batch in enumerate(loader, start=1):
             values = batch["input_values"].to(device, non_blocking=True)
             trigger = batch["trigger_labels"].to(device, non_blocking=True)
@@ -1338,8 +1374,24 @@ def train_audio_model(
                 scheduler.step()
             total_loss += float(raw_loss.detach()) * len(values)
             examples += len(values)
-            if batch_index % 250 == 0:
-                print(f"  epoch {epoch}: {batch_index:,}/{len(loader):,} batches")
+            interval_loss += float(raw_loss.detach()) * len(values)
+            interval_examples += len(values)
+            if batch_index % args.progress_every_batches == 0 or batch_index == len(loader):
+                elapsed = time.monotonic() - epoch_started
+                batches_per_second = batch_index / max(elapsed, 1e-9)
+                remaining_seconds = (
+                    len(loader) - batch_index
+                ) / max(batches_per_second, 1e-9)
+                print(
+                    f"  epoch {epoch}: {batch_index:,}/{len(loader):,} batches; "
+                    f"recent_loss={interval_loss / max(interval_examples, 1):.5f}; "
+                    f"running_loss={total_loss / max(examples, 1):.5f}; "
+                    f"elapsed={format_duration(elapsed)}; "
+                    f"epoch_eta={format_duration(remaining_seconds)}; "
+                    f"rate={batches_per_second:.2f} batch/s"
+                )
+                interval_loss = 0.0
+                interval_examples = 0
         evaluation = evaluate_audio_model(
             training_model,
             val_dataset,
@@ -1353,13 +1405,7 @@ def train_audio_model(
         metrics, _, _ = evaluation
         row = {"epoch": float(epoch), "train_loss": total_loss / max(examples, 1), **metrics}
         history.append(row)
-        print(
-            f"Epoch {epoch:02d}: train_loss={row['train_loss']:.5f}, "
-            f"val_loss={metrics['loss']:.5f}, trigger_f1={metrics['trigger_f1']:.4f}, "
-            f"source_macro_f1={metrics['source_macro_f1']:.4f}, "
-            f"ecotype_macro_f1={metrics['ecotype_macro_f1']:.4f}, "
-            f"combined={metrics['combined_score']:.4f}"
-        )
+        print_epoch_metrics(epoch, row["train_loss"], metrics)
         if metrics["combined_score"] > best_score + 1e-8:
             best_score = metrics["combined_score"]
             best_state = {
@@ -1392,6 +1438,34 @@ def confusion_frame(
 def label_counts(values: np.ndarray, id2label: dict[int, str]) -> dict[str, int]:
     counts = Counter(values.tolist())
     return {name: counts[index] for index, name in id2label.items()}
+
+
+def save_loss_plot(history: pd.DataFrame, output_path: Path) -> None:
+    """Save available epoch-level training and validation loss curves."""
+    if history.empty or "epoch" not in history or "train_loss" not in history:
+        print("Loss plot skipped: training history does not contain loss values")
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        figure, axis = plt.subplots(figsize=(8, 5))
+        axis.plot(history["epoch"], history["train_loss"], marker="o", label="Training loss")
+        if "loss" in history and history["loss"].notna().any():
+            axis.plot(history["epoch"], history["loss"], marker="o", label="Validation loss")
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("Loss")
+        axis.set_title("Training and validation loss")
+        axis.grid(True, alpha=0.25)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(output_path, dpi=200, bbox_inches="tight")
+        plt.close(figure)
+        print(f"Saved loss plot:        {output_path}")
+    except Exception as exc:
+        print(f"WARNING: could not save loss plot: {exc}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1447,6 +1521,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-batch-size", type=int, default=32)
     parser.add_argument("--head-batch-size", type=int, default=2048)
     parser.add_argument("--preprocessing-workers", type=int, default=2)
+    parser.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=100,
+        help="Print training loss, rate, and epoch ETA every N batches.",
+    )
     parser.add_argument("--early-stopping-patience", type=int, default=3)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument(
@@ -1539,6 +1619,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-grad-norm must be positive")
     if args.clip_seconds <= 0:
         parser.error("--clip-seconds must be positive")
+    if args.progress_every_batches < 1:
+        parser.error("--progress-every-batches must be positive")
     for value, name in (
         (args.random_gain_prob, "--random-gain-prob"),
         (args.time_shift_prob, "--time-shift-prob"),
@@ -1780,6 +1862,7 @@ def main() -> int:
 
     torch.save(full_state, output_dir / "pytorch_model.bin")
     history.to_csv(output_dir / "training_history.csv", index=False)
+    save_loss_plot(history, output_dir / "training_loss.png")
     trigger_mask = val_labels["trigger"] != IGNORE_INDEX
     confusion_frame(
         val_labels["trigger"][trigger_mask], predictions["trigger"][trigger_mask], TRIGGER_ID2LABEL
