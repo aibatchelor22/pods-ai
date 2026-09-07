@@ -99,8 +99,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resident-max-fp-rate",
         type=float,
-        default=0.30,
-        help="Maximum resident false-positive rate for resident-sensitive selection.",
+        default=1.0,
+        help=(
+            "Optional maximum resident false-positive rate for resident-sensitive "
+            "selection. The default 1.0 imposes no constraint."
+        ),
     )
     parser.add_argument("--checkpoint-every", type=int, default=1000)
     return parser.parse_args()
@@ -154,12 +157,21 @@ def configurations(args: argparse.Namespace) -> tuple[Iterable[evaluation.Aggreg
 
 
 def result_row(run: int, config: evaluation.AggregationConfig, metrics: dict[str, Any]) -> dict[str, Any]:
+    whale_macro_recall = float(
+        np.mean(
+            [
+                metrics["per_class"][label]["recall"]
+                for label in ("humpback", "resident", "transient")
+            ]
+        )
+    )
     row: dict[str, Any] = {"run": run, **asdict(config)}
     row.update(
         evaluated=metrics["evaluated"],
         correct=metrics["correct"],
         accuracy=metrics["accuracy"],
         whale_macro_f1=metrics["whale_macro_f1"],
+        whale_macro_recall=whale_macro_recall,
         all_class_macro_f1=metrics["all_class_macro_f1"],
     )
     for label in evaluation.EVALUATION_LABELS:
@@ -241,6 +253,15 @@ def main() -> int:
     overall = results.sort_values(
         ["whale_macro_f1", "accuracy", "all_class_macro_f1"], ascending=False
     ).iloc[0]
+
+    # This operating point emphasizes correct recall across all three whale
+    # classes. Using macro recall prevents the largest class from dominating;
+    # F1 and accuracy break ties among equally sensitive configurations.
+    whale_sensitive = results.sort_values(
+        ["whale_macro_recall", "whale_macro_f1", "accuracy", "all_class_macro_f1"],
+        ascending=False,
+    ).iloc[0]
+
     eligible = results.loc[results["resident_false_positive_rate"] <= args.resident_max_fp_rate]
     if eligible.empty:
         print("No configuration met the resident FP-rate constraint; using the lowest-FP configuration.")
@@ -250,10 +271,18 @@ def main() -> int:
         ).iloc[0]
     else:
         resident = eligible.sort_values(
-            ["resident_recall", "resident_f1", "whale_macro_f1", "accuracy"], ascending=False
+            [
+                "resident_recall",
+                "resident_f1",
+                "resident_false_positive_rate",
+                "whale_macro_f1",
+                "accuracy",
+            ],
+            ascending=[False, False, True, False, False],
         ).iloc[0]
     results.sort_values(["whale_macro_f1", "accuracy"], ascending=False).to_csv(output_path, index=False)
     save_selected("best_overall", overall, samples, output_dir)
+    save_selected("best_whale_sensitive", whale_sensitive, samples, output_dir)
     save_selected("best_resident_sensitive", resident, samples, output_dir)
     selection = {
         "complete_grid_size": complete_grid,
@@ -261,6 +290,7 @@ def main() -> int:
         "seed": args.seed,
         "resident_max_fp_rate": args.resident_max_fp_rate,
         "best_overall": overall.to_dict(),
+        "best_whale_sensitive": whale_sensitive.to_dict(),
         "best_resident_sensitive": resident.to_dict(),
     }
     (output_dir / "selected_configurations.json").write_text(
