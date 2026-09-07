@@ -93,6 +93,48 @@ def domain_key(row: pd.Series, columns: list[str]) -> str:
     )
 
 
+class HierarchicalSampler:
+    """Sample provider, then dataset, then recording, then clip uniformly."""
+
+    def __init__(self, frame: pd.DataFrame):
+        if frame.empty:
+            raise ValueError("Cannot build a sampler from an empty frame")
+        self.frame = frame
+        self.tree: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+        for provider, provider_frame in frame.groupby("_provider_key", sort=True):
+            datasets: dict[str, dict[str, np.ndarray]] = {}
+            for dataset, dataset_frame in provider_frame.groupby("_dataset_key", sort=True):
+                recordings = {
+                    str(recording): recording_frame.index.to_numpy()
+                    for recording, recording_frame in dataset_frame.groupby("_recording_key", sort=True)
+                }
+                datasets[str(dataset)] = recordings
+            self.tree[str(provider)] = datasets
+        self.providers = tuple(self.tree)
+
+    def sample(self, rng: np.random.Generator) -> pd.Series:
+        provider = self.providers[int(rng.integers(len(self.providers)))]
+        datasets = self.tree[provider]
+        dataset_keys = tuple(datasets)
+        dataset = dataset_keys[int(rng.integers(len(dataset_keys)))]
+        recordings = datasets[dataset]
+        recording_keys = tuple(recordings)
+        recording = recording_keys[int(rng.integers(len(recording_keys)))]
+        indices = recordings[recording]
+        index = indices[int(rng.integers(len(indices)))]
+        return self.frame.loc[index]
+
+
+def sample_row(
+    frame: pd.DataFrame,
+    sampler: HierarchicalSampler | None,
+    rng: np.random.Generator,
+) -> pd.Series:
+    if sampler is not None:
+        return sampler.sample(rng)
+    return frame.iloc[int(rng.integers(len(frame)))]
+
+
 class ClipReader:
     """Read a clip from either clips.zip or Kaggle's expanded clips directory."""
 
@@ -457,6 +499,34 @@ def write_metadata(output_dir: Path, dataset_id: str, title: str, license_name: 
     (output_dir / "dataset-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
+def write_balance_report(rows: list[dict[str, Any]], path: Path) -> None:
+    columns = ["role", "donor_label", "provider", "dataset", "mixtures", "unique_recordings"]
+    if not rows:
+        pd.DataFrame(columns=columns).to_csv(path, index=False)
+        return
+    frame = pd.DataFrame(rows)
+    reports: list[pd.DataFrame] = []
+    for role, provider, dataset, recording in (
+        ("donor", "donor_provider", "donor_dataset", "donor_source_recording_id"),
+        ("background", "background_provider", "background_dataset", "background_source_recording_id"),
+    ):
+        report = (
+            frame.groupby(["model_source_label", provider, dataset], dropna=False)
+            .agg(mixtures=("clip_id", "size"), unique_recordings=(recording, "nunique"))
+            .reset_index()
+            .rename(
+                columns={
+                    "model_source_label": "donor_label",
+                    provider: "provider",
+                    dataset: "dataset",
+                }
+            )
+        )
+        report.insert(0, "role", role)
+        reports.append(report[columns])
+    pd.concat(reports, ignore_index=True).to_csv(path, index=False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", action="append", default=None, help="Root searched recursively; repeatable.")
@@ -469,6 +539,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-counts", default=None)
     parser.add_argument("--domain-columns", default="Provider,Dataset")
     parser.add_argument("--require-different-domain", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("hierarchical_balanced", "clip_uniform"),
+        default="hierarchical_balanced",
+        help=(
+            "hierarchical_balanced samples provider, dataset, recording, and clip "
+            "uniformly at each level (default); clip_uniform reproduces row-wise sampling."
+        ),
+    )
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--clip-seconds", type=float, default=3.0)
     parser.add_argument("--snr-db-min", type=float, default=-12.0)
@@ -521,6 +600,7 @@ def main() -> int:
     clips_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.output_manifest) if args.output_manifest else output_dir / MANIFEST_NAME
     audit_path = output_dir / "pca_mixture_generation_audit.csv"
+    balance_path = output_dir / "sampling_balance_report.csv"
 
     frame, manifests = discover_rows(roots, args.manifest_name)
     if args.max_input_rows is not None:
@@ -568,9 +648,46 @@ def main() -> int:
         if count and donors[label].empty:
             raise ValueError(f"No eligible {label} donor rows")
     frame_domains = frame.apply(lambda row: domain_key(row, domains), axis=1)
+    frame["_provider_key"] = (
+        frame["Provider"].fillna("").astype(str).str.strip().replace("", "<missing>")
+    )
+    frame["_dataset_key"] = (
+        frame["Dataset"].fillna("").astype(str).str.strip().replace("", "<missing>")
+    )
+    frame["_recording_key"] = (
+        frame["source_recording_id"].fillna("").astype(str).str.strip().replace("", "<missing>")
+    )
     for label in labels:
         donors[label]["_domain"] = frame_domains.loc[donors[label].index]
+        donors[label]["_provider_key"] = frame.loc[donors[label].index, "_provider_key"]
+        donors[label]["_dataset_key"] = frame.loc[donors[label].index, "_dataset_key"]
+        donors[label]["_recording_key"] = frame.loc[donors[label].index, "_recording_key"]
     backgrounds["_domain"] = frame_domains.loc[backgrounds.index]
+    backgrounds["_provider_key"] = frame.loc[backgrounds.index, "_provider_key"]
+    backgrounds["_dataset_key"] = frame.loc[backgrounds.index, "_dataset_key"]
+    backgrounds["_recording_key"] = frame.loc[backgrounds.index, "_recording_key"]
+
+    balanced = args.sampling_mode == "hierarchical_balanced"
+    donor_samplers = {
+        label: HierarchicalSampler(donors[label]) if balanced else None for label in labels
+    }
+    # With cross-domain mixing there are normally only a modest number of
+    # provider/dataset domains. Build each eligible background hierarchy once
+    # and reuse it instead of filtering the full table for every mixture.
+    background_samplers: dict[str, HierarchicalSampler | None] = {}
+
+    def background_pool_and_sampler(donor: pd.Series) -> tuple[pd.DataFrame, HierarchicalSampler | None]:
+        excluded_domain = clean(donor.get("_domain")) if args.require_different_domain else ""
+        cache_key = excluded_domain or "<all-domains>"
+        if args.require_different_domain:
+            pool = backgrounds.loc[backgrounds["_domain"].ne(excluded_domain)]
+        else:
+            pool = backgrounds
+        if pool.empty:
+            raise ValueError("no_eligible_background_domain")
+        if cache_key not in background_samplers:
+            background_samplers[cache_key] = HierarchicalSampler(pool) if balanced else None
+        return pool, background_samplers[cache_key]
 
     rows: list[dict[str, Any]] = []
     audit: list[dict[str, Any]] = []
@@ -592,6 +709,7 @@ def main() -> int:
     print(f"Target SNR:            {args.snr_db_min:g}..{args.snr_db_max:g} dB")
     print(f"PCA mask:              components={args.pca_components}, percentile={args.mask_percentile:g}")
     print(f"Different domain:      {args.require_different_domain}")
+    print(f"Sampling mode:         {args.sampling_mode}")
     print(f"Previously completed:  {len(completed):,}")
     print("=" * 72)
 
@@ -607,17 +725,11 @@ def main() -> int:
             success = False
             for attempt in range(1, args.max_attempts_per_mixture + 1):
                 try:
-                    donor = donor_pool.iloc[int(rng.integers(len(donor_pool)))]
-                    eligible_backgrounds = backgrounds.loc[
-                        backgrounds["source_recording_id"].astype(str).ne(clean(donor.get("source_recording_id")))
-                    ]
-                    if args.require_different_domain:
-                        eligible_backgrounds = eligible_backgrounds.loc[
-                            eligible_backgrounds["_domain"].ne(clean(donor.get("_domain")))
-                        ]
-                    if eligible_backgrounds.empty:
-                        raise ValueError("no_eligible_background")
-                    background = eligible_backgrounds.iloc[int(rng.integers(len(eligible_backgrounds)))]
+                    donor = sample_row(donor_pool, donor_samplers[label], rng)
+                    eligible_backgrounds, background_sampler = background_pool_and_sampler(donor)
+                    background = sample_row(eligible_backgrounds, background_sampler, rng)
+                    if clean(background.get("source_recording_id")) == clean(donor.get("source_recording_id")):
+                        raise ValueError("donor_and_background_share_recording")
                     donor_audio = reader.load(donor)
                     background_audio = reader.load(background)
                     event_start, event_end, low_hz, high_hz = annotation_geometry(
@@ -670,6 +782,7 @@ def main() -> int:
 
     pd.DataFrame(rows).to_csv(manifest_path, index=False)
     pd.DataFrame(audit).to_csv(audit_path, index=False)
+    write_balance_report(rows, balance_path)
     write_metadata(output_dir, args.kaggle_dataset_id, args.kaggle_title, args.kaggle_license)
     summary = {
         "input_manifests": [str(path) for path in manifests],
@@ -678,6 +791,12 @@ def main() -> int:
         "ambient_backgrounds": len(backgrounds),
         "requested_label_counts": counts,
         "saved_label_counts": dict(Counter(clean(row.get("model_source_label")) for row in rows)),
+        "donor_provider_counts": dict(Counter(clean(row.get("donor_provider")) for row in rows)),
+        "background_provider_counts": dict(Counter(clean(row.get("background_provider")) for row in rows)),
+        "donor_dataset_counts": dict(Counter(clean(row.get("donor_dataset")) for row in rows)),
+        "background_dataset_counts": dict(Counter(clean(row.get("background_dataset")) for row in rows)),
+        "unique_donor_recordings": len({clean(row.get("donor_source_recording_id")) for row in rows}),
+        "unique_background_recordings": len({clean(row.get("background_source_recording_id")) for row in rows}),
         "saved_total": len(rows),
         "failed_mixtures": sum(1 for row in audit if row.get("status") == "failed"),
         "retry_reasons": dict(failures.most_common()),
@@ -689,6 +808,7 @@ def main() -> int:
     print(f"Saved mixtures:        {len(rows):,}")
     print(f"Trainer manifest:      {manifest_path}")
     print(f"Audit:                 {audit_path}")
+    print(f"Sampling balance:      {balance_path}")
     print("This is a generated-only manifest; keep the original shard datasets attached during training.")
     if args.publish_action == "create":
         subprocess.run(["kaggle", "datasets", "create", "-p", str(output_dir), "--dir-mode", "zip"], check=True)
