@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Build leak-safe PCA vocalization/background mixtures for the V2 dataset.
+"""Build leak-safe vocalization/background mixtures for the V2 dataset.
 
 The script discovers builder-created ``multispecies_cetacean_manifest.csv``
 files, uses annotated TRAIN clips as foreground donors, and uses only ambient
-TRAIN clips (``clip_kind=background``) as backgrounds.  A low-rank PCA model
-estimates stationary donor noise in the STFT; high positive residuals inside
-the annotation time/frequency rectangle form the vocalization mask.  The
-isolated foreground is placed in a background clip from another recording and
-scaled to a random, band-limited SNR.
+TRAIN clips (``clip_kind=background``) as backgrounds. The default PCA method
+estimates stationary donor noise in the STFT and keeps high positive residuals
+inside the annotation time/frequency rectangle. The ``annotation_rectangle``
+method instead preserves the complete softened annotation rectangle, matching
+the earlier controlled-background experiment. The isolated foreground is
+placed in a background clip from another recording and scaled to a random,
+band-limited SNR.
 
 Output is a standalone Kaggle-dataset directory containing a generated-only
 trainer manifest and lossless 16 kHz FLAC files.  Do not concatenate the input
@@ -249,6 +251,7 @@ def isolate_vocalization(
     hop_length: int,
     percentile: float,
     pca_components: int,
+    foreground_mask_method: str = "pca_percentile",
 ) -> tuple[np.ndarray, float, float]:
     clip_seconds = len(waveform) / sample_rate
     segment_start = max(0.0, event_start - time_margin_sec)
@@ -271,22 +274,27 @@ def isolate_vocalization(
     if not np.any(rectangle):
         raise ValueError("empty_annotation_mask")
 
-    magnitude = np.abs(spectrum).astype(np.float64)
-    log_magnitude = np.log1p(magnitude / max(float(np.median(magnitude)), EPSILON))
-    observations = log_magnitude.T
-    mean_spectrum = observations.mean(axis=0, keepdims=True)
-    centered = observations - mean_spectrum
-    rank = min(pca_components, centered.shape[0] - 1, centered.shape[1])
-    if rank < 1:
-        raise ValueError("insufficient_stft_frames_for_pca")
-    reconstruction = mean_spectrum + randomized_low_rank_reconstruction(centered, rank)
-    residual = np.maximum(observations - reconstruction, 0.0).T
-    candidates = residual[rectangle]
-    candidates = candidates[np.isfinite(candidates) & (candidates > 0)]
-    if candidates.size == 0:
-        raise ValueError("pca_mask_has_no_positive_residual")
-    threshold = float(np.percentile(candidates, percentile))
-    mask = ((residual >= threshold) & rectangle).astype(np.float32)
+    if foreground_mask_method == "annotation_rectangle":
+        mask = rectangle.astype(np.float32)
+    elif foreground_mask_method == "pca_percentile":
+        magnitude = np.abs(spectrum).astype(np.float64)
+        log_magnitude = np.log1p(magnitude / max(float(np.median(magnitude)), EPSILON))
+        observations = log_magnitude.T
+        mean_spectrum = observations.mean(axis=0, keepdims=True)
+        centered = observations - mean_spectrum
+        rank = min(pca_components, centered.shape[0] - 1, centered.shape[1])
+        if rank < 1:
+            raise ValueError("insufficient_stft_frames_for_pca")
+        reconstruction = mean_spectrum + randomized_low_rank_reconstruction(centered, rank)
+        residual = np.maximum(observations - reconstruction, 0.0).T
+        candidates = residual[rectangle]
+        candidates = candidates[np.isfinite(candidates) & (candidates > 0)]
+        if candidates.size == 0:
+            raise ValueError("pca_mask_has_no_positive_residual")
+        threshold = float(np.percentile(candidates, percentile))
+        mask = ((residual >= threshold) & rectangle).astype(np.float32)
+    else:
+        raise ValueError(f"Unknown foreground mask method: {foreground_mask_method}")
     sigma_frequency = max(0.5, 30.0 / (sample_rate / n_fft))
     sigma_time = max(0.5, 0.025 * sample_rate / hop_length)
     mask = gaussian_filter(mask, sigma=(sigma_frequency, sigma_time), mode="nearest")
@@ -425,13 +433,15 @@ def output_row(
     seed: int,
     sample_rate: int,
     sample_count: int,
+    foreground_mask_method: str,
 ) -> dict[str, Any]:
     label = clean(donor.get("model_source_label"))
     ecotype = clean(donor.get("clean_ecotype")) if label == "KW" else ""
-    clip_id = f"pca_mix_{mixture_index:07d}"
+    is_pca = foreground_mask_method == "pca_percentile"
+    clip_id = f"{'pca_mix' if is_pca else 'controlled_mix'}_{mixture_index:07d}"
     return {
         "clip_id": clip_id,
-        "clip_kind": "synthetic_pca_mixture",
+        "clip_kind": "synthetic_pca_mixture" if is_pca else "synthetic_controlled_mixture",
         "negative_subtype": "",
         "model_source_label": label,
         "clean_class_species": clean(donor.get("clean_class_species")),
@@ -439,7 +449,7 @@ def output_row(
         "source_head_eligible": "TRUE",
         "ecotype_head_eligible": "TRUE" if label == "KW" and ecotype else "FALSE",
         "split": "train",
-        "storage_key": "synthetic_pca_mixtures",
+        "storage_key": "synthetic_pca_mixtures" if is_pca else "synthetic_controlled_mixtures",
         "archive_path": "clips.zip",
         "archive_member_path": filename,
         "relative_clip_path": f"clips/{filename}",
@@ -447,7 +457,7 @@ def output_row(
         "Provider": clean(background.get("Provider")),
         "Dataset": clean(background.get("Dataset")),
         "source_recording_id": f"synthetic|{clean(donor.get('source_recording_id'))}|{clean(background.get('source_recording_id'))}",
-        "AnnotationLevel": "PcaVocalizationMaskMixture",
+        "AnnotationLevel": "PcaVocalizationMaskMixture" if is_pca else "ControlledMixture",
         "FileBeginSec": metrics["mixed_event_start_sec"],
         "FileEndSec": metrics["mixed_event_end_sec"],
         "LowFreqHz": low_hz,
@@ -457,7 +467,11 @@ def output_row(
         "Generated": "TRUE",
         "mixture_index": mixture_index,
         "mixture_seed": seed,
-        "mixture_method": "pca_percentile_vocalization_mask_controlled_snr",
+        "mixture_method": (
+            "pca_percentile_vocalization_mask_controlled_snr"
+            if is_pca
+            else "annotation_time_frequency_mask_controlled_snr"
+        ),
         "mixture_target_snr_db": metrics["target_snr_db"],
         "mixture_measured_snr_db": metrics["measured_snr_db"],
         "mixture_signal_gain": metrics["signal_gain"],
@@ -483,14 +497,24 @@ def atomic_flac(path: Path, waveform: np.ndarray, sample_rate: int) -> None:
     temporary.replace(path)
 
 
-def write_metadata(output_dir: Path, dataset_id: str, title: str, license_name: str) -> None:
+def write_metadata(
+    output_dir: Path,
+    dataset_id: str,
+    title: str,
+    license_name: str,
+    foreground_mask_method: str,
+) -> None:
     if dataset_id.count("/") != 1:
         raise ValueError("--kaggle-dataset-id must be owner/dataset-slug")
     metadata = {
         "title": title,
         "id": dataset_id,
         "licenses": [{"name": license_name}],
-        "subtitle": "PCA vocalization-mask mixtures for multispecies cetacean training",
+        "subtitle": (
+            "PCA vocalization-mask mixtures for multispecies cetacean training"
+            if foreground_mask_method == "pca_percentile"
+            else "Annotation-rectangle controlled mixtures for multispecies cetacean training"
+        ),
         "description": (
             "Synthetic train-only 3-second clips made from annotated vocalization masks "
             "and ambient backgrounds drawn from different source recordings."
@@ -529,7 +553,12 @@ def write_balance_report(rows: list[dict[str, Any]], path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", action="append", default=None, help="Root searched recursively; repeatable.")
+    parser.add_argument(
+        "--data-root",
+        action="append",
+        default=None,
+        help="Root searched recursively; repeatable (default: /kaggle/input).",
+    )
     parser.add_argument("--manifest-name", default=MANIFEST_NAME)
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-manifest", default=None)
@@ -556,6 +585,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frequency-margin-hz", type=float, default=100.0)
     parser.add_argument("--stft-n-fft", type=int, default=1024)
     parser.add_argument("--stft-hop-length", type=int, default=256)
+    parser.add_argument(
+        "--foreground-mask-method",
+        choices=("pca_percentile", "annotation_rectangle"),
+        default="pca_percentile",
+        help=(
+            "pca_percentile keeps high-energy residual bins; annotation_rectangle "
+            "preserves the complete softened annotation time/frequency rectangle."
+        ),
+    )
     parser.add_argument("--mask-percentile", type=float, default=95.0)
     parser.add_argument("--pca-components", type=int, default=1)
     parser.add_argument("--peak-limit", type=float, default=0.99)
@@ -610,8 +648,8 @@ def main() -> int:
 
     labels = comma_values(args.donor_labels)
     invalid = set(labels) - VALID_SOURCE_LABELS
-    if invalid or "Abiotic" in labels:
-        raise ValueError(f"Donors must be biological labels from KW,HW,UndBio; got {labels}")
+    if invalid:
+        raise ValueError(f"Donors must come from Abiotic,KW,HW,UndBio; got {labels}")
     counts = parse_counts(args.label_counts, labels, args.num_mixtures)
     schedule = [label for label, count in counts.items() for _ in range(count)]
     np.random.default_rng(args.seed).shuffle(schedule)
@@ -707,7 +745,9 @@ def main() -> int:
     print(f"Ambient backgrounds:   {len(backgrounds):,}")
     print(f"Requested mixtures:    {len(schedule):,} ({counts})")
     print(f"Target SNR:            {args.snr_db_min:g}..{args.snr_db_max:g} dB")
-    print(f"PCA mask:              components={args.pca_components}, percentile={args.mask_percentile:g}")
+    print(f"Foreground mask:       {args.foreground_mask_method}")
+    if args.foreground_mask_method == "pca_percentile":
+        print(f"PCA mask:              components={args.pca_components}, percentile={args.mask_percentile:g}")
     print(f"Different domain:      {args.require_different_domain}")
     print(f"Sampling mode:         {args.sampling_mode}")
     print(f"Previously completed:  {len(completed):,}")
@@ -738,14 +778,15 @@ def main() -> int:
                     signal, offset_start, offset_end = isolate_vocalization(
                         donor_audio, args.sample_rate, event_start, event_end, low_hz, high_hz,
                         args.time_margin_sec, args.stft_n_fft, args.stft_hop_length,
-                        args.mask_percentile, args.pca_components,
+                        args.mask_percentile, args.pca_components, args.foreground_mask_method,
                     )
                     target_snr = float(rng.uniform(args.snr_db_min, args.snr_db_max))
                     mixture, metrics = make_mixture(
                         signal, offset_start, offset_end, background_audio, args.sample_rate,
                         low_hz, high_hz, target_snr, args.peak_limit, rng,
                     )
-                    filename = f"pca_mix_{mixture_index:07d}_{label.casefold()}_snr{target_snr:+05.1f}db.flac"
+                    prefix = "pca_mix" if args.foreground_mask_method == "pca_percentile" else "controlled_mix"
+                    filename = f"{prefix}_{mixture_index:07d}_{label.casefold()}_snr{target_snr:+05.1f}db.flac"
                     atomic_flac(clips_dir / filename, mixture, args.sample_rate)
                     rows.append(
                         output_row(
@@ -759,6 +800,7 @@ def main() -> int:
                             args.seed,
                             args.sample_rate,
                             round(args.sample_rate * args.clip_seconds),
+                            args.foreground_mask_method,
                         )
                     )
                     audit.append({"mixture_index": mixture_index, "label": label, "attempt": attempt, "status": "saved", "filename": filename})
@@ -783,7 +825,13 @@ def main() -> int:
     pd.DataFrame(rows).to_csv(manifest_path, index=False)
     pd.DataFrame(audit).to_csv(audit_path, index=False)
     write_balance_report(rows, balance_path)
-    write_metadata(output_dir, args.kaggle_dataset_id, args.kaggle_title, args.kaggle_license)
+    write_metadata(
+        output_dir,
+        args.kaggle_dataset_id,
+        args.kaggle_title,
+        args.kaggle_license,
+        args.foreground_mask_method,
+    )
     summary = {
         "input_manifests": [str(path) for path in manifests],
         "input_training_rows": len(frame),
