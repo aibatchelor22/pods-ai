@@ -1368,10 +1368,15 @@ def train_audio_model(
             if should_step:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scale_before_step = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer_step_succeeded = (
+                    not scaler.is_enabled() or scaler.get_scale() >= scale_before_step
+                )
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+                if optimizer_step_succeeded:
+                    scheduler.step()
             total_loss += float(raw_loss.detach()) * len(values)
             examples += len(values)
             interval_loss += float(raw_loss.detach()) * len(values)
