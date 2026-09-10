@@ -188,6 +188,119 @@ class WaveformAugmenter:
         return np.clip(output, -1.0, 1.0).astype(np.float32, copy=False)
 
 
+class ASTFeatureAugmenter:
+    """Training-only random frequency-response curves for normalized AST features."""
+
+    def __init__(
+        self,
+        feature_extractor: Any,
+        filteraugment_prob: float = 0.3,
+        filteraugment_mode: str = "linear",
+        filteraugment_num_bands_min: int = 3,
+        filteraugment_num_bands_max: int = 6,
+        filteraugment_gain_db_min: float = -3.0,
+        filteraugment_gain_db_max: float = 3.0,
+        filteraugment_min_bandwidth_bins: int = 4,
+    ) -> None:
+        self.filteraugment_prob = filteraugment_prob
+        self.filteraugment_mode = filteraugment_mode
+        self.filteraugment_num_bands_min = filteraugment_num_bands_min
+        self.filteraugment_num_bands_max = filteraugment_num_bands_max
+        self.filteraugment_gain_db_min = filteraugment_gain_db_min
+        self.filteraugment_gain_db_max = filteraugment_gain_db_max
+        self.filteraugment_min_bandwidth_bins = filteraugment_min_bandwidth_bins
+
+        # ASTFeatureExtractor computes natural-log filterbank energies and, when
+        # normalization is enabled, applies (x - mean) / (2 * std). Convert an
+        # acoustic power change in dB to that normalized feature scale.
+        do_normalize = bool(getattr(feature_extractor, "do_normalize", True))
+        mean = float(np.asarray(getattr(feature_extractor, "mean", 0.0)).mean())
+        std = float(np.asarray(getattr(feature_extractor, "std", 1.0)).mean())
+        if do_normalize and std <= 0.0:
+            raise ValueError(f"AST feature extractor std must be positive, got {std}")
+        normalization_divisor = 2.0 * std if do_normalize else 1.0
+        self.db_to_feature_scale = (math.log(10.0) / 10.0) / normalization_divisor
+        self.padding_value = (-mean / normalization_divisor) if do_normalize else 0.0
+
+    def __call__(self, input_values: torch.Tensor) -> torch.Tensor:
+        if input_values.ndim != 3:
+            raise ValueError(
+                "AST FilterAugment expects [batch, time, frequency] features, "
+                f"got shape {tuple(input_values.shape)}"
+            )
+        output = input_values.clone()
+        for batch_index in range(output.shape[0]):
+            if random.random() >= self.filteraugment_prob:
+                continue
+            sample = output[batch_index]
+            frequency_bins = int(sample.shape[-1])
+            curve = self._filteraugment_curve(
+                frequency_bins,
+                device=sample.device,
+                dtype=sample.dtype,
+            )
+            # Do not turn constant normalized padding frames into artificial
+            # frequency stripes when the feature extractor pads an example.
+            valid_time = torch.any(
+                torch.abs(sample - self.padding_value) > 1e-6,
+                dim=-1,
+            )
+            sample[valid_time] += curve
+        return output
+
+    def _filteraugment_curve(
+        self,
+        frequency_bins: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        max_bands = min(
+            self.filteraugment_num_bands_max,
+            frequency_bins // self.filteraugment_min_bandwidth_bins,
+        )
+        if max_bands < 1:
+            raise ValueError(
+                "FilterAugment minimum bandwidth exceeds the number of mel bins"
+            )
+        min_bands = min(self.filteraugment_num_bands_min, max_bands)
+        number_of_bands = random.randint(min_bands, max_bands)
+        remaining = frequency_bins - number_of_bands * self.filteraugment_min_bandwidth_bins
+        extra_widths = np.random.multinomial(
+            remaining,
+            np.full(number_of_bands, 1.0 / number_of_bands),
+        )
+        widths = extra_widths + self.filteraugment_min_bandwidth_bins
+        boundaries = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
+
+        if self.filteraugment_mode == "step":
+            curve = np.empty(frequency_bins, dtype=np.float32)
+            gains_db = np.random.uniform(
+                self.filteraugment_gain_db_min,
+                self.filteraugment_gain_db_max,
+                size=number_of_bands,
+            )
+            for index, gain_db in enumerate(gains_db):
+                curve[boundaries[index] : boundaries[index + 1]] = gain_db
+        elif self.filteraugment_mode == "linear":
+            gains_db = np.random.uniform(
+                self.filteraugment_gain_db_min,
+                self.filteraugment_gain_db_max,
+                size=number_of_bands + 1,
+            )
+            curve = np.interp(
+                np.arange(frequency_bins, dtype=np.float32),
+                boundaries,
+                gains_db,
+            ).astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported FilterAugment mode: {self.filteraugment_mode}")
+        return torch.as_tensor(
+            curve * self.db_to_feature_scale,
+            device=device,
+            dtype=dtype,
+        )
+
+
 class ArchiveAudioCollator:
     """Load only requested ZIP members and convert waveforms to AST features."""
 
@@ -199,11 +312,13 @@ class ArchiveAudioCollator:
         high_pass_cutoff_hz: float | None,
         high_pass_order: int,
         augmenter: WaveformAugmenter | None = None,
+        feature_augmenter: ASTFeatureAugmenter | None = None,
     ) -> None:
         self.feature_extractor = feature_extractor
         self.target_samples = round(clip_seconds * SAMPLE_RATE)
         self.mean_subtract = mean_subtract
         self.augmenter = augmenter
+        self.feature_augmenter = feature_augmenter
         self.handles: dict[str, zipfile.ZipFile] = {}
         self.high_pass_sos: np.ndarray | None = None
         if high_pass_cutoff_hz is not None:
@@ -272,6 +387,8 @@ class ArchiveAudioCollator:
             padding=True,
             return_tensors="pt",
         )
+        if self.feature_augmenter is not None:
+            features["input_values"] = self.feature_augmenter(features["input_values"])
         features["trigger_labels"] = torch.tensor(
             [row["trigger_label"] for row in rows], dtype=torch.long
         )
@@ -1656,6 +1773,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-shift-prob", type=float, default=1.0)
     parser.add_argument("--max-shift-ms", type=float, default=250.0)
     parser.add_argument("--time-shift-fade-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--filteraugment",
+        action="store_true",
+        help=(
+            "Apply training-only random frequency-response curves to normalized "
+            "AST log-mel features during full-backbone training."
+        ),
+    )
+    parser.add_argument(
+        "--filteraugment-prob",
+        type=float,
+        default=0.3,
+        help="Per-example FilterAugment probability (default: 0.3).",
+    )
+    parser.add_argument(
+        "--filteraugment-mode",
+        choices=["linear", "step"],
+        default="linear",
+        help="Frequency-response curve type (default: linear).",
+    )
+    parser.add_argument("--filteraugment-num-bands-min", type=int, default=3)
+    parser.add_argument("--filteraugment-num-bands-max", type=int, default=6)
+    parser.add_argument("--filteraugment-gain-db-min", type=float, default=-3.0)
+    parser.add_argument("--filteraugment-gain-db-max", type=float, default=3.0)
+    parser.add_argument("--filteraugment-min-bandwidth-bins", type=int, default=4)
     args = parser.parse_args()
     args.data_root = args.data_root or ["/kaggle/input"]
     if min(
@@ -1682,6 +1824,7 @@ def parse_args() -> argparse.Namespace:
     for value, name in (
         (args.random_gain_prob, "--random-gain-prob"),
         (args.time_shift_prob, "--time-shift-prob"),
+        (args.filteraugment_prob, "--filteraugment-prob"),
     ):
         if not 0.0 <= value <= 1.0:
             parser.error(f"{name} must be between 0 and 1")
@@ -1691,9 +1834,23 @@ def parse_args() -> argparse.Namespace:
         parser.error("time-shift durations cannot be negative")
     if args.max_shift_ms >= args.clip_seconds * 1000.0:
         parser.error("--max-shift-ms must be shorter than --clip-seconds")
-    if args.freeze_backbone and (args.random_gain or args.time_shift):
+    if args.filteraugment_num_bands_min < 1 or args.filteraugment_num_bands_max < 1:
+        parser.error("FilterAugment band counts must be positive")
+    if args.filteraugment_num_bands_min > args.filteraugment_num_bands_max:
         parser.error(
-            "stochastic waveform augmentation is unavailable with --freeze-backbone "
+            "--filteraugment-num-bands-min must be less than or equal to "
+            "--filteraugment-num-bands-max"
+        )
+    if args.filteraugment_gain_db_min > args.filteraugment_gain_db_max:
+        parser.error(
+            "--filteraugment-gain-db-min must be less than or equal to "
+            "--filteraugment-gain-db-max"
+        )
+    if args.filteraugment_min_bandwidth_bins < 1:
+        parser.error("--filteraugment-min-bandwidth-bins must be positive")
+    if args.freeze_backbone and (args.random_gain or args.time_shift or args.filteraugment):
+        parser.error(
+            "stochastic waveform/feature augmentation is unavailable with --freeze-backbone "
             "because each clip is embedded only once"
         )
     return args
@@ -1760,6 +1917,20 @@ def main() -> int:
         feature_extractor = AutoFeatureExtractor.from_pretrained(feature_source)
     except Exception:
         feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_name)
+    feature_augmenter = (
+        ASTFeatureAugmenter(
+            feature_extractor=feature_extractor,
+            filteraugment_prob=args.filteraugment_prob,
+            filteraugment_mode=args.filteraugment_mode,
+            filteraugment_num_bands_min=args.filteraugment_num_bands_min,
+            filteraugment_num_bands_max=args.filteraugment_num_bands_max,
+            filteraugment_gain_db_min=args.filteraugment_gain_db_min,
+            filteraugment_gain_db_max=args.filteraugment_gain_db_max,
+            filteraugment_min_bandwidth_bins=args.filteraugment_min_bandwidth_bins,
+        )
+        if args.filteraugment
+        else None
+    )
     validation_collator = ArchiveAudioCollator(
         feature_extractor,
         args.clip_seconds,
@@ -1789,6 +1960,7 @@ def main() -> int:
         preprocessing["high_pass_cutoff_hz"] if preprocessing["high_pass_filter"] else None,
         preprocessing["high_pass_order"],
         augmenter=waveform_augmenter,
+        feature_augmenter=feature_augmenter,
     )
 
     print("\nMultispecies Cetacean training")
@@ -1829,7 +2001,12 @@ def main() -> int:
         f"random_gain={args.random_gain} (p={args.random_gain_prob:g}, "
         f"±{args.gain_db:g} dB, {args.gain_clipping_mode}); "
         f"time_shift={args.time_shift} (p={args.time_shift_prob:g}, "
-        f"max={args.max_shift_ms:g} ms, fade={args.time_shift_fade_ms:g} ms)"
+        f"max={args.max_shift_ms:g} ms, fade={args.time_shift_fade_ms:g} ms); "
+        f"filteraugment={args.filteraugment} (p={args.filteraugment_prob:g}, "
+        f"{args.filteraugment_mode}, bands={args.filteraugment_num_bands_min}-"
+        f"{args.filteraugment_num_bands_max}, gain={args.filteraugment_gain_db_min:g}.."
+        f"{args.filteraugment_gain_db_max:g} dB, min_width="
+        f"{args.filteraugment_min_bandwidth_bins} bins)"
     )
 
     train_label_values = {
@@ -2009,6 +2186,14 @@ def main() -> int:
             "time_shift_probability": args.time_shift_prob,
             "max_shift_ms": args.max_shift_ms,
             "time_shift_fade_ms": args.time_shift_fade_ms,
+            "filteraugment": args.filteraugment,
+            "filteraugment_probability": args.filteraugment_prob,
+            "filteraugment_mode": args.filteraugment_mode,
+            "filteraugment_num_bands_min": args.filteraugment_num_bands_min,
+            "filteraugment_num_bands_max": args.filteraugment_num_bands_max,
+            "filteraugment_gain_db_min": args.filteraugment_gain_db_min,
+            "filteraugment_gain_db_max": args.filteraugment_gain_db_max,
+            "filteraugment_min_bandwidth_bins": args.filteraugment_min_bandwidth_bins,
         },
         "class_weights": weights,
         "learning_rate": args.learning_rate,
