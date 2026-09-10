@@ -29,6 +29,7 @@ import io
 import json
 import math
 import random
+import re
 import time
 import zipfile
 from collections import Counter, defaultdict
@@ -842,6 +843,68 @@ def print_data_provenance(title: str, records: list[dict[str, Any]]) -> None:
             )
 
 
+REMOTE_MARKER = re.compile(r"(^|[\\/_-])remote([\\/_-]|$)", re.IGNORECASE)
+
+
+def direct_remote_reason(row: dict[str, Any], manifest: Path) -> str:
+    if clean(row.get("extraction_mode")).casefold() == "remote_seek":
+        return "extraction_mode"
+    for column in ("shard_id", "storage_key", "kaggle_dataset_id"):
+        if REMOTE_MARKER.search(clean(row.get(column))):
+            return column
+    if REMOTE_MARKER.search(str(manifest)):
+        return "manifest_path"
+    return ""
+
+
+def discover_remote_recording_ids(
+    roots: Collection[Path], manifests: Collection[Path]
+) -> set[str]:
+    """Collect remote-mode source IDs from plans and original shard manifests."""
+    result: set[str] = set()
+    plan_name = "multispecies_cetacean_source_recording_plan.csv"
+    plans = sorted({path.resolve() for root in roots for path in root.rglob(plan_name)})
+    for plan in plans:
+        with plan.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not {"source_recording_id", "extraction_mode"}.issubset(
+                reader.fieldnames or []
+            ):
+                continue
+            for row in reader:
+                if clean(row.get("extraction_mode")).casefold() == "remote_seek":
+                    recording_id = clean(row.get("source_recording_id"))
+                    if recording_id:
+                        result.add(recording_id)
+    for manifest in manifests:
+        with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if direct_remote_reason(row, manifest):
+                    recording_id = clean(row.get("source_recording_id"))
+                    if recording_id and not recording_id.startswith("synthetic|"):
+                        result.add(recording_id)
+    return result
+
+
+def remote_row_reason(
+    row: dict[str, Any], manifest: Path, remote_recording_ids: set[str]
+) -> str:
+    direct = direct_remote_reason(row, manifest)
+    if direct:
+        return direct
+    source_id = clean(row.get("source_recording_id"))
+    if source_id in remote_recording_ids:
+        return "source_recording_id"
+    donor_id = clean(row.get("donor_source_recording_id"))
+    if donor_id and donor_id in remote_recording_ids:
+        return "synthetic_remote_donor"
+    background_id = clean(row.get("background_source_recording_id"))
+    if background_id and background_id in remote_recording_ids:
+        return "synthetic_remote_background"
+    return ""
+
+
 def discover_rows(
     roots: list[Path],
     split: str,
@@ -852,10 +915,15 @@ def discover_rows(
     conflict_policy: str,
     require_audit_coverage: bool,
     audit_usage: Counter[str],
+    exclude_remote_data: bool = False,
+    remote_filter_usage: Counter[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[Path], list[Path]]:
     manifests = sorted({path.resolve() for root in roots for path in root.rglob(manifest_name)})
     if not manifests:
         raise FileNotFoundError(f"No {manifest_name} files found below: {roots}")
+    remote_recording_ids = (
+        discover_remote_recording_ids(roots, manifests) if exclude_remote_data else set()
+    )
     rows: list[dict[str, Any]] = []
     used_manifests: list[Path] = []
     archives: set[Path] = set()
@@ -880,6 +948,13 @@ def discover_rows(
             for raw in reader:
                 if clean(raw.get("split")).casefold() != split.casefold():
                     continue
+                if exclude_remote_data:
+                    reason = remote_row_reason(raw, manifest, remote_recording_ids)
+                    if reason:
+                        if remote_filter_usage is not None:
+                            remote_filter_usage[f"{split}:{reason}"] += 1
+                            remote_filter_usage[f"{split}:total"] += 1
+                        continue
                 source = clean(raw["model_source_label"])
                 if source not in SOURCE_LABELS:
                     raise ValueError(f"{manifest}: unknown model_source_label {source!r}")
@@ -1759,6 +1834,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest-name", default="multispecies_cetacean_manifest.csv")
     parser.add_argument(
+        "--exclude-remote-data",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Exclude original remote_seek rows and synthetic mixtures whose donor "
+            "or background source recording was remote (default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--overlap-audit-csv",
         type=Path,
         help="Optional annotation_id-keyed overlap sidecar used for per-head masking.",
@@ -2005,6 +2089,7 @@ def main() -> int:
             "can be identified"
         )
     audit_usage: Counter[str] = Counter()
+    remote_filter_usage: Counter[str] = Counter()
 
     train_rows, train_manifests, train_archives = discover_rows(
         roots,
@@ -2016,6 +2101,8 @@ def main() -> int:
         args.overlap_conflict_policy,
         args.require_overlap_audit_coverage,
         audit_usage,
+        args.exclude_remote_data,
+        remote_filter_usage,
     )
     val_rows, val_manifests, val_archives = discover_rows(
         roots,
@@ -2027,6 +2114,8 @@ def main() -> int:
         args.overlap_conflict_policy,
         args.require_overlap_audit_coverage,
         audit_usage,
+        args.exclude_remote_data,
+        remote_filter_usage,
     )
     train_rows = random_subset(train_rows, args.max_train_files, args.seed)
     val_rows = random_subset(val_rows, args.max_val_files, args.seed + 1)
@@ -2038,6 +2127,13 @@ def main() -> int:
     )
     print_data_provenance("Training", train_provenance)
     print_data_provenance("Validation", val_provenance)
+    if args.exclude_remote_data:
+        print("\nRemote-data exclusion enabled")
+        print(f"  Excluded rows: {dict(sorted(remote_filter_usage.items()))}")
+        (output_dir / "remote_data_exclusions.json").write_text(
+            json.dumps(dict(sorted(remote_filter_usage.items())), indent=2),
+            encoding="utf-8",
+        )
     train_domain_counts = assign_domain_sizes(train_rows)
     train_dataset = ArchiveManifestDataset(train_rows)
     val_dataset = ArchiveManifestDataset(val_rows)
@@ -2309,6 +2405,8 @@ def main() -> int:
         "domain_columns": args.domain_columns,
         "training_domain_count": len(train_domain_counts),
         "input_data_provenance": input_provenance,
+        "exclude_remote_data": args.exclude_remote_data,
+        "remote_data_exclusions": dict(sorted(remote_filter_usage.items())),
         "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
         "training_augmentation": {
