@@ -609,6 +609,7 @@ def discover_rows(
     split: str,
     manifest_name: str,
     undbio_policy: str,
+    domain_columns: Collection[str],
     overlap_audit: dict[str, dict[str, str]],
     conflict_policy: str,
     require_audit_coverage: bool,
@@ -629,6 +630,7 @@ def discover_rows(
         "archive_path",
         "archive_member_path",
     }
+    required.update(domain_columns)
     for manifest in manifests:
         used = False
         with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -732,6 +734,9 @@ def discover_rows(
                         "event_group_size": (
                             max(1, int(audit_row["event_group_size"])) if audit_row else 1
                         ),
+                        "domain_key": tuple(
+                            clean(raw.get(column)) or "<missing>" for column in domain_columns
+                        ),
                     }
                 )
                 used = True
@@ -749,6 +754,13 @@ def random_subset(rows: list[dict[str, Any]], maximum: int | None, seed: int) ->
         raise ValueError("maximum clip counts must be positive")
     indices = np.random.default_rng(seed).choice(len(rows), size=maximum, replace=False)
     return [rows[index] for index in sorted(indices.tolist())]
+
+
+def assign_domain_sizes(rows: list[dict[str, Any]]) -> Counter[tuple[str, ...]]:
+    counts: Counter[tuple[str, ...]] = Counter(row["domain_key"] for row in rows)
+    for row in rows:
+        row["domain_size"] = counts[row["domain_key"]]
+    return counts
 
 
 def preprocessing_from_checkpoint(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1060,17 +1072,33 @@ def weight_tensor(values: list[float] | None, device: torch.device) -> torch.Ten
     return None if values is None else torch.tensor(values, dtype=torch.float32, device=device)
 
 
-def event_group_sampler(
-    group_sizes: Collection[int], mode: str, seed: int
+def training_sampler(
+    event_group_sizes: Collection[int],
+    event_group_mode: str,
+    domain_sizes: Collection[int],
+    domain_mode: str,
+    seed: int,
 ) -> WeightedRandomSampler | None:
-    if mode == "none":
+    if event_group_mode == "none" and domain_mode == "none":
         return None
-    sizes = np.asarray(list(group_sizes), dtype=np.float64)
-    if len(sizes) == 0 or np.any(sizes < 1):
+    event_sizes = np.asarray(list(event_group_sizes), dtype=np.float64)
+    domains = np.asarray(list(domain_sizes), dtype=np.float64)
+    if len(event_sizes) == 0 or len(event_sizes) != len(domains):
+        raise ValueError("Sampling metadata must be non-empty and aligned")
+    if np.any(event_sizes < 1):
         raise ValueError("Event group sizes must be positive")
-    weights = torch.from_numpy(1.0 / sizes)
+    if np.any(domains < 1):
+        raise ValueError("Domain sizes must be positive")
+    weights = np.ones(len(event_sizes), dtype=np.float64)
+    if event_group_mode == "inverse_size":
+        weights /= event_sizes
+    if domain_mode == "inverse_sqrt":
+        weights /= np.sqrt(domains)
+    elif domain_mode == "inverse_frequency":
+        weights /= domains
+    weights /= weights.mean()
     return WeightedRandomSampler(
-        weights,
+        torch.from_numpy(weights),
         num_samples=len(weights),
         replacement=True,
         generator=torch.Generator().manual_seed(seed),
@@ -1093,8 +1121,12 @@ def train_head(
         torch.from_numpy(train_labels["source"]),
         torch.from_numpy(train_labels["ecotype"]),
     )
-    sampler = event_group_sampler(
-        train_labels["event_group_size"], args.event_group_sampling, args.seed
+    sampler = training_sampler(
+        train_labels["event_group_size"],
+        args.event_group_sampling,
+        train_labels["domain_size"],
+        args.domain_balanced_sampling,
+        args.seed,
     )
     loader = DataLoader(
         dataset,
@@ -1284,9 +1316,11 @@ def train_audio_model(
     weight_values: dict[str, list[float] | None],
     device: torch.device,
 ) -> tuple[dict[str, torch.Tensor], pd.DataFrame, dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]]:
-    sampler = event_group_sampler(
+    sampler = training_sampler(
         (row["event_group_size"] for row in train_dataset.rows),
         args.event_group_sampling,
+        (row["domain_size"] for row in train_dataset.rows),
+        args.domain_balanced_sampling,
         args.seed,
     )
     loader = DataLoader(
@@ -1512,6 +1546,25 @@ def parse_args() -> argparse.Namespace:
             "sampling weight; ambient background rows remain singleton groups."
         ),
     )
+    parser.add_argument(
+        "--domain-balanced-sampling",
+        choices=["none", "inverse_sqrt", "inverse_frequency"],
+        default="none",
+        help=(
+            "Optional domain-aware training sampler. inverse_sqrt tempers large-domain "
+            "dominance while retaining some frequency information; inverse_frequency "
+            "gives each observed domain approximately equal total sampling probability."
+        ),
+    )
+    parser.add_argument(
+        "--domain-columns",
+        nargs="+",
+        default=["Provider", "Dataset"],
+        help=(
+            "Manifest columns whose combined values define a sampling domain "
+            "(default: Provider Dataset)."
+        ),
+    )
     parser.add_argument("--model-name", required=True)
     parser.add_argument(
         "--output-dir",
@@ -1676,6 +1729,7 @@ def main() -> int:
         "train",
         args.manifest_name,
         args.undbio_trigger_policy,
+        args.domain_columns,
         overlap_audit,
         args.overlap_conflict_policy,
         args.require_overlap_audit_coverage,
@@ -1686,6 +1740,7 @@ def main() -> int:
         "validation",
         args.manifest_name,
         args.undbio_trigger_policy,
+        args.domain_columns,
         overlap_audit,
         args.overlap_conflict_policy,
         args.require_overlap_audit_coverage,
@@ -1693,6 +1748,7 @@ def main() -> int:
     )
     train_rows = random_subset(train_rows, args.max_train_files, args.seed)
     val_rows = random_subset(val_rows, args.max_val_files, args.seed + 1)
+    train_domain_counts = assign_domain_sizes(train_rows)
     train_dataset = ArchiveManifestDataset(train_rows)
     val_dataset = ArchiveManifestDataset(val_rows)
     preprocessing, _ = preprocessing_from_checkpoint(args)
@@ -1748,6 +1804,17 @@ def main() -> int:
     print(f"Overlap audit:          {overlap_audit_path or 'none'}")
     print(f"Overlap policy:         {args.overlap_conflict_policy}")
     print(f"Event-group sampling:   {args.event_group_sampling}")
+    print(
+        "Domain sampling:        "
+        f"{args.domain_balanced_sampling} by {', '.join(args.domain_columns)}"
+    )
+    domain_sizes = np.asarray(list(train_domain_counts.values()), dtype=np.int64)
+    print(
+        "Training domains:       "
+        f"{len(train_domain_counts):,} "
+        f"(clips/domain min={domain_sizes.min():,}, "
+        f"median={int(np.median(domain_sizes)):,}, max={domain_sizes.max():,})"
+    )
     if overlap_audit:
         print(f"Overlap audit usage:    {dict(sorted(audit_usage.items()))}")
     print(f"Mean subtraction:       {preprocessing['mean_subtract']}")
@@ -1828,6 +1895,9 @@ def main() -> int:
             )
         train_embeddings, train_labels = train_cache
         val_embeddings, val_labels = val_cache
+        train_labels["domain_size"] = np.asarray(
+            [row["domain_size"] for row in train_rows], dtype=np.int64
+        )
         model.to("cpu")
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1925,6 +1995,9 @@ def main() -> int:
         "overlap_conflict_policy": args.overlap_conflict_policy,
         "require_overlap_audit_coverage": args.require_overlap_audit_coverage,
         "event_group_sampling": args.event_group_sampling,
+        "domain_balanced_sampling": args.domain_balanced_sampling,
+        "domain_columns": args.domain_columns,
+        "training_domain_count": len(train_domain_counts),
         "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
         "training_augmentation": {
