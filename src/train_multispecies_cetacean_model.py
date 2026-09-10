@@ -514,19 +514,19 @@ def download_weights(model_name: str) -> Path:
     raise FileNotFoundError(f"No supported checkpoint weights in {model_name}: {'; '.join(errors)}")
 
 
-def checkpoint_files(model_name: str) -> tuple[dict[str, Any], Path, str] | None:
+def checkpoint_metadata(model_name: str) -> tuple[dict[str, Any], str] | None:
+    """Read V2/legacy metadata without downloading its potentially large weights."""
     local = Path(model_name)
     config_names = (
         ("multispecies_cetacean_config.json", "new"),
         ("multitask_config.json", "legacy"),
     )
     if local.is_dir():
-        weights = find_local_weights(local)
         for name, kind in config_names:
             path = local / name
-            if path.is_file() and weights is not None:
+            if path.is_file():
                 with path.open("r", encoding="utf-8") as handle:
-                    return json.load(handle), weights, kind
+                    return json.load(handle), kind
         return None
     for name, kind in config_names:
         try:
@@ -534,8 +534,62 @@ def checkpoint_files(model_name: str) -> tuple[dict[str, Any], Path, str] | None
         except Exception:
             continue
         with config_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle), download_weights(model_name), kind
+            return json.load(handle), kind
     return None
+
+
+def checkpoint_files(model_name: str) -> tuple[dict[str, Any], Path, str] | None:
+    metadata = checkpoint_metadata(model_name)
+    if metadata is None:
+        return None
+    values, kind = metadata
+    local = Path(model_name)
+    weights = find_local_weights(local) if local.is_dir() else download_weights(model_name)
+    if weights is None:
+        raise FileNotFoundError(f"No supported checkpoint weights in {model_name}")
+    return values, weights, kind
+
+
+def resolve_ast_config(
+    model_name: str,
+    metadata: dict[str, Any],
+) -> tuple[Any, str]:
+    """Resolve an AST architecture through V2 checkpoint ancestry.
+
+    Some externally uploaded V2 repositories contain the complete model state
+    and V2 metadata but an incomplete generic ``config.json``. The state can
+    still be loaded safely by following ``base_model`` links until a valid
+    Transformers architecture configuration is found. This resolver reads
+    metadata only; it does not download ancestor weights.
+    """
+    current = model_name
+    current_metadata = metadata
+    visited: set[str] = set()
+    errors: list[str] = []
+    for _ in range(32):
+        if current in visited:
+            raise RuntimeError(
+                "Cycle detected while resolving checkpoint architecture: "
+                + " -> ".join([*visited, current])
+            )
+        visited.add(current)
+        try:
+            return AutoConfig.from_pretrained(current), current
+        except (OSError, ValueError, KeyError) as exc:
+            errors.append(f"{current}: {type(exc).__name__}: {exc}")
+        parent = clean(current_metadata.get("architecture_source")) or clean(
+            current_metadata.get("base_model")
+        )
+        if not parent or parent == current:
+            break
+        parent_checkpoint = checkpoint_metadata(parent)
+        current = parent
+        current_metadata = parent_checkpoint[0] if parent_checkpoint is not None else {}
+    detail = "; ".join(errors[-4:])
+    raise RuntimeError(
+        f"Could not reconstruct the AST architecture for {model_name}. "
+        f"Checked checkpoint ancestry; recent errors: {detail}"
+    )
 
 
 def read_state_dict(path: Path) -> dict[str, torch.Tensor]:
@@ -570,9 +624,10 @@ def load_model(
         if not architecture_source:
             raise ValueError("Checkpoint metadata is missing base_model")
         if standalone:
-            base = AutoModelForAudioClassification.from_config(
-                AutoConfig.from_pretrained(architecture_source)
+            architecture_config, architecture_source = resolve_ast_config(
+                model_name, metadata
             )
+            base = AutoModelForAudioClassification.from_config(architecture_config)
         else:
             base = AutoModelForAudioClassification.from_pretrained(architecture_source)
         model = MultispeciesCetaceanModel(base, dropout)
@@ -617,11 +672,14 @@ def load_model(
                 model.load_state_dict(ecotype_keys, strict=False)
                 print("Transferred the compatible ecotype head")
             print("Initialized new trigger and four-class source heads")
-        feature_source = model_name if standalone else architecture_source
+        # The resolved ancestor is guaranteed to have a valid Transformers
+        # configuration and carries the unchanged AST feature-extractor setup.
+        feature_source = architecture_source
         identity = {
             "model_name": model_name,
             "weights": file_identity(weights_path),
             "kind": kind,
+            "architecture_source": architecture_source,
         }
     for parameter in model.ast.parameters():
         parameter.requires_grad = not freeze_backbone
