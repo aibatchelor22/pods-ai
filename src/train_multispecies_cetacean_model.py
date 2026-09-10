@@ -31,7 +31,7 @@ import math
 import random
 import time
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Collection
 
@@ -779,6 +779,69 @@ def load_overlap_audit(path: Path | None) -> dict[str, dict[str, str]]:
     return result
 
 
+def input_dataset_identity(path: Path, roots: Collection[Path]) -> tuple[str, str]:
+    """Infer the Kaggle dataset identity containing a discovered manifest."""
+    resolved = path.resolve()
+    parts = resolved.parts
+    lowered = [part.casefold() for part in parts]
+    for index in range(len(parts) - 1):
+        if lowered[index] != "input":
+            continue
+        if index + 3 < len(parts) and lowered[index + 1] == "datasets":
+            root = Path(*parts[: index + 4])
+            return f"{parts[index + 2]}/{parts[index + 3]}", str(root)
+        if index + 1 < len(parts):
+            root = Path(*parts[: index + 2])
+            return parts[index + 1], str(root)
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        return f"local:{root.resolve().name}", str(root.resolve())
+    return "local:unresolved", str(resolved.parent)
+
+
+def data_provenance(rows: list[dict[str, Any]], split: str) -> list[dict[str, Any]]:
+    """Summarize the selected post-filter/post-subsample rows by manifest."""
+    grouped: Counter[tuple[str, str, str]] = Counter(
+        (
+            str(row["input_dataset_id"]),
+            str(row["input_dataset_root"]),
+            str(row["manifest_path"]),
+        )
+        for row in rows
+    )
+    return [
+        {
+            "split": split,
+            "input_dataset_id": dataset_id,
+            "input_dataset_root": dataset_root,
+            "manifest_path": manifest_path,
+            "selected_clips": count,
+        }
+        for (dataset_id, dataset_root, manifest_path), count in sorted(grouped.items())
+    ]
+
+
+def print_data_provenance(title: str, records: list[dict[str, Any]]) -> None:
+    print(f"\n{title} input datasets")
+    by_dataset: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_dataset[
+            (str(record["input_dataset_id"]), str(record["input_dataset_root"]))
+        ].append(record)
+    for (dataset_id, dataset_root), manifests in by_dataset.items():
+        clips = sum(int(record["selected_clips"]) for record in manifests)
+        print(f"  {dataset_id}: {clips:,} selected clips")
+        print(f"    root: {dataset_root}")
+        for record in manifests:
+            print(
+                f"    manifest ({int(record['selected_clips']):,}): "
+                f"{record['manifest_path']}"
+            )
+
+
 def discover_rows(
     roots: list[Path],
     split: str,
@@ -808,6 +871,7 @@ def discover_rows(
     required.update(domain_columns)
     for manifest in manifests:
         used = False
+        dataset_id, dataset_root = input_dataset_identity(manifest, roots)
         with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             missing = required.difference(reader.fieldnames or [])
@@ -912,6 +976,9 @@ def discover_rows(
                         "domain_key": tuple(
                             clean(raw.get(column)) or "<missing>" for column in domain_columns
                         ),
+                        "manifest_path": str(manifest),
+                        "input_dataset_id": dataset_id,
+                        "input_dataset_root": dataset_root,
                     }
                 )
                 used = True
@@ -1963,6 +2030,14 @@ def main() -> int:
     )
     train_rows = random_subset(train_rows, args.max_train_files, args.seed)
     val_rows = random_subset(val_rows, args.max_val_files, args.seed + 1)
+    train_provenance = data_provenance(train_rows, "train")
+    val_provenance = data_provenance(val_rows, "validation")
+    input_provenance = [*train_provenance, *val_provenance]
+    pd.DataFrame(input_provenance).to_csv(
+        output_dir / "input_data_provenance.csv", index=False
+    )
+    print_data_provenance("Training", train_provenance)
+    print_data_provenance("Validation", val_provenance)
     train_domain_counts = assign_domain_sizes(train_rows)
     train_dataset = ArchiveManifestDataset(train_rows)
     val_dataset = ArchiveManifestDataset(val_rows)
@@ -2233,6 +2308,7 @@ def main() -> int:
         "domain_balanced_sampling": args.domain_balanced_sampling,
         "domain_columns": args.domain_columns,
         "training_domain_count": len(train_domain_counts),
+        "input_data_provenance": input_provenance,
         "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
         "training_augmentation": {
