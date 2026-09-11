@@ -5,7 +5,8 @@ This is the V2-compatible preset for the mixing method used by the earlier
 successful controlled-background experiment. It uses annotated Abiotic, KW,
 and HW training clips as foreground donors, preserves each complete softened
 annotation time/frequency rectangle, and adds it at controlled SNR to an
-ambient training background from another provider/dataset domain.
+ambient training background from another provider/dataset domain. Remote-seek
+shards and recordings are excluded by default for this local-data ablation.
 
 All general data discovery, leak safeguards, balancing, checkpointing, and
 Kaggle publishing are implemented by
@@ -35,6 +36,7 @@ PRESET_ARGUMENTS = [
     "--domain-columns",
     "Provider,Dataset",
     "--require-different-domain",
+    "--exclude-remote-data",
     "--output-dir",
     "/kaggle/working/multispecies_cetacean_controlled_background_mixtures",
     "--kaggle-dataset-id",
