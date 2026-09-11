@@ -23,6 +23,7 @@ import argparse
 import io
 import json
 import math
+import re
 import subprocess
 import time
 import zipfile
@@ -38,6 +39,7 @@ from scipy.signal import butter, istft, resample_poly, sosfiltfilt, stft
 
 
 MANIFEST_NAME = "multispecies_cetacean_manifest.csv"
+REMOTE_MARKER = re.compile(r"(^|[\\/_-])remote([\\/_-]|$)", re.IGNORECASE)
 DEFAULT_OUTPUT_DIR = "/kaggle/working/multispecies_cetacean_pca_mixtures"
 DEFAULT_DATASET_ID = "leonisviridis/multispecies-cetacean-pca-mixtures"
 VALID_SOURCE_LABELS = {"Abiotic", "KW", "HW", "UndBio"}
@@ -403,6 +405,29 @@ def discover_rows(roots: list[Path], manifest_name: str) -> tuple[pd.DataFrame, 
     return result, manifests
 
 
+def exclude_remote_rows(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove remote-seek rows identified by metadata or shard location."""
+    remote = pd.Series(False, index=frame.index)
+    if "extraction_mode" in frame:
+        remote |= frame["extraction_mode"].fillna("").astype(str).str.casefold().eq(
+            "remote_seek"
+        )
+    for column in ("shard_id", "storage_key", "kaggle_dataset_id", "_manifest_path"):
+        if column in frame:
+            remote |= frame[column].fillna("").astype(str).map(
+                lambda value: bool(REMOTE_MARKER.search(value))
+            )
+    remote_recordings = set(
+        frame.loc[remote, "source_recording_id"].fillna("").astype(str)
+    )
+    remote_recordings.discard("")
+    for column in ("donor_source_recording_id", "background_source_recording_id"):
+        if column in frame and remote_recordings:
+            remote |= frame[column].fillna("").astype(str).isin(remote_recordings)
+    excluded = int(remote.sum())
+    return frame.loc[~remote].reset_index(drop=True), excluded
+
+
 def load_overlap_actions(path: Path | None) -> dict[str, dict[str, str]]:
     if path is None:
         return {}
@@ -602,6 +627,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=401)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--max-input-rows", type=int, default=None, help="Small randomized input subset for testing.")
+    parser.add_argument(
+        "--exclude-remote-data",
+        action="store_true",
+        help="Exclude remote-seek shards/recordings from donors and backgrounds.",
+    )
     parser.add_argument("--kaggle-dataset-id", default=DEFAULT_DATASET_ID)
     parser.add_argument("--kaggle-title", default="Multispecies Cetacean PCA Vocalization Mixtures")
     parser.add_argument("--kaggle-license", default="CC0-1.0")
@@ -641,6 +671,12 @@ def main() -> int:
     balance_path = output_dir / "sampling_balance_report.csv"
 
     frame, manifests = discover_rows(roots, args.manifest_name)
+    excluded_remote_rows = 0
+    if args.exclude_remote_data:
+        frame, excluded_remote_rows = exclude_remote_rows(frame)
+        print(f"Excluded remote-data rows: {excluded_remote_rows:,}")
+        if frame.empty:
+            raise ValueError("No training rows remain after --exclude-remote-data")
     if args.max_input_rows is not None:
         if args.max_input_rows < 1:
             raise ValueError("--max-input-rows must be positive")
@@ -835,6 +871,8 @@ def main() -> int:
     summary = {
         "input_manifests": [str(path) for path in manifests],
         "input_training_rows": len(frame),
+        "exclude_remote_data": args.exclude_remote_data,
+        "excluded_remote_rows": excluded_remote_rows,
         "eligible_donors": {label: len(donors[label]) for label in labels},
         "ambient_backgrounds": len(backgrounds),
         "requested_label_counts": counts,
