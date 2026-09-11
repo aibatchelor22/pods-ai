@@ -38,9 +38,9 @@ PRESET_ARGUMENTS = [
     "--output-dir",
     "/kaggle/working/multispecies_cetacean_controlled_background_mixtures",
     "--kaggle-dataset-id",
-    "leonisviridis/multispecies-cetacean-v2-controlled-background-mixtures",
+    "leonisviridis/multispecies-v2-controlled-mixtures",
     "--kaggle-title",
-    "Multispecies Cetacean V2 Controlled Background Mixtures",
+    "Multispecies V2 Controlled Mixtures",
 ]
 
 
