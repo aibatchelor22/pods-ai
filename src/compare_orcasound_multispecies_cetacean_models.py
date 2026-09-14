@@ -55,6 +55,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default=None)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--inference-path",
+        choices=("reference", "compact-crop", "compact-interpolate", "padded-full-spectrogram"),
+        default="reference",
+        help=(
+            "Window feature path. Compact modes compute one spectrogram per "
+            "recording; reference preserves the training-time feature path."
+        ),
+    )
     parser.add_argument("--segment-seconds", type=float, default=3.0)
     parser.add_argument("--hop-seconds", type=float, default=2.0)
     parser.add_argument("--max-samples", type=int)
@@ -219,6 +228,108 @@ def infer_prepared_windows(
     return frame, elapsed, identity
 
 
+def infer_full_spectrogram_recordings(
+    model_name: str,
+    manifest: pd.DataFrame,
+    wav_dir: Path,
+    preprocessing: dict[str, Any],
+    batch_size: int,
+    device: torch.device,
+    amp: bool,
+    segment_seconds: float,
+    hop_seconds: float,
+    inference_path: str,
+) -> tuple[pd.DataFrame, float, dict[str, Any]]:
+    """Cache raw head probabilities using one full fbank per recording."""
+    try:
+        from multispecies_cetacean_inference_full_spectrogram import (
+            FullSpectrogramMultispeciesCetaceanInference,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Optimized inference requires "
+            "multispecies_cetacean_inference_full_spectrogram.py and "
+            "multispecies_cetacean_inference.py beside this script."
+        ) from exc
+
+    compact = inference_path != "padded-full-spectrogram"
+    position_mode = (
+        "interpolate" if inference_path == "compact-interpolate" else "crop"
+    )
+    print(
+        f"\nLoading model for {inference_path} inference: {model_name}"
+    )
+    predictor = FullSpectrogramMultispeciesCetaceanInference(
+        model_name,
+        device=str(device),
+        inference_batch_size=batch_size,
+        compact_ast_frames=compact,
+        compact_position_embedding_mode=position_mode,
+        amp=amp,
+    )
+    # Preserve the comparison script's explicit preprocessing overrides.
+    predictor.mean_subtract = bool(preprocessing["mean_subtract"])
+    predictor.high_pass_filter = bool(preprocessing["high_pass_filter"])
+    predictor.high_pass_cutoff_hz = float(preprocessing["high_pass_cutoff_hz"])
+    predictor.high_pass_order = int(preprocessing["high_pass_order"])
+
+    frames: list[pd.DataFrame] = []
+    started = time.perf_counter()
+    try:
+        for sample_id, row in manifest.iterrows():
+            wav_path = evaluation.resolve_wav(row, wav_dir)
+            probabilities = predictor.predict_window_probabilities(
+                str(wav_path),
+                segment_duration=segment_seconds,
+                hop_duration=hop_seconds,
+            )
+            window_count = int(probabilities["trigger"].shape[0])
+            category = evaluation.clean(row.get("Category"))
+            record = pd.DataFrame(
+                {
+                    "sample_id": np.full(window_count, int(sample_id)),
+                    "category": np.full(window_count, category, dtype=object),
+                    "actual_label": np.full(
+                        window_count,
+                        evaluation.normalize_label(category),
+                        dtype=object,
+                    ),
+                    "wav_path": np.full(window_count, str(wav_path), dtype=object),
+                    "window_index": np.arange(window_count, dtype=np.int64),
+                    "window_start_sec": (
+                        np.arange(window_count, dtype=np.float64) * hop_seconds
+                    ),
+                }
+            )
+            for label, index in TRIGGER_LABELS.items():
+                record[f"trigger_{label}"] = probabilities["trigger"][:, index]
+            for label, index in SOURCE_LABELS.items():
+                record[f"source_{label}"] = probabilities["source"][:, index]
+            for label, index in ECOTYPE_LABELS.items():
+                record[f"ecotype_{label}"] = probabilities["ecotype"][:, index]
+            frames.append(record)
+            if (sample_id + 1) % 25 == 0 or sample_id + 1 == len(manifest):
+                print(
+                    f"  inferred {sample_id + 1:,}/{len(manifest):,} recordings"
+                )
+        elapsed = time.perf_counter() - started
+        identity = {
+            "model_directory": str(predictor.model_directory),
+            "feature_extraction_mode": (
+                "full_spectrogram_padded"
+                if not compact
+                else f"full_spectrogram_compact_{position_mode}"
+            ),
+        }
+        return pd.concat(frames, ignore_index=True), elapsed, identity
+    finally:
+        predictor.model.to("cpu")
+        del predictor
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
 def cache_is_compatible(cache_path: Path, expected: dict[str, Any]) -> bool:
     metadata_path = cache_path.with_suffix(".json")
     if not cache_path.is_file() or not metadata_path.is_file():
@@ -232,6 +343,7 @@ def cache_is_compatible(cache_path: Path, expected: dict[str, Any]) -> bool:
 
 def evaluate_grid(
     model_name: str,
+    inference_path: str,
     cache: pd.DataFrame,
     configurations: list[evaluation.AggregationConfig],
     complete_grid_size: int,
@@ -241,13 +353,16 @@ def evaluate_grid(
 ) -> tuple[pd.Series, Path]:
     samples = evaluation.load_cached_samples(cache)
     rows: list[dict[str, Any]] = []
-    model_dir = output_dir / "models" / model_slug(model_name)
+    model_dir = output_dir / "models" / (
+        f"{model_slug(model_name)}_{inference_path.replace('-', '_')}"
+    )
     model_dir.mkdir(parents=True, exist_ok=True)
     result_path = model_dir / "grid_search_results.csv"
     for run, config in enumerate(configurations, start=1):
         _, _, metrics = evaluation.evaluate_cached_samples(samples, config)
         row = grid_search.result_row(run, config, metrics)
         row["model_name"] = model_name
+        row["inference_path"] = inference_path
         rows.append(row)
         if run % checkpoint_every == 0 or run == len(configurations):
             pd.DataFrame(rows).to_csv(result_path, index=False)
@@ -292,6 +407,7 @@ def main() -> int:
     print(f"Test recordings:        {len(manifest):,}")
     print(f"Grid configurations:    {selected_runs:,} of {complete_grid_size:,}")
     print(f"Device / AMP:           {device} / {args.amp and device.type == 'cuda'}")
+    print(f"Inference path:         {args.inference_path}")
 
     profiles: dict[str, dict[str, Any]] = {}
     model_records: dict[str, dict[str, Any]] = {}
@@ -299,7 +415,9 @@ def main() -> int:
         preprocessing = model_preprocessing(model_name, args)
         profile_key = json.dumps(preprocessing, sort_keys=True)
         profiles.setdefault(profile_key, {"preprocessing": preprocessing, "models": []})["models"].append(model_name)
-        cache_path = cache_dir / f"{model_slug(model_name)}.csv"
+        cache_path = cache_dir / (
+            f"{model_slug(model_name)}_{args.inference_path.replace('-', '_')}.csv"
+        )
         cache_inputs = {
             "model_name": model_name,
             "testing_csv": input_identity(testing_csv),
@@ -310,6 +428,7 @@ def main() -> int:
             "max_samples": args.max_samples,
             "category": args.category,
             "amp": args.amp and device.type == "cuda",
+            "inference_path": args.inference_path,
         }
         model_records[model_name] = {
             "cache_path": cache_path,
@@ -333,6 +452,38 @@ def main() -> int:
             if model_name not in pending:
                 print(f"Reusing model window cache: {model_records[model_name]['cache_path']}")
         if not pending:
+            continue
+        if args.inference_path != "reference":
+            for model_name in pending:
+                record = model_records[model_name]
+                cache, inference_seconds, identity = infer_full_spectrogram_recordings(
+                    model_name,
+                    manifest,
+                    wav_dir,
+                    record["preprocessing"],
+                    args.batch_size,
+                    device,
+                    args.amp,
+                    args.segment_seconds,
+                    args.hop_seconds,
+                    args.inference_path,
+                )
+                cache.to_csv(record["cache_path"], index=False)
+                record["cache_path"].with_suffix(".json").write_text(
+                    json.dumps(
+                        {
+                            "cache_inputs": record["cache_inputs"],
+                            "model_identity": identity,
+                            "inference_seconds": inference_seconds,
+                            "recordings": int(cache["sample_id"].nunique()),
+                            "windows": len(cache),
+                        },
+                        indent=2,
+                        default=str,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"Saved model window cache: {record['cache_path']}")
             continue
         windows, window_metadata = prepare_windows(
             manifest,
@@ -379,6 +530,7 @@ def main() -> int:
         cache = pd.read_csv(cache_path, low_memory=False)
         best, _ = evaluate_grid(
             model_name,
+            args.inference_path,
             cache,
             configurations,
             complete_grid_size,
@@ -412,6 +564,7 @@ def main() -> int:
         json.dumps(
             {
                 "model_name": top_model,
+                "inference_path": args.inference_path,
                 "ranking_metric": args.ranking_metric,
                 "aggregation": asdict(top_config),
                 "metrics": metrics,
