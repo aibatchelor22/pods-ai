@@ -6,9 +6,10 @@
 This adapter follows the optimized PODS-AI AST path: deterministic waveform
 preprocessing is applied once to the 60-second waveform, one Kaldi fbank is
 computed, and the overlapping three-second feature windows are sliced from it.
-Compact mode also removes unnecessary AST time padding and resizes positional
-embeddings. Because this is not bit-identical to per-window preprocessing, it
-must pass prediction and evaluation regression tests before deployment.
+Compact mode also removes unnecessary AST time padding. By default it crops
+the positional grid to the positions occupied by real three-second audio;
+interpolation remains available as an experiment. Compact inference is not
+bit-identical to the padded model and must pass evaluation before deployment.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ class FullSpectrogramMultispeciesCetaceanInference(
         inference_batch_size: int = 8,
         aggregation_config: Optional[Mapping[str, Any]] = None,
         compact_ast_frames: bool = True,
+        compact_position_embedding_mode: str = "crop",
     ) -> None:
         super().__init__(
             model_path=model_path,
@@ -57,8 +59,13 @@ class FullSpectrogramMultispeciesCetaceanInference(
             aggregation_config=aggregation_config,
         )
         self.compact_ast_frames = bool(compact_ast_frames)
+        if compact_position_embedding_mode not in {"crop", "interpolate"}:
+            raise ValueError(
+                "compact_position_embedding_mode must be 'crop' or 'interpolate'"
+            )
+        self.compact_position_embedding_mode = compact_position_embedding_mode
         self._position_embedding_cache: dict[
-            tuple[int, int], torch.Tensor
+            tuple[str, int, int], torch.Tensor
         ] = {}
         self._segment_frame_cache: dict[tuple[int, int], int] = {}
         self._original_position_embeddings = (
@@ -99,7 +106,11 @@ class FullSpectrogramMultispeciesCetaceanInference(
         if min(target_frequency, target_time, source_frequency, source_time) < 1:
             raise ValueError("Invalid AST patch geometry for compact inference")
 
-        target_key = (target_frequency, target_time)
+        target_key = (
+            self.compact_position_embedding_mode,
+            target_frequency,
+            target_time,
+        )
         target_tokens = target_frequency * target_time + NUM_SPECIAL_TOKENS
         if current.shape[1] == target_tokens:
             return
@@ -125,14 +136,30 @@ class FullSpectrogramMultispeciesCetaceanInference(
         patch = source[:, NUM_SPECIAL_TOKENS:, :].reshape(
             1, source_frequency, source_time, hidden_size
         )
-        patch = patch.permute(0, 3, 1, 2)
-        patch = torch.nn.functional.interpolate(
-            patch,
-            size=(target_frequency, target_time),
-            mode="bilinear",
-            align_corners=False,
-        )
-        patch = patch.permute(0, 2, 3, 1).reshape(
+        if self.compact_position_embedding_mode == "crop":
+            if (
+                target_frequency > source_frequency
+                or target_time > source_time
+            ):
+                raise RuntimeError(
+                    "Cannot crop AST positional embeddings to a larger grid: "
+                    f"source={source_frequency}x{source_time}, "
+                    f"target={target_frequency}x{target_time}"
+                )
+            # Training placed the real short-clip frames at the beginning of
+            # the padded time axis. Keep those exact learned positions instead
+            # of compressing the entire padded timeline into the short clip.
+            patch = patch[:, :target_frequency, :target_time, :]
+        else:
+            patch = patch.permute(0, 3, 1, 2)
+            patch = torch.nn.functional.interpolate(
+                patch,
+                size=(target_frequency, target_time),
+                mode="bilinear",
+                align_corners=False,
+            )
+            patch = patch.permute(0, 2, 3, 1)
+        patch = patch.reshape(
             1, target_frequency * target_time, hidden_size
         )
         resized = torch.cat((special, patch), dim=1).detach()
@@ -295,7 +322,8 @@ class FullSpectrogramMultispeciesCetaceanInference(
             "hop_duration": float(hop_duration),
             "segment_duration": float(segment_duration),
             "feature_extraction_mode": (
-                "full_spectrogram_compact"
+                "full_spectrogram_compact_"
+                + self.compact_position_embedding_mode
                 if self.compact_ast_frames
                 else "full_spectrogram_padded"
             ),

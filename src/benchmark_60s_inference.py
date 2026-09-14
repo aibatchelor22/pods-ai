@@ -338,6 +338,16 @@ def parse_args() -> argparse.Namespace:
             "frame length. By default v2_optimized uses compact PODS-AI-style frames."
         ),
     )
+    parser.add_argument(
+        "--optimized-position-embedding-mode",
+        choices=("crop", "interpolate"),
+        default="crop",
+        help=(
+            "How compact inference maps the checkpoint positional grid. "
+            "'crop' preserves the positions occupied by real short-clip frames; "
+            "'interpolate' retains the earlier experimental behavior."
+        ),
+    )
     parser.add_argument("--aggregation-json", type=Path)
     parser.add_argument("--podsai-model-path", default=DEFAULT_PODSAI_MODEL)
     parser.add_argument("--podsai-model-revision", default=DEFAULT_PODSAI_REVISION)
@@ -452,12 +462,18 @@ def main() -> int:
             inference_batch_size=args.inference_batch_size,
             aggregation_config=aggregation,
             compact_ast_frames=not args.optimized_preserve_max_length,
+            compact_position_embedding_mode=(
+                args.optimized_position_embedding_mode
+            ),
         )
         rows = benchmark_model(
             (
                 "multispecies_v2_full_spectrogram_padded"
                 if args.optimized_preserve_max_length
-                else "multispecies_v2_full_spectrogram_compact"
+                else (
+                    "multispecies_v2_full_spectrogram_compact_"
+                    + args.optimized_position_embedding_mode
+                )
             ),
             args.v2_model_path,
             predictor,
@@ -532,6 +548,12 @@ def main() -> int:
             "inference_batch_size": args.inference_batch_size,
             "segment_seconds": args.segment_seconds,
             "hop_seconds": args.hop_seconds,
+            "optimized_preserve_max_length": (
+                args.optimized_preserve_max_length
+            ),
+            "optimized_position_embedding_mode": (
+                args.optimized_position_embedding_mode
+            ),
             "timed_scope": "predict(wav); excludes model loading and WAV download",
         },
         "models": summaries,

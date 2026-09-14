@@ -28,6 +28,12 @@ def main() -> int:
         action="store_true",
         help="Keep padded AST frames while still computing the fbank only once.",
     )
+    parser.add_argument(
+        "--position-embedding-mode",
+        choices=("crop", "interpolate"),
+        default="crop",
+        help="Positional-grid mapping used by compact inference (default: crop).",
+    )
     args = parser.parse_args()
     if not args.wav_file.is_file():
         raise FileNotFoundError(args.wav_file)
@@ -46,6 +52,7 @@ def main() -> int:
         inference_batch_size=args.inference_batch_size,
         aggregation_config=aggregation,
         compact_ast_frames=not args.preserve_max_length,
+        compact_position_embedding_mode=args.position_embedding_mode,
     )
     device = predictor.device
     if device.startswith("cuda"):
@@ -63,4 +70,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
