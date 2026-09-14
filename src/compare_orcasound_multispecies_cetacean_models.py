@@ -265,8 +265,10 @@ def infer_full_spectrogram_recordings(
         inference_batch_size=batch_size,
         compact_ast_frames=compact,
         compact_position_embedding_mode=position_mode,
-        amp=amp,
     )
+    # Set this after construction so the comparison also works with the
+    # earlier crop-capable adapter, whose constructor did not expose ``amp``.
+    predictor.amp = bool(amp) and device.type == "cuda"
     # Preserve the comparison script's explicit preprocessing overrides.
     predictor.mean_subtract = bool(preprocessing["mean_subtract"])
     predictor.high_pass_filter = bool(preprocessing["high_pass_filter"])
@@ -278,11 +280,46 @@ def infer_full_spectrogram_recordings(
     try:
         for sample_id, row in manifest.iterrows():
             wav_path = evaluation.resolve_wav(row, wav_dir)
-            probabilities = predictor.predict_window_probabilities(
-                str(wav_path),
-                segment_duration=segment_seconds,
-                hop_duration=hop_seconds,
-            )
+            if hasattr(predictor, "predict_window_probabilities"):
+                probabilities = predictor.predict_window_probabilities(
+                    str(wav_path),
+                    segment_duration=segment_seconds,
+                    hop_duration=hop_seconds,
+                )
+            else:
+                # Compatibility with the first crop-enabled adapter. It had
+                # the optimized feature method but exposed only predict().
+                input_values = predictor._compute_input_values(
+                    predictor._read_audio(str(wav_path)),
+                    float(segment_seconds),
+                    float(hop_seconds),
+                )
+                probability_parts: dict[str, list[np.ndarray]] = {
+                    "trigger": [],
+                    "source": [],
+                    "ecotype": [],
+                }
+                with torch.inference_mode():
+                    for batch_start in range(0, len(input_values), batch_size):
+                        values = input_values[
+                            batch_start : batch_start + batch_size
+                        ].to(device)
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=torch.float16,
+                            enabled=predictor.amp,
+                        ):
+                            outputs = predictor.model(input_values=values)
+                        for name, output in zip(probability_parts, outputs):
+                            probability_parts[name].append(
+                                torch.softmax(output.float(), dim=-1)
+                                .cpu()
+                                .numpy()
+                            )
+                probabilities = {
+                    name: np.concatenate(parts)
+                    for name, parts in probability_parts.items()
+                }
             window_count = int(probabilities["trigger"].shape[0])
             category = evaluation.clean(row.get("Category"))
             record = pd.DataFrame(
