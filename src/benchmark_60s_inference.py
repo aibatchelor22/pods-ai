@@ -59,7 +59,7 @@ def parse_csv_values(value: str) -> list[str]:
     result = [item.strip().casefold() for item in value.split(",") if item.strip()]
     if not result:
         raise ValueError("At least one model must be selected")
-    unknown = sorted(set(result) - {"v2", "podsai"})
+    unknown = sorted(set(result) - {"v2", "v2_optimized", "podsai"})
     if unknown:
         raise ValueError(f"Unknown --models values: {unknown}")
     return result
@@ -231,6 +231,48 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> 
         writer.writerows(rows)
 
 
+def compare_v2_predictions(rows: list[TimingRow]) -> list[dict[str, Any]]:
+    reference = {
+        (row.manifest_row, row.repeat): row
+        for row in rows
+        if row.model == "multispecies_v2"
+    }
+    optimized = {
+        (row.manifest_row, row.repeat): row
+        for row in rows
+        if row.model.startswith("multispecies_v2_full_spectrogram_")
+    }
+    comparisons: list[dict[str, Any]] = []
+    for key in sorted(reference.keys() & optimized.keys()):
+        original = reference[key]
+        faster = optimized[key]
+        confidence_difference = None
+        if (
+            original.global_confidence is not None
+            and faster.global_confidence is not None
+        ):
+            confidence_difference = abs(
+                original.global_confidence - faster.global_confidence
+            )
+        comparisons.append(
+            {
+                "manifest_row": original.manifest_row,
+                "repeat": original.repeat,
+                "category": original.category,
+                "wav_path": original.wav_path,
+                "reference_prediction": original.predicted_label,
+                "optimized_prediction": faster.predicted_label,
+                "predictions_agree": (
+                    original.predicted_label == faster.predicted_label
+                ),
+                "reference_confidence": original.global_confidence,
+                "optimized_confidence": faster.global_confidence,
+                "absolute_confidence_difference": confidence_difference,
+            }
+        )
+    return comparisons
+
+
 def release_model(predictor: Any) -> None:
     model = getattr(predictor, "model", None)
     if model is not None and hasattr(model, "to"):
@@ -244,9 +286,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--testing-csv", default="output/csv/testing_60s_samples.csv")
     parser.add_argument("--wav-dir", default="output/testing-wav")
-    parser.add_argument("--models", default="v2,podsai", help="v2,podsai; v2; or podsai")
+    parser.add_argument(
+        "--models",
+        default="v2,v2_optimized,podsai",
+        help="Comma-separated selection: v2, v2_optimized, and/or podsai.",
+    )
     parser.add_argument("--v2-model-path")
     parser.add_argument("--v2-model-revision")
+    parser.add_argument(
+        "--optimized-preserve-max-length",
+        action="store_true",
+        help=(
+            "Compute one full spectrogram but preserve the checkpoint's padded AST "
+            "frame length. By default v2_optimized uses compact PODS-AI-style frames."
+        ),
+    )
     parser.add_argument("--aggregation-json", type=Path)
     parser.add_argument("--podsai-model-path", default=DEFAULT_PODSAI_MODEL)
     parser.add_argument("--podsai-model-revision", default=DEFAULT_PODSAI_REVISION)
@@ -267,7 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="output/benchmark_60s_inference")
     args = parser.parse_args()
     args.models = parse_csv_values(args.models)
-    if "v2" in args.models and not args.v2_model_path:
+    if {"v2", "v2_optimized"}.intersection(args.models) and not args.v2_model_path:
         parser.error("--v2-model-path is required when benchmarking v2")
     for name in (
         "inference_batch_size",
@@ -349,6 +403,39 @@ def main() -> int:
         release_model(predictor)
         del predictor
 
+    if "v2_optimized" in args.models:
+        from multispecies_cetacean_inference_full_spectrogram import (
+            FullSpectrogramMultispeciesCetaceanInference,
+        )
+
+        predictor = FullSpectrogramMultispeciesCetaceanInference(
+            args.v2_model_path,
+            device=device,
+            model_revision=args.v2_model_revision,
+            inference_batch_size=args.inference_batch_size,
+            aggregation_config=aggregation,
+            compact_ast_frames=not args.optimized_preserve_max_length,
+        )
+        rows = benchmark_model(
+            (
+                "multispecies_v2_full_spectrogram_padded"
+                if args.optimized_preserve_max_length
+                else "multispecies_v2_full_spectrogram_compact"
+            ),
+            args.v2_model_path,
+            predictor,
+            samples,
+            device,
+            args.warmup_runs,
+            args.repeats,
+            args.segment_seconds,
+            args.hop_seconds,
+        )
+        timing_rows.extend(rows)
+        summaries.append(summarize(rows, 60.0))
+        release_model(predictor)
+        del predictor
+
     if "podsai" in args.models:
         if not (source_dir / "model_inference.py").is_file():
             raise FileNotFoundError(f"model_inference.py not found under {source_dir}")
@@ -388,6 +475,13 @@ def main() -> int:
         summaries,
         list(summaries[0]),
     )
+    prediction_comparisons = compare_v2_predictions(timing_rows)
+    if prediction_comparisons:
+        write_csv(
+            output_dir / "v2_prediction_agreement.csv",
+            prediction_comparisons,
+            list(prediction_comparisons[0]),
+        )
     report = {
         "settings": {
             "testing_csv": str(manifest),
@@ -405,6 +499,12 @@ def main() -> int:
         },
         "models": summaries,
     }
+    if prediction_comparisons:
+        agreement = statistics.fmean(
+            float(row["predictions_agree"])
+            for row in prediction_comparisons
+        )
+        report["v2_prediction_agreement"] = agreement
     (output_dir / "inference_benchmark_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
@@ -427,6 +527,11 @@ def main() -> int:
             f"{summary['p95_predict_seconds']:8.3f}s "
             f"{summary['real_time_factor']:10.4f} "
             f"{summary['realtime_speed_multiple']:10.2f}x"
+        )
+    if prediction_comparisons:
+        print(
+            "Reference/optimized global-label agreement: "
+            f"{100.0 * report['v2_prediction_agreement']:.2f}%"
         )
     print(f"\nSaved benchmark outputs to {output_dir.resolve()}")
     return 0
