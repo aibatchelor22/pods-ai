@@ -53,6 +53,8 @@ class TimingRow:
     predict_seconds: float
     predicted_label: str
     global_confidence: float | None
+    local_predictions_json: str
+    per_class_probabilities_json: str
 
 
 def parse_csv_values(value: str) -> list[str]:
@@ -191,6 +193,13 @@ def benchmark_model(
                     predict_seconds=elapsed,
                     predicted_label=clean(result.get("global_prediction_label")),
                     global_confidence=(float(confidence) if confidence is not None else None),
+                    local_predictions_json=json.dumps(
+                        result.get("local_predictions", [])
+                    ),
+                    per_class_probabilities_json=json.dumps(
+                        result.get("per_class_probabilities", {}),
+                        sort_keys=True,
+                    ),
                 )
             )
             print(
@@ -254,6 +263,23 @@ def compare_v2_predictions(rows: list[TimingRow]) -> list[dict[str, Any]]:
             confidence_difference = abs(
                 original.global_confidence - faster.global_confidence
             )
+        reference_local = json.loads(original.local_predictions_json)
+        optimized_local = json.loads(faster.local_predictions_json)
+        compared_windows = min(len(reference_local), len(optimized_local))
+        local_agreement = None
+        if compared_windows:
+            local_agreement = sum(
+                reference_local[index] == optimized_local[index]
+                for index in range(compared_windows)
+            ) / compared_windows
+
+        reference_classes = json.loads(original.per_class_probabilities_json)
+        optimized_classes = json.loads(faster.per_class_probabilities_json)
+        common_classes = sorted(reference_classes.keys() & optimized_classes.keys())
+        class_differences = [
+            abs(float(reference_classes[label]) - float(optimized_classes[label]))
+            for label in common_classes
+        ]
         comparisons.append(
             {
                 "manifest_row": original.manifest_row,
@@ -268,6 +294,17 @@ def compare_v2_predictions(rows: list[TimingRow]) -> list[dict[str, Any]]:
                 "reference_confidence": original.global_confidence,
                 "optimized_confidence": faster.global_confidence,
                 "absolute_confidence_difference": confidence_difference,
+                "reference_local_windows": len(reference_local),
+                "optimized_local_windows": len(optimized_local),
+                "local_label_agreement": local_agreement,
+                "mean_absolute_class_probability_difference": (
+                    statistics.fmean(class_differences)
+                    if class_differences
+                    else None
+                ),
+                "maximum_absolute_class_probability_difference": (
+                    max(class_differences) if class_differences else None
+                ),
             }
         )
     return comparisons
@@ -505,6 +542,24 @@ def main() -> int:
             for row in prediction_comparisons
         )
         report["v2_prediction_agreement"] = agreement
+        local_agreements = [
+            float(row["local_label_agreement"])
+            for row in prediction_comparisons
+            if row["local_label_agreement"] is not None
+        ]
+        class_probability_differences = [
+            float(row["mean_absolute_class_probability_difference"])
+            for row in prediction_comparisons
+            if row["mean_absolute_class_probability_difference"] is not None
+        ]
+        report["v2_local_label_agreement"] = (
+            statistics.fmean(local_agreements) if local_agreements else None
+        )
+        report["v2_mean_absolute_class_probability_difference"] = (
+            statistics.fmean(class_probability_differences)
+            if class_probability_differences
+            else None
+        )
     (output_dir / "inference_benchmark_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
@@ -533,6 +588,16 @@ def main() -> int:
             "Reference/optimized global-label agreement: "
             f"{100.0 * report['v2_prediction_agreement']:.2f}%"
         )
+        if report["v2_local_label_agreement"] is not None:
+            print(
+                "Reference/optimized local-window agreement: "
+                f"{100.0 * report['v2_local_label_agreement']:.2f}%"
+            )
+        if report["v2_mean_absolute_class_probability_difference"] is not None:
+            print(
+                "Mean absolute aggregate-score difference: "
+                f"{report['v2_mean_absolute_class_probability_difference']:.6f}"
+            )
     print(f"\nSaved benchmark outputs to {output_dir.resolve()}")
     return 0
 

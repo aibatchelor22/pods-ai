@@ -60,6 +60,7 @@ class FullSpectrogramMultispeciesCetaceanInference(
         self._position_embedding_cache: dict[
             tuple[int, int], torch.Tensor
         ] = {}
+        self._segment_frame_cache: dict[tuple[int, int], int] = {}
         self._original_position_embeddings = (
             self.model.ast.embeddings.position_embeddings.detach().clone()
         )
@@ -189,11 +190,13 @@ class FullSpectrogramMultispeciesCetaceanInference(
         waveform = torch.from_numpy(
             self._preprocess_full_audio(audio)
         ).float().unsqueeze(0)
+        # Keep this call aligned with ASTFeatureExtractor._extract_fbank_features.
+        # In particular, do not subtract the log-mel mean afterward: the AST
+        # extractor pads the raw fbank and then applies its configured global
+        # mean/std normalization.
         full_fbank = torchaudio.compliance.kaldi.fbank(
             waveform,
-            htk_compat=True,
             sample_frequency=SAMPLE_RATE,
-            use_energy=False,
             window_type="hanning",
             num_mel_bins=num_mel_bins,
             dither=0.0,
@@ -202,7 +205,27 @@ class FullSpectrogramMultispeciesCetaceanInference(
 
         frames_per_second = 1000.0 / frame_shift_ms
         hop_frames = round(hop_duration * frames_per_second)
-        segment_frames = round(segment_duration * frames_per_second)
+        # A 3-second Kaldi fbank has fewer than 300 frames because complete
+        # analysis frames must fit inside the waveform (normally 298 frames at
+        # 16 kHz, 25 ms frame length, and 10 ms frame shift). Derive rather than
+        # assume that count so slicing matches independently extracted windows.
+        frame_cache_key = (segment_samples, num_mel_bins)
+        segment_frames = self._segment_frame_cache.get(frame_cache_key)
+        if segment_frames is None:
+            probe = torch.zeros((1, segment_samples), dtype=torch.float32)
+            segment_frames = int(
+                torchaudio.compliance.kaldi.fbank(
+                    probe,
+                    sample_frequency=SAMPLE_RATE,
+                    window_type="hanning",
+                    num_mel_bins=num_mel_bins,
+                    dither=0.0,
+                    frame_shift=frame_shift_ms,
+                ).shape[0]
+            )
+            if segment_frames < 1:
+                raise RuntimeError("Kaldi fbank produced no frames for one segment")
+            self._segment_frame_cache[frame_cache_key] = segment_frames
         target_frames = (
             max(1, min(max_length, segment_frames))
             if self.compact_ast_frames
@@ -215,8 +238,6 @@ class FullSpectrogramMultispeciesCetaceanInference(
         for index in range(positions):
             start = index * hop_frames
             window = full_fbank[start : start + segment_frames, :]
-            if window.numel():
-                window = window - window.mean()
             if window.shape[0] < target_frames:
                 window = torch.nn.functional.pad(
                     window, (0, 0, 0, target_frames - window.shape[0])
@@ -285,4 +306,3 @@ def get_full_spectrogram_multispecies_cetacean_inference(
     model_path: str, **kwargs: Any
 ) -> FullSpectrogramMultispeciesCetaceanInference:
     return FullSpectrogramMultispeciesCetaceanInference(model_path, **kwargs)
-
