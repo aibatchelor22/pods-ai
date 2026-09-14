@@ -251,7 +251,46 @@ def load_recordings(args: argparse.Namespace) -> list[Recording]:
         if args.max_files < 1:
             raise ValueError("--max-files must be positive")
         rng = random.Random(args.seed)
-        selected = rng.sample(selected, min(args.max_files, len(selected)))
+        sample_size = min(args.max_files, len(selected))
+        if args.max_files_sampling == "balanced":
+            # Balance providers first, then rotate through datasets within each
+            # provider. Small strata may exhaust early; remaining slots are
+            # filled by the providers that still have eligible recordings.
+            strata: dict[str, dict[str, list[Recording]]] = defaultdict(lambda: defaultdict(list))
+            for recording in selected:
+                strata[recording.provider][recording.dataset].append(recording)
+            providers = list(strata)
+            rng.shuffle(providers)
+            datasets_by_provider: dict[str, list[str]] = {}
+            dataset_positions: dict[str, int] = {}
+            for provider in providers:
+                datasets = list(strata[provider])
+                rng.shuffle(datasets)
+                datasets_by_provider[provider] = datasets
+                dataset_positions[provider] = 0
+                for dataset in datasets:
+                    rng.shuffle(strata[provider][dataset])
+
+            sampled: list[Recording] = []
+            while len(sampled) < sample_size:
+                added_this_round = False
+                for provider in providers:
+                    datasets = datasets_by_provider[provider]
+                    for _ in range(len(datasets)):
+                        position = dataset_positions[provider] % len(datasets)
+                        dataset_positions[provider] += 1
+                        bucket = strata[provider][datasets[position]]
+                        if bucket:
+                            sampled.append(bucket.pop())
+                            added_this_round = True
+                            break
+                    if len(sampled) >= sample_size:
+                        break
+                if not added_this_round:
+                    break
+            selected = sampled
+        else:
+            selected = rng.sample(selected, sample_size)
         selected.sort(key=lambda item: (item.provider, item.dataset, item.soundfile))
     if not selected:
         raise ValueError(
@@ -478,6 +517,10 @@ def load_bundles(args: argparse.Namespace, output_dir: Path) -> tuple[list[Model
             "preprocessing": preprocessing,
             "feature_signature": signature,
         }
+        # Preserve compatibility with caches written before balanced sampling
+        # existed while still preventing random/balanced cache reuse.
+        if args.max_files_sampling != "random":
+            metadata["max_files_sampling"] = args.max_files_sampling
         if metadata_path.is_file():
             previous = json.loads(metadata_path.read_text(encoding="utf-8"))
             if previous != metadata:
@@ -1102,6 +1145,15 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated source-plan extraction modes; remote_seek is excluded by default.",
     )
     parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--max-files-sampling",
+        choices=("random", "balanced"),
+        default="random",
+        help=(
+            "How --max-files selects recordings. 'random' preserves the legacy behavior; "
+            "'balanced' balances providers, then datasets within each provider."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=401)
     parser.add_argument("--window-sec", type=float, default=3.0)
     parser.add_argument("--hop-sec", type=float, default=1.0)
@@ -1172,6 +1224,11 @@ def main() -> int:
     truth_by_recording = load_truth(Path(args.annotations), recordings)
     truth_counts = Counter(event.species for events in truth_by_recording.values() for event in events)
     print(f"Selected local validation recordings: {len(recordings):,}")
+    print(f"Selected providers: {dict(sorted(Counter(item.provider for item in recordings).items()))}")
+    print(
+        "Selected provider/datasets: "
+        f"{dict(sorted(Counter(f'{item.provider}/{item.dataset}' for item in recordings).items()))}"
+    )
     print(f"Ground-truth events: {dict(truth_counts)}")
     bundles, extractor = load_bundles(args, output_dir)
     timings = infer_recordings(args, recordings, bundles, extractor)
