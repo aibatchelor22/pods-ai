@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
+import argparse
 import csv
 import math
 import os
@@ -28,6 +29,8 @@ PACIFIC_TZ = timezone('US/Pacific')
 N_SECONDS = 3  # Create 3-second wav files.
 TESTING_WINDOW_SECONDS = 60
 TESTING_CENTER_OFFSET_SECONDS = 30
+DEFAULT_DCLDE_MANIFEST = Path("output/csv/dclde_60s_samples.csv")
+DEFAULT_DCLDE_WAV_ROOT = Path("output/dclde-wavs")
 
 @dataclass
 class CSVRow:
@@ -193,6 +196,19 @@ def _get_relative_wav_path(row: CSVRow) -> Path:
     return Path(row.category) / _get_wav_filename(row.node_name, row.timestamp_pst)
 
 
+HUMPBACK_SIGNAL_WAV_PREFIX = "signals-humpback_"
+
+
+def is_external_humpback_training_wav(relative_path: Path) -> bool:
+    """Return True for retained submodule-derived humpback training segments."""
+    return (
+        len(relative_path.parts) >= 2
+        and relative_path.parts[0] == "humpback"
+        and relative_path.name.startswith(HUMPBACK_SIGNAL_WAV_PREFIX)
+        and relative_path.suffix.lower() == ".wav"
+    )
+
+
 def _copy_wav_from_cache_if_exists(expected_path: Path, output_root: Path, cache_root: Path | None) -> bool:
     """
     Copy a WAV file from cache_root into output_root if it exists there.
@@ -221,10 +237,14 @@ def delete_stale_wavs(output_root: Path, expected_relative_paths: set[Path]) -> 
 
     deleted_count = 0
     for wav_path in output_root.rglob("*.wav"):
-        if wav_path.relative_to(output_root) not in expected_relative_paths:
-            wav_path.unlink()
-            print(f"Deleted stale wav: {wav_path}")
-            deleted_count += 1
+        relative_path = wav_path.relative_to(output_root)
+        if relative_path in expected_relative_paths:
+            continue
+        if is_external_humpback_training_wav(relative_path):
+            continue
+        wav_path.unlink()
+        print(f"Deleted stale wav: {wav_path}")
+        deleted_count += 1
 
     for directory in sorted((path for path in output_root.rglob("*") if path.is_dir()), reverse=True):
         if directory == output_root:
@@ -472,8 +492,7 @@ def download_testing_sample(row: CSVRow, output_root: Path, cache_root: Path | N
     with TemporaryDirectory() as tmp_dir:
         wav_path = download_60s_audio(row.node_name, download_timestamp, tmp_dir)
         if wav_path is None:
-            print(f"Warning: Failed to download 60-second clip for {row.node_name} at {row.timestamp_pst}")
-            return
+            raise AssertionError(f"Error: Failed to download 60-second clip for {row.node_name} at {row.timestamp_pst}")
         shutil.move(wav_path, expected_path)
         print(f"Downloaded: {expected_path}")
 
@@ -498,20 +517,82 @@ def process_testing_csv(csv_path: Path, output_root: Path, cache_root: Path | No
     delete_stale_wavs(output_root, expected_relative_paths)
 
 
+def download_dclde_sample(
+    row: CSVRow,
+    output_root: Path,
+    cache_root: Path | None = None,
+) -> None:
+    """Download one complete DCLDE WAV directly from the URI in its manifest."""
+    label_dir = output_root / row.category
+    label_dir.mkdir(parents=True, exist_ok=True)
+    expected_path = label_dir / _get_wav_filename(row.node_name, row.timestamp_pst)
+    if expected_path.exists() and expected_path.stat().st_size:
+        print(f"Skipping (already exists): {expected_path}")
+        return
+    if _copy_wav_from_cache_if_exists(expected_path, output_root, cache_root):
+        return
+    if not row.uri:
+        raise ValueError("DCLDE manifest row has an empty URI")
+
+    with TemporaryDirectory() as tmp_dir:
+        download_from_url(row.uri, tmp_dir)
+        downloaded_path = Path(tmp_dir) / os.path.basename(row.uri.split("?", 1)[0])
+        if not downloaded_path.is_file() or not downloaded_path.stat().st_size:
+            raise FileNotFoundError(f"Download did not produce {downloaded_path.name}")
+        shutil.move(str(downloaded_path), expected_path)
+    print(f"Downloaded DCLDE WAV: {expected_path}")
+
+
+def process_dclde_csv(
+    csv_path: Path,
+    output_root: Path,
+    cache_root: Path | None = None,
+) -> None:
+    """Download all full recordings listed in the optional DCLDE manifest."""
+    rows = parse_csv(csv_path)
+    print(f"Found {len(rows)} DCLDE Orcasound recordings to process")
+    expected_relative_paths = {_get_relative_wav_path(row) for row in rows}
+    failures: list[str] = []
+    for index, row in enumerate(rows, start=1):
+        print(
+            f"Processing DCLDE sample {index}/{len(rows)}: "
+            f"{row.category} - {row.description}"
+        )
+        try:
+            download_dclde_sample(row, output_root, cache_root=cache_root)
+        except Exception as error:
+            message = (
+                f"row {index + 1} ({row.node_name}, {row.timestamp_pst}): "
+                f"{type(error).__name__}: {error}"
+            )
+            failures.append(message)
+            print(f"WARNING: DCLDE download failed for {message}", file=sys.stderr)
+
+    delete_stale_wavs(output_root, expected_relative_paths)
+    print(
+        f"DCLDE download summary: {len(rows) - len(failures)}/{len(rows)} "
+        "recordings available"
+    )
+    if failures:
+        print(f"DCLDE failures: {len(failures)}", file=sys.stderr)
+
+
 def print_usage():
     """
     Display usage information for this script.
     """
     print("Usage: python download_wavs.py [--validate-only]")
     print()
-    print("This script downloads wav files for training and testing samples.")
+    print("This script downloads training, testing, and optional DCLDE Orcasound WAVs.")
     print("It reads from:")
     print("  - output/csv/training_3s_samples.csv")
     print("  - output/csv/testing_60s_samples.csv")
+    print("  - output/csv/dclde_60s_samples.csv (optional)")
     print()
     print("And saves wav files to:")
     print("  - output/wav/ (training samples)")
     print("  - output/testing-wav/ (testing samples)")
+    print("  - output/dclde-wavs/ (DCLDE Orcasound recordings)")
     print()
     print("Optional argument:")
     print("  --validate-only: validate CSV overlap rules without downloading WAV files")
@@ -520,21 +601,29 @@ def print_usage():
     print("  - WAV_CACHE_DIR: root directory to copy existing wav files from before downloading")
 
 
-def run_download_wavs(validate_only: bool = False) -> None:
-    training_csv_path = Path("../output/csv/training_3s_samples.csv")
-    testing_csv_path = Path("../output/csv/testing_60s_samples.csv")
+def run_download_wavs(
+    validate_only: bool = False,
+    dclde_csv_path: Path = DEFAULT_DCLDE_MANIFEST,
+    dclde_output_root: Path | None = None,
+) -> None:
+    training_csv_path = Path("output/csv/training_3s_samples.csv")
+    testing_csv_path = Path("output/csv/testing_60s_samples.csv")
 
     worktree_root = Path(os.getenv("WAV_WORKTREE_DIR", "."))
     training_output_root = worktree_root / "output/wav"
     testing_output_root = worktree_root / "output/testing-wav"
+    if dclde_output_root is None:
+        dclde_output_root = worktree_root / DEFAULT_DCLDE_WAV_ROOT
 
     cache_root_env = os.getenv("WAV_CACHE_DIR")
     training_cache_root = None
     testing_cache_root = None
+    dclde_cache_root = None
     if cache_root_env:
         cache_root = Path(cache_root_env)
         training_cache_root = cache_root / "output/wav"
         testing_cache_root = cache_root / "output/testing-wav"
+        dclde_cache_root = cache_root / DEFAULT_DCLDE_WAV_ROOT
 
     if not training_csv_path.exists():
         print(f"Error: CSV file not found at {training_csv_path}")
@@ -553,6 +642,16 @@ def run_download_wavs(validate_only: bool = False) -> None:
 
     if validate_only:
         print("Overlap validation completed successfully.")
+        if dclde_csv_path.exists():
+            dclde_rows = parse_csv(dclde_csv_path)
+            if not dclde_rows:
+                raise ValueError(f"DCLDE manifest has no usable rows: {dclde_csv_path}")
+            missing_uri = sum(not row.uri for row in dclde_rows)
+            if missing_uri:
+                raise ValueError(f"DCLDE manifest contains {missing_uri} row(s) without a URI")
+            print(f"DCLDE manifest validation completed: {len(dclde_rows)} rows.")
+        else:
+            print(f"DCLDE manifest not found; validation skipped: {dclde_csv_path}")
         return
 
     process_csv(training_csv_path, training_output_root, cache_root=training_cache_root)
@@ -560,10 +659,46 @@ def run_download_wavs(validate_only: bool = False) -> None:
     if testing_rows:
         process_testing_csv(testing_csv_path, testing_output_root, cache_root=testing_cache_root)
 
+    if dclde_csv_path.exists():
+        process_dclde_csv(
+            dclde_csv_path,
+            dclde_output_root,
+            cache_root=dclde_cache_root,
+        )
+    else:
+        print(f"DCLDE manifest not found; skipping DCLDE downloads: {dclde_csv_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download PODS-AI training, testing, and optional DCLDE Orcasound WAVs. "
+            "Run from the repository root as python src/download_wavs.py."
+        )
+    )
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--dclde-manifest",
+        type=Path,
+        default=DEFAULT_DCLDE_MANIFEST,
+        help=(
+            "DCLDE Orcasound manifest (default: output/csv/dclde_60s_samples.csv). "
+            "If absent, DCLDE downloading is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--dclde-wav-root",
+        type=Path,
+        default=None,
+        help="Override DCLDE WAV output root (default: output/dclde-wavs).",
+    )
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] != "--validate-only"):
-        print_usage()
-        sys.exit(1)
-
-    run_download_wavs(validate_only=(len(sys.argv) == 2))
+    args = parse_args()
+    run_download_wavs(
+        validate_only=args.validate_only,
+        dclde_csv_path=args.dclde_manifest,
+        dclde_output_root=args.dclde_wav_root,
+    )
