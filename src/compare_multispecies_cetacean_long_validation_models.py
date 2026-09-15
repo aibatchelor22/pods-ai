@@ -24,6 +24,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -31,7 +32,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -75,6 +76,7 @@ class Recording:
     audio_source: str
     extraction_mode: str
     source_size_bytes: int
+    estimated_duration_sec: float
 
 
 @dataclass(frozen=True)
@@ -215,7 +217,96 @@ def apply_preprocessing_overrides(settings: dict[str, Any], args: argparse.Names
     return result
 
 
+def duration_from_audio_header(data: bytes) -> float | None:
+    """Read duration from a small WAV/RF64 or FLAC header without fetching the audio."""
+    if data.startswith(b"fLaC") and len(data) >= 42:
+        position = 4
+        while position + 4 <= len(data):
+            block_header = data[position : position + 4]
+            block_type = block_header[0] & 0x7F
+            block_length = int.from_bytes(block_header[1:4], "big")
+            position += 4
+            if position + block_length > len(data):
+                break
+            if block_type == 0 and block_length >= 18:
+                packed = int.from_bytes(data[position + 10 : position + 18], "big")
+                sample_rate = packed >> 44
+                total_samples = packed & ((1 << 36) - 1)
+                if sample_rate > 0 and total_samples > 0:
+                    return total_samples / float(sample_rate)
+            position += block_length
+
+    if len(data) >= 12 and data[:4] in {b"RIFF", b"RF64"} and data[8:12] == b"WAVE":
+        position = 12
+        byte_rate = 0
+        data_size: int | None = None
+        rf64_data_size: int | None = None
+        while position + 8 <= len(data):
+            chunk_id = data[position : position + 4]
+            chunk_size = int.from_bytes(data[position + 4 : position + 8], "little")
+            payload = position + 8
+            if chunk_id == b"ds64" and payload + 16 <= len(data):
+                rf64_data_size = int.from_bytes(data[payload + 8 : payload + 16], "little")
+            elif chunk_id == b"fmt " and payload + 12 <= len(data):
+                byte_rate = int.from_bytes(data[payload + 8 : payload + 12], "little")
+            elif chunk_id == b"data":
+                data_size = rf64_data_size if chunk_size == 0xFFFFFFFF else chunk_size
+                break
+            next_position = payload + chunk_size + (chunk_size % 2)
+            if next_position <= position or next_position > len(data):
+                break
+            position = next_position
+        if byte_rate > 0 and data_size is not None and data_size > 0:
+            return data_size / float(byte_rate)
+    return None
+
+
+def probe_recording_duration(recording: Recording, timeout_sec: float) -> float:
+    source = recording.audio_source
+    if not source.startswith(REMOTE_SCHEMES):
+        return float(sf.info(source).duration)
+    request = urllib.request.Request(
+        remote_download_url(source),
+        headers={
+            "User-Agent": "pods-ai-v2-long-evaluator/1.0",
+            "Range": "bytes=0-262143",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        data = response.read(262144)
+    duration = duration_from_audio_header(data)
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        raise ValueError("audio header did not expose a valid WAV/FLAC duration")
+    return duration
+
+
+def write_duration_cache(path: Path, values: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(values, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
 def load_recordings(args: argparse.Namespace) -> list[Recording]:
+    duration_by_id: dict[str, float] = defaultdict(float)
+    duration_by_triplet: dict[tuple[str, str, str], float] = defaultdict(float)
+    for row in read_rows(Path(args.annotations)):
+        try:
+            end_sec = float(row.get("FileEndSec", ""))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(end_sec) or end_sec <= 0:
+            continue
+        recording_id = clean(row.get("source_recording_id"))
+        if recording_id:
+            duration_by_id[recording_id] = max(duration_by_id[recording_id], end_sec)
+        triplet = (
+            clean(row.get("Provider")),
+            clean(row.get("Dataset")),
+            clean(row.get("Soundfile")),
+        )
+        duration_by_triplet[triplet] = max(duration_by_triplet[triplet], end_sec)
+
     rows = read_rows(Path(args.source_plan))
     modes = {item.casefold() for item in parse_csv_list(args.extraction_modes, str, "extraction modes")}
     selected: list[Recording] = []
@@ -235,15 +326,23 @@ def load_recordings(args: argparse.Namespace) -> list[Recording]:
             recording_id = "|".join(
                 (clean(row.get("Provider")), clean(row.get("Dataset")), clean(row.get("Soundfile")))
             )
+        provider = clean(row.get("Provider"))
+        dataset = clean(row.get("Dataset"))
+        soundfile = clean(row.get("Soundfile"))
+        estimated_duration_sec = duration_by_id.get(
+            recording_id,
+            duration_by_triplet.get((provider, dataset, soundfile), 0.0),
+        )
         selected.append(
             Recording(
                 recording_id=recording_id,
-                provider=clean(row.get("Provider")),
-                dataset=clean(row.get("Dataset")),
-                soundfile=clean(row.get("Soundfile")),
+                provider=provider,
+                dataset=dataset,
+                soundfile=soundfile,
                 audio_source=source,
                 extraction_mode=mode,
                 source_size_bytes=int(float(clean(row.get("source_size_bytes")) or 0)),
+                estimated_duration_sec=estimated_duration_sec,
             )
         )
     selected.sort(key=lambda item: (item.provider, item.dataset, item.soundfile))
@@ -252,7 +351,7 @@ def load_recordings(args: argparse.Namespace) -> list[Recording]:
             raise ValueError("--max-files must be positive")
         rng = random.Random(args.seed)
         sample_size = min(args.max_files, len(selected))
-        if args.max_files_sampling == "balanced":
+        if args.max_files_sampling in {"balanced", "balanced-duration"}:
             # Balance providers first, then rotate through datasets within each
             # provider. Small strata may exhaust early; remaining slots are
             # filled by the providers that still have eligible recordings.
@@ -272,26 +371,115 @@ def load_recordings(args: argparse.Namespace) -> list[Recording]:
                     rng.shuffle(strata[provider][dataset])
 
             sampled: list[Recording] = []
+            provider_seconds = Counter()
+            dataset_seconds = Counter()
+            duration_cache_path = (
+                Path(args.duration_cache)
+                if args.duration_cache
+                else Path(args.output_dir) / "recording_duration_cache.json"
+            )
+            duration_cache: dict[str, float] = {}
+            if args.max_files_sampling == "balanced-duration" and duration_cache_path.is_file():
+                duration_cache = {
+                    str(key): float(value)
+                    for key, value in json.loads(
+                        duration_cache_path.read_text(encoding="utf-8")
+                    ).items()
+                }
+            probed_count = 0
             while len(sampled) < sample_size:
-                added_this_round = False
-                for provider in providers:
-                    datasets = datasets_by_provider[provider]
-                    for _ in range(len(datasets)):
-                        position = dataset_positions[provider] % len(datasets)
-                        dataset_positions[provider] += 1
-                        bucket = strata[provider][datasets[position]]
-                        if bucket:
-                            sampled.append(bucket.pop())
-                            added_this_round = True
-                            break
-                    if len(sampled) >= sample_size:
-                        break
-                if not added_this_round:
+                available_providers = [
+                    provider
+                    for provider in providers
+                    if any(strata[provider][dataset] for dataset in datasets_by_provider[provider])
+                ]
+                if not available_providers:
                     break
+                if args.max_files_sampling == "balanced-duration":
+                    provider = min(
+                        available_providers,
+                        key=lambda item: (provider_seconds[item], providers.index(item)),
+                    )
+                    available_datasets = [
+                        dataset
+                        for dataset in datasets_by_provider[provider]
+                        if strata[provider][dataset]
+                    ]
+                    dataset = min(
+                        available_datasets,
+                        key=lambda item: (
+                            dataset_seconds[(provider, item)],
+                            datasets_by_provider[provider].index(item),
+                        ),
+                    )
+                    recording = strata[provider][dataset].pop()
+                    duration = duration_cache.get(recording.recording_id)
+                    if duration is None:
+                        try:
+                            duration = probe_recording_duration(
+                                recording, args.duration_probe_timeout_seconds
+                            )
+                            duration_cache[recording.recording_id] = duration
+                            probed_count += 1
+                            if probed_count % 10 == 0:
+                                write_duration_cache(duration_cache_path, duration_cache)
+                                print(
+                                    f"Probed {probed_count} recording durations for "
+                                    "duration-balanced sampling"
+                                )
+                        except Exception as error:
+                            duration = max(recording.estimated_duration_sec, args.window_sec)
+                            # Cache the deterministic fallback as well so a
+                            # resumed run cannot silently select a different set.
+                            duration_cache[recording.recording_id] = duration
+                            print(
+                                f"WARNING: duration probe failed for {recording.soundfile}; "
+                                f"using annotation-based estimate {duration:.1f}s: {error}",
+                                file=sys.stderr,
+                            )
+                    recording = replace(recording, estimated_duration_sec=duration)
+                    sampled.append(recording)
+                    cost = max(duration, args.window_sec)
+                    provider_seconds[provider] += cost
+                    dataset_seconds[(provider, dataset)] += cost
+                else:
+                    added_this_round = False
+                    for provider in providers:
+                        datasets = datasets_by_provider[provider]
+                        for _ in range(len(datasets)):
+                            position = dataset_positions[provider] % len(datasets)
+                            dataset_positions[provider] += 1
+                            bucket = strata[provider][datasets[position]]
+                            if bucket:
+                                sampled.append(bucket.pop())
+                                added_this_round = True
+                                break
+                        if len(sampled) >= sample_size:
+                            break
+                    if not added_this_round:
+                        break
+            if args.max_files_sampling == "balanced-duration" and duration_cache:
+                write_duration_cache(duration_cache_path, duration_cache)
             selected = sampled
         else:
             selected = rng.sample(selected, sample_size)
-        selected.sort(key=lambda item: (item.provider, item.dataset, item.soundfile))
+        # Keep the randomized/interleaved sampling order. Sorting by provider
+        # here made an interrupted run's completed prefix provider-skewed.
+    if args.max_audio_hours is not None:
+        budget_seconds = args.max_audio_hours * 3600.0
+        budgeted: list[Recording] = []
+        used_seconds = 0.0
+        for recording in selected:
+            duration = recording.estimated_duration_sec
+            if duration <= 0 or used_seconds + duration > budget_seconds:
+                continue
+            budgeted.append(recording)
+            used_seconds += duration
+        selected = budgeted
+        print(
+            f"Applied audio budget: selected {len(selected):,} recordings totaling "
+            f"{used_seconds / 3600.0:.3f} estimated hours (limit {args.max_audio_hours:g})"
+        )
     if not selected:
         raise ValueError(
             f"No recordings matched split={args.split!r}, extraction_modes={sorted(modes)}"
@@ -521,6 +709,10 @@ def load_bundles(args: argparse.Namespace, output_dir: Path) -> tuple[list[Model
         # existed while still preventing random/balanced cache reuse.
         if args.max_files_sampling != "random":
             metadata["max_files_sampling"] = args.max_files_sampling
+        if args.max_files_sampling == "balanced-duration":
+            metadata["selected_recordings_sha256"] = hashlib.sha256(
+                "\n".join(recording.recording_id for recording in recordings).encode("utf-8")
+            ).hexdigest()
         if metadata_path.is_file():
             previous = json.loads(metadata_path.read_text(encoding="utf-8"))
             if previous != metadata:
@@ -1147,11 +1339,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument(
         "--max-files-sampling",
-        choices=("random", "balanced"),
+        choices=("random", "balanced", "balanced-duration"),
         default="random",
         help=(
             "How --max-files selects recordings. 'random' preserves the legacy behavior; "
-            "'balanced' balances providers, then datasets within each provider."
+            "'balanced' balances recording counts across providers and datasets; "
+            "'balanced-duration' balances estimated audio time using each "
+            "recording's maximum annotation end time. Both balanced modes keep "
+            "an interleaved processing order so interrupted runs remain representative."
+        ),
+    )
+    parser.add_argument(
+        "--duration-cache",
+        default=None,
+        help=(
+            "JSON cache for lightweight audio-header duration probes used by "
+            "balanced-duration (default: OUTPUT_DIR/recording_duration_cache.json)."
+        ),
+    )
+    parser.add_argument(
+        "--duration-probe-timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Timeout for each remote audio-header duration probe (default: 30).",
+    )
+    parser.add_argument(
+        "--max-audio-hours",
+        type=float,
+        default=None,
+        help=(
+            "Optional total audio-duration budget. Requires --max-files-sampling "
+            "balanced-duration so durations are read from the audio headers."
         ),
     )
     parser.add_argument("--seed", type=int, default=401)
@@ -1202,6 +1420,16 @@ def validate_args(args: argparse.Namespace) -> None:
             raise FileNotFoundError(path)
     if args.batch_size < 1 or args.window_sec <= 0 or args.hop_sec <= 0:
         raise ValueError("Batch size, window seconds, and hop seconds must be positive")
+    if args.duration_probe_timeout_seconds <= 0:
+        raise ValueError("--duration-probe-timeout-seconds must be positive")
+    if args.max_audio_hours is not None:
+        if args.max_audio_hours <= 0:
+            raise ValueError("--max-audio-hours must be positive")
+        if args.max_files is None or args.max_files_sampling != "balanced-duration":
+            raise ValueError(
+                "--max-audio-hours requires --max-files and "
+                "--max-files-sampling balanced-duration"
+            )
     if args.minimum_support_windows < 1 or args.event_top_k < 1:
         raise ValueError("Support windows and event top-k must be positive")
     if args.support_radius_windows < 0 or args.maximum_gap_windows < 0 or args.peak_suppression_windows < 0:
@@ -1223,8 +1451,21 @@ def main() -> int:
     recordings = load_recordings(args)
     truth_by_recording = load_truth(Path(args.annotations), recordings)
     truth_counts = Counter(event.species for events in truth_by_recording.values() for event in events)
+    estimated_seconds_by_provider = Counter()
+    for recording in recordings:
+        estimated_seconds_by_provider[recording.provider] += max(
+            recording.estimated_duration_sec, args.window_sec
+        )
+    estimated_hours_by_provider = {
+        provider: round(seconds / 3600.0, 3)
+        for provider, seconds in sorted(estimated_seconds_by_provider.items())
+    }
     print(f"Selected local validation recordings: {len(recordings):,}")
     print(f"Selected providers: {dict(sorted(Counter(item.provider for item in recordings).items()))}")
+    print(
+        "Estimated selected audio hours by provider: "
+        f"{estimated_hours_by_provider}"
+    )
     print(
         "Selected provider/datasets: "
         f"{dict(sorted(Counter(f'{item.provider}/{item.dataset}' for item in recordings).items()))}"
