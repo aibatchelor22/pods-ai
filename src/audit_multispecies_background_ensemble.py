@@ -417,7 +417,7 @@ def run_cook_inlet(inventory: pd.DataFrame, args: argparse.Namespace) -> None:
     if not args.cook_inlet_checkpoint.is_file():
         raise FileNotFoundError(
             f"Cook Inlet checkpoint not found: {args.cook_inlet_checkpoint}. "
-            "Download the official binary best.ckpt checkpoint."
+            "Download the official binary.ckpt base checkpoint from Zenodo."
         )
     dataset = "multispecies_background_audit"
     command = [
@@ -443,18 +443,31 @@ def run_cook_inlet(inventory: pd.DataFrame, args: argparse.Namespace) -> None:
     score_col = next((c for c in raw if c.casefold() in {"probability", "score", "confidence"}), None)
     if audio_col is None or score_col is None:
         raise ValueError(f"Unexpected Cook Inlet output columns: {list(raw.columns)}")
-    file_to_clip = {
-        Path(str(row.staged_wav)).name: str(row.clip_id)
-        for row in inventory.itertuples(index=False)
-    }
+    file_to_clip: dict[str, str] = {}
+    for row in inventory.itertuples(index=False):
+        staged = Path(str(row.staged_wav))
+        clip_id = str(row.clip_id)
+        # Cook Inlet's CSV may contain either the original WAV filename or the
+        # reconstructed spectrogram stem with the WAV suffix removed.
+        file_to_clip[staged.name] = clip_id
+        file_to_clip[staged.stem] = clip_id
     raw["_name"] = raw[audio_col].astype(str).map(lambda value: Path(value).name)
     raw["clip_id"] = raw["_name"].map(file_to_clip)
+    missing = raw["clip_id"].isna()
+    if missing.any():
+        raw.loc[missing, "clip_id"] = raw.loc[missing, "_name"].map(
+            lambda value: file_to_clip.get(Path(str(value)).stem)
+        )
     raw = raw.dropna(subset=["clip_id"])
     result = (
         raw.groupby("clip_id", as_index=False)[score_col].max()
         .rename(columns={score_col: "cook_inlet_whale_score"})
     )
     atomic_csv(result, score_path)
+    print(
+        f"Cook Inlet score coverage: {len(result):,}/{len(inventory):,} clips "
+        f"({100.0 * len(result) / max(len(inventory), 1):.1f}%)"
+    )
 
 
 def parse_thresholds(values: Sequence[str]) -> dict[str, float]:
@@ -670,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--checkpoint-every", type=int, default=100)
     parser.add_argument("--cook-inlet-repo", type=Path, default=Path("/kaggle/working/CookInlet_Belugas"))
-    parser.add_argument("--cook-inlet-checkpoint", type=Path, default=Path("/kaggle/input/cook-inlet-belugas-checkpoints/binary/best.ckpt"))
+    parser.add_argument("--cook-inlet-checkpoint", type=Path, default=Path("/kaggle/input/cook-inlet-belugas-checkpoints/binary.ckpt"))
     parser.add_argument("--cook-inlet-temperature", type=float, default=3.0)
     parser.add_argument("--bacpipe-repo", type=Path, default=Path("/kaggle/working/bacpipe"))
     parser.add_argument("--orcahello-repo", type=Path, default=Path("/kaggle/working/aifororcas-livesystem"))
