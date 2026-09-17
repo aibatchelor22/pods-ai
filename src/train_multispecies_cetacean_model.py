@@ -905,6 +905,27 @@ def remote_row_reason(
     return ""
 
 
+def remote_background_reason(
+    row: dict[str, Any], manifest: Path, remote_recording_ids: set[str]
+) -> str:
+    """Identify questionable background derived from remote-mode recordings.
+
+    Original annotated remote clips are intentionally retained. Synthetic
+    mixtures are excluded only when their background recording was remote;
+    a remote annotated foreground donor remains eligible.
+    """
+    clip_kind = clean(row.get("clip_kind")).casefold()
+    source_id = clean(row.get("source_recording_id"))
+    if clip_kind == "background" and (
+        source_id in remote_recording_ids or direct_remote_reason(row, manifest)
+    ):
+        return "original_remote_background"
+    background_id = clean(row.get("background_source_recording_id"))
+    if background_id and background_id in remote_recording_ids:
+        return "synthetic_remote_background"
+    return ""
+
+
 def discover_rows(
     roots: list[Path],
     split: str,
@@ -916,13 +937,16 @@ def discover_rows(
     require_audit_coverage: bool,
     audit_usage: Counter[str],
     exclude_remote_data: bool = False,
+    exclude_remote_background: bool = False,
     remote_filter_usage: Counter[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[Path], list[Path]]:
     manifests = sorted({path.resolve() for root in roots for path in root.rglob(manifest_name)})
     if not manifests:
         raise FileNotFoundError(f"No {manifest_name} files found below: {roots}")
     remote_recording_ids = (
-        discover_remote_recording_ids(roots, manifests) if exclude_remote_data else set()
+        discover_remote_recording_ids(roots, manifests)
+        if exclude_remote_data or exclude_remote_background
+        else set()
     )
     rows: list[dict[str, Any]] = []
     used_manifests: list[Path] = []
@@ -950,6 +974,13 @@ def discover_rows(
                     continue
                 if exclude_remote_data:
                     reason = remote_row_reason(raw, manifest, remote_recording_ids)
+                    if reason:
+                        if remote_filter_usage is not None:
+                            remote_filter_usage[f"{split}:{reason}"] += 1
+                            remote_filter_usage[f"{split}:total"] += 1
+                        continue
+                elif exclude_remote_background:
+                    reason = remote_background_reason(raw, manifest, remote_recording_ids)
                     if reason:
                         if remote_filter_usage is not None:
                             remote_filter_usage[f"{split}:{reason}"] += 1
@@ -1843,6 +1874,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--exclude-remote-background",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Exclude original background clips sampled from remote_seek recordings "
+            "and synthetic mixtures using a remote background recording, while "
+            "retaining annotated remote clips and remote annotated foreground donors "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--overlap-audit-csv",
         type=Path,
         help="Optional annotation_id-keyed overlap sidecar used for per-head masking.",
@@ -2067,6 +2109,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.exclude_remote_data and args.exclude_remote_background:
+        raise ValueError(
+            "Choose either --exclude-remote-data or --exclude-remote-background, not both"
+        )
     set_seed(args.seed)
     roots = [Path(value).expanduser().resolve() for value in args.data_root]
     for root in roots:
@@ -2102,6 +2148,7 @@ def main() -> int:
         args.require_overlap_audit_coverage,
         audit_usage,
         args.exclude_remote_data,
+        args.exclude_remote_background,
         remote_filter_usage,
     )
     val_rows, val_manifests, val_archives = discover_rows(
@@ -2115,6 +2162,7 @@ def main() -> int:
         args.require_overlap_audit_coverage,
         audit_usage,
         args.exclude_remote_data,
+        args.exclude_remote_background,
         remote_filter_usage,
     )
     train_rows = random_subset(train_rows, args.max_train_files, args.seed)
@@ -2127,8 +2175,9 @@ def main() -> int:
     )
     print_data_provenance("Training", train_provenance)
     print_data_provenance("Validation", val_provenance)
-    if args.exclude_remote_data:
-        print("\nRemote-data exclusion enabled")
+    if args.exclude_remote_data or args.exclude_remote_background:
+        label = "Remote-data" if args.exclude_remote_data else "Remote-background"
+        print(f"\n{label} exclusion enabled")
         print(f"  Excluded rows: {dict(sorted(remote_filter_usage.items()))}")
         (output_dir / "remote_data_exclusions.json").write_text(
             json.dumps(dict(sorted(remote_filter_usage.items())), indent=2),
@@ -2406,6 +2455,7 @@ def main() -> int:
         "training_domain_count": len(train_domain_counts),
         "input_data_provenance": input_provenance,
         "exclude_remote_data": args.exclude_remote_data,
+        "exclude_remote_background": args.exclude_remote_background,
         "remote_data_exclusions": dict(sorted(remote_filter_usage.items())),
         "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
