@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -653,7 +653,11 @@ def commit_partial_csv(partial: Path, destination: Path) -> None:
     partial.unlink()
 
 
-def load_bundles(args: argparse.Namespace, output_dir: Path) -> tuple[list[ModelBundle], Any]:
+def load_bundles(
+    args: argparse.Namespace,
+    output_dir: Path,
+    recordings: Sequence[Recording],
+) -> tuple[list[ModelBundle], Any]:
     devices = [item.strip() for item in args.model_devices.split(",") if item.strip()]
     if not devices:
         devices = [args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")]
@@ -1471,7 +1475,7 @@ def main() -> int:
         f"{dict(sorted(Counter(f'{item.provider}/{item.dataset}' for item in recordings).items()))}"
     )
     print(f"Ground-truth events: {dict(truth_counts)}")
-    bundles, extractor = load_bundles(args, output_dir)
+    bundles, extractor = load_bundles(args, output_dir, recordings)
     timings = infer_recordings(args, recordings, bundles, extractor)
     (output_dir / "inference_timings.json").write_text(json.dumps(timings, indent=2), encoding="utf-8")
 
