@@ -1095,6 +1095,30 @@ def discover_rows(
     return rows, used_manifests, sorted(archives)
 
 
+def load_training_clip_exclusions(paths: Collection[Path]) -> set[str]:
+    """Load clip IDs from CSV sidecars or one-ID-per-line text files."""
+    excluded: set[str] = set()
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Training clip exclusion file not found: {resolved}")
+        if resolved.suffix.casefold() == ".csv":
+            with resolved.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if "clip_id" not in (reader.fieldnames or []):
+                    raise ValueError(f"{resolved} must contain a clip_id column")
+                excluded.update(
+                    clip_id for row in reader
+                    if (clip_id := clean(row.get("clip_id")))
+                )
+        else:
+            excluded.update(
+                value for line in resolved.read_text(encoding="utf-8-sig").splitlines()
+                if (value := clean(line)) and not value.startswith("#")
+            )
+    return excluded
+
+
 def random_subset(rows: list[dict[str, Any]], maximum: int | None, seed: int) -> list[dict[str, Any]]:
     if maximum is None or maximum >= len(rows):
         return rows
@@ -1865,6 +1889,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest-name", default="multispecies_cetacean_manifest.csv")
     parser.add_argument(
+        "--exclude-training-clips-csv",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "CSV containing a clip_id column (or one-ID-per-line text file) whose "
+            "matching rows are excluded from the training split only; repeatable."
+        ),
+    )
+    parser.add_argument(
         "--exclude-remote-data",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2165,6 +2199,35 @@ def main() -> int:
         args.exclude_remote_background,
         remote_filter_usage,
     )
+    excluded_training_ids = load_training_clip_exclusions(args.exclude_training_clips_csv)
+    matched_training_exclusions: set[str] = set()
+    if excluded_training_ids:
+        before = len(train_rows)
+        matched_training_exclusions = {
+            str(row["clip_id"]) for row in train_rows
+            if str(row["clip_id"]) in excluded_training_ids
+        }
+        train_rows = [
+            row for row in train_rows
+            if str(row["clip_id"]) not in excluded_training_ids
+        ]
+        if not train_rows:
+            raise ValueError("Training clip exclusions removed every training row")
+        print("\nTraining clip-ID exclusion enabled")
+        print(f"  Requested unique IDs: {len(excluded_training_ids):,}")
+        print(f"  Matched training rows: {len(matched_training_exclusions):,}")
+        print(f"  Unmatched IDs:         {len(excluded_training_ids - matched_training_exclusions):,}")
+        print(f"  Remaining train rows:  {len(train_rows):,} (from {before:,})")
+        exclusion_report = pd.DataFrame(
+            {
+                "clip_id": sorted(excluded_training_ids),
+                "matched_training_row": [
+                    clip_id in matched_training_exclusions
+                    for clip_id in sorted(excluded_training_ids)
+                ],
+            }
+        )
+        exclusion_report.to_csv(output_dir / "training_clip_exclusions.csv", index=False)
     train_rows = random_subset(train_rows, args.max_train_files, args.seed)
     val_rows = random_subset(val_rows, args.max_val_files, args.seed + 1)
     train_provenance = data_provenance(train_rows, "train")
@@ -2457,6 +2520,12 @@ def main() -> int:
         "exclude_remote_data": args.exclude_remote_data,
         "exclude_remote_background": args.exclude_remote_background,
         "remote_data_exclusions": dict(sorted(remote_filter_usage.items())),
+        "training_clip_exclusion_files": [
+            file_identity(path.expanduser().resolve())
+            for path in args.exclude_training_clips_csv
+        ],
+        "training_clip_exclusions_requested": len(excluded_training_ids),
+        "training_clip_exclusions_matched": len(matched_training_exclusions),
         "overlap_audit_usage": dict(sorted(audit_usage.items())),
         "preprocessing": preprocessing,
         "training_augmentation": {
