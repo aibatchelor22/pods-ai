@@ -1689,13 +1689,19 @@ def evaluate_audio_model(
 def ordered_dataset_hash(dataset: ArchiveManifestDataset) -> str:
     digest = hashlib.sha256()
     for row in dataset.rows:
+        domain_size_value = clean(row.get("domain_size"))
+        event_group_size_value = clean(row.get("event_group_size"))
         signature = {
             "clip_id": clean(row.get("clip_id")),
             "trigger_label": int(row["trigger_label"]),
             "source_label": int(row["source_label"]),
             "ecotype_label": int(row["ecotype_label"]),
-            "event_group_size": int(row["event_group_size"]),
-            "domain_size": int(row["domain_size"]),
+            "event_group_size": (
+                int(event_group_size_value) if event_group_size_value else None
+            ),
+            # Validation rows are not sampled and therefore do not carry this
+            # training-only field.
+            "domain_size": int(domain_size_value) if domain_size_value else None,
         }
         digest.update(
             json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
