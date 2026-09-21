@@ -104,6 +104,14 @@ def atomic_json(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def atomic_torch_save(path: Path, payload: object) -> None:
+    """Atomically replace a PyTorch checkpoint after serialization succeeds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
 class ArchiveManifestDataset(Dataset):
     """Manifest metadata for clips stored as members of shard ZIP archives."""
 
@@ -1678,6 +1686,56 @@ def evaluate_audio_model(
     return metrics, predictions, labels
 
 
+def ordered_dataset_hash(dataset: ArchiveManifestDataset) -> str:
+    digest = hashlib.sha256()
+    for row in dataset.rows:
+        signature = {
+            "clip_id": clean(row.get("clip_id")),
+            "trigger_label": int(row["trigger_label"]),
+            "source_label": int(row["source_label"]),
+            "ecotype_label": int(row["ecotype_label"]),
+            "event_group_size": int(row["event_group_size"]),
+            "domain_size": int(row["domain_size"]),
+        }
+        digest.update(
+            json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def resolve_training_state_path(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if resolved.is_dir():
+        resolved = resolved / "training_state_last.pt"
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Training state not found: {resolved}")
+    return resolved
+
+
+def move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer, device: torch.device
+) -> None:
+    for state in optimizer.state.values():
+        for name, value in state.items():
+            if torch.is_tensor(value):
+                state[name] = value.to(device)
+
+
+def load_training_state(path: Path) -> dict[str, object]:
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Training state is not a dictionary: {path}")
+    if state.get("format") != "multispecies_cetacean_training_state_v1":
+        raise RuntimeError(
+            f"Unsupported training-state format in {path}: {state.get('format')!r}"
+        )
+    return state
+
+
 def train_audio_model(
     args: argparse.Namespace,
     model: MultispeciesCetaceanModel,
@@ -1687,6 +1745,7 @@ def train_audio_model(
     validation_collator: ArchiveAudioCollator,
     weight_values: dict[str, list[float] | None],
     device: torch.device,
+    output_dir: Path,
 ) -> tuple[dict[str, torch.Tensor], pd.DataFrame, dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]]:
     sampler = training_sampler(
         (row["event_group_size"] for row in train_dataset.rows),
@@ -1695,16 +1754,21 @@ def train_audio_model(
         args.domain_balanced_sampling,
         args.seed,
     )
+    loader_generator = torch.Generator().manual_seed(args.seed)
+    sampler_generator = sampler.generator if sampler is not None else None
+    resumable = bool(args.save_training_state or args.resume_training_state)
     loader = DataLoader(
         train_dataset,
         batch_size=args.embedding_batch_size,
         shuffle=sampler is None,
         sampler=sampler,
-        generator=torch.Generator().manual_seed(args.seed) if sampler is None else None,
+        generator=loader_generator,
         collate_fn=train_collator,
         num_workers=args.preprocessing_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=args.preprocessing_workers > 0,
+        # Recreating workers each epoch makes their random augmentation seeds
+        # reproducible across a process boundary when a run is resumed.
+        persistent_workers=args.preprocessing_workers > 0 and not resumable,
     )
     model.to(device)
     training_model: nn.Module = model
@@ -1742,12 +1806,127 @@ def train_audio_model(
     )
     weights = {name: weight_tensor(value, device) for name, value in weight_values.items()}
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    state_signature = {
+        "total_epochs": int(args.epochs),
+        "updates_per_epoch": int(updates_per_epoch),
+        "total_updates": int(total_updates),
+        "train_clip_count": int(len(train_dataset)),
+        "train_dataset_hash": ordered_dataset_hash(train_dataset),
+        "validation_clip_count": int(len(val_dataset)),
+        "validation_dataset_hash": ordered_dataset_hash(val_dataset),
+        "embedding_batch_size": int(args.embedding_batch_size),
+        "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "lr_scheduler_type": str(args.lr_scheduler_type),
+        "warmup_ratio": float(args.warmup_ratio),
+        "learning_rate": float(args.learning_rate),
+        "backbone_learning_rate": float(args.backbone_learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "dropout": float(args.dropout),
+        "max_grad_norm": float(args.max_grad_norm),
+        "early_stopping_patience": int(args.early_stopping_patience),
+        "seed": int(args.seed),
+        "event_group_sampling": str(args.event_group_sampling),
+        "domain_balanced_sampling": str(args.domain_balanced_sampling),
+        "loss_weights": {
+            "trigger": float(args.trigger_loss_weight),
+            "source": float(args.source_loss_weight),
+            "ecotype": float(args.ecotype_loss_weight),
+        },
+        "class_weights": weight_values,
+        "preprocessing": {
+            "clip_seconds": float(args.clip_seconds),
+            "mean_subtract_argument": args.mean_subtract,
+            "high_pass_filter_argument": args.high_pass_filter,
+            "high_pass_cutoff_hz_argument": args.high_pass_cutoff_hz,
+            "high_pass_order_argument": args.high_pass_order,
+        },
+        "augmentation": {
+            "random_gain": bool(args.random_gain),
+            "random_gain_prob": float(args.random_gain_prob),
+            "gain_db": float(args.gain_db),
+            "gain_clipping_mode": str(args.gain_clipping_mode),
+            "time_shift": bool(args.time_shift),
+            "time_shift_prob": float(args.time_shift_prob),
+            "max_shift_ms": float(args.max_shift_ms),
+            "time_shift_fade_ms": float(args.time_shift_fade_ms),
+            "filteraugment": bool(args.filteraugment),
+            "filteraugment_prob": float(args.filteraugment_prob),
+            "filteraugment_mode": str(args.filteraugment_mode),
+            "filteraugment_num_bands_min": int(args.filteraugment_num_bands_min),
+            "filteraugment_num_bands_max": int(args.filteraugment_num_bands_max),
+            "filteraugment_gain_db_min": float(args.filteraugment_gain_db_min),
+            "filteraugment_gain_db_max": float(args.filteraugment_gain_db_max),
+            "filteraugment_min_bandwidth_bins": int(
+                args.filteraugment_min_bandwidth_bins
+            ),
+        },
+    }
     best_score = -math.inf
     best_state: dict[str, torch.Tensor] = {}
     best_evaluation: tuple[dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]] | None = None
     history: list[dict[str, float]] = []
     stale = 0
-    for epoch in range(1, args.epochs + 1):
+    completed_epochs = 0
+    if args.resume_training_state:
+        resume_path = resolve_training_state_path(args.resume_training_state)
+        saved = load_training_state(resume_path)
+        saved_signature = saved.get("signature")
+        if saved_signature != state_signature:
+            mismatches: list[str] = []
+            saved_signature_dict = saved_signature if isinstance(saved_signature, dict) else {}
+            for name in sorted(set(state_signature) | set(saved_signature_dict)):
+                expected = saved_signature_dict.get(name, "<missing>")
+                actual = state_signature.get(name, "<missing>")
+                if expected != actual:
+                    mismatches.append(f"  {name}: saved={expected!r}, current={actual!r}")
+            raise RuntimeError(
+                "Resume settings/data do not match the saved training state:\n"
+                + "\n".join(mismatches)
+            )
+        model.load_state_dict(saved["model_state"], strict=True)
+        optimizer.load_state_dict(saved["optimizer_state"])
+        move_optimizer_state_to_device(optimizer, device)
+        scheduler.load_state_dict(saved["scheduler_state"])
+        scaler.load_state_dict(saved["scaler_state"])
+        completed_epochs = int(saved["completed_epochs"])
+        best_score = float(saved["best_score"])
+        best_state = saved["best_state"]
+        best_evaluation = saved["best_evaluation"]
+        history = list(saved["history"])
+        stale = int(saved["stale"])
+        random.setstate(saved["python_random_state"])
+        np.random.set_state(saved["numpy_random_state"])
+        torch.set_rng_state(saved["torch_random_state"])
+        if device.type == "cuda" and saved.get("cuda_random_states") is not None:
+            torch.cuda.set_rng_state_all(saved["cuda_random_states"])
+        loader_generator.set_state(saved["loader_generator_state"])
+        if sampler_generator is not None:
+            sampler_state = saved.get("sampler_generator_state")
+            if sampler_state is None:
+                raise RuntimeError("Saved state is missing the sampler generator state")
+            sampler_generator.set_state(sampler_state)
+        print(
+            f"Resumed exact training state from {resume_path}: "
+            f"{completed_epochs}/{args.epochs} epochs complete; "
+            f"current learning rates={scheduler.get_last_lr()}"
+        )
+    if completed_epochs >= args.epochs:
+        raise RuntimeError(
+            f"Training state already completed {completed_epochs} epochs, "
+            f"which meets --epochs {args.epochs}"
+        )
+    remaining_epochs = args.epochs - completed_epochs
+    epochs_this_run = (
+        remaining_epochs
+        if args.max_epochs_this_run is None
+        else min(remaining_epochs, args.max_epochs_this_run)
+    )
+    final_epoch_this_run = completed_epochs + epochs_this_run
+    print(
+        f"Global schedule: {args.epochs} epochs; this process will run epochs "
+        f"{completed_epochs + 1}-{final_epoch_this_run}."
+    )
+    for epoch in range(completed_epochs + 1, final_epoch_this_run + 1):
         training_model.train()
         epoch_started = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
@@ -1826,9 +2005,47 @@ def train_audio_model(
             stale = 0
         else:
             stale += 1
-            if args.early_stopping_patience and stale >= args.early_stopping_patience:
-                print(f"Early stopping after {stale} non-improving epochs")
-                break
+        should_stop = bool(
+            args.early_stopping_patience and stale >= args.early_stopping_patience
+        )
+        if resumable:
+            training_state_path = output_dir / "training_state_last.pt"
+            atomic_torch_save(
+                training_state_path,
+                {
+                    "format": "multispecies_cetacean_training_state_v1",
+                    "signature": state_signature,
+                    "completed_epochs": int(epoch),
+                    "model_state": {
+                        name: value.detach().cpu().clone()
+                        for name, value in model.state_dict().items()
+                    },
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict(),
+                    "best_score": float(best_score),
+                    "best_state": best_state,
+                    "best_evaluation": best_evaluation,
+                    "history": history,
+                    "stale": int(stale),
+                    "python_random_state": random.getstate(),
+                    "numpy_random_state": np.random.get_state(),
+                    "torch_random_state": torch.get_rng_state(),
+                    "cuda_random_states": (
+                        torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+                    ),
+                    "loader_generator_state": loader_generator.get_state(),
+                    "sampler_generator_state": (
+                        sampler_generator.get_state()
+                        if sampler_generator is not None
+                        else None
+                    ),
+                },
+            )
+            print(f"Saved resumable training state: {training_state_path}")
+        if should_stop:
+            print(f"Early stopping after {stale} non-improving epochs")
+            break
     if not best_state or best_evaluation is None:
         raise RuntimeError("No best full-model checkpoint was selected")
     return best_state, pd.DataFrame(history), *best_evaluation
@@ -1972,7 +2189,41 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="/kaggle/working/multispecies_cetacean_model",
     )
-    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=12,
+        help=(
+            "Total epochs in the global learning-rate schedule. When splitting a "
+            "run across sessions, keep this value unchanged in every session."
+        ),
+    )
+    parser.add_argument(
+        "--max-epochs-this-run",
+        type=int,
+        help=(
+            "Optional cap on epochs executed in this process. For example, use "
+            "--epochs 7 --max-epochs-this-run 4, then resume to run epochs 5-7."
+        ),
+    )
+    parser.add_argument(
+        "--save-training-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Save output-dir/training_state_last.pt after every full-model epoch. "
+            "The rolling checkpoint includes current/best model weights, optimizer, "
+            "scheduler, AMP scaler, history, and random-generator states."
+        ),
+    )
+    parser.add_argument(
+        "--resume-training-state",
+        type=Path,
+        help=(
+            "Resume full-model training from training_state_last.pt. A directory is "
+            "accepted and resolves to its training_state_last.pt file."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--backbone-learning-rate", type=float, default=1e-6)
     parser.add_argument("--ecotype-learning-rate", type=float, default=1e-4)
@@ -2138,6 +2389,15 @@ def parse_args() -> argparse.Namespace:
             "stochastic waveform/feature augmentation is unavailable with --freeze-backbone "
             "because each clip is embedded only once"
         )
+    if args.epochs < 1:
+        parser.error("--epochs must be positive")
+    if args.max_epochs_this_run is not None and args.max_epochs_this_run < 1:
+        parser.error("--max-epochs-this-run must be positive")
+    if args.freeze_backbone and (args.save_training_state or args.resume_training_state):
+        parser.error(
+            "resumable optimizer/scheduler state is currently supported only for "
+            "full-model training without --freeze-backbone"
+        )
     return args
 
 
@@ -2146,6 +2406,21 @@ def main() -> int:
     if args.exclude_remote_data and args.exclude_remote_background:
         raise ValueError(
             "Choose either --exclude-remote-data or --exclude-remote-background, not both"
+        )
+    if args.resume_training_state is not None:
+        args.resume_training_state = resolve_training_state_path(
+            args.resume_training_state
+        )
+        args.save_training_state = True
+    if (
+        args.max_epochs_this_run is not None
+        and args.max_epochs_this_run < args.epochs
+        and not args.save_training_state
+    ):
+        args.save_training_state = True
+        print(
+            "Enabled --save-training-state automatically because this process "
+            "is capped before the global schedule ends."
         )
     set_seed(args.seed)
     roots = [Path(value).expanduser().resolve() for value in args.data_root]
@@ -2449,6 +2724,7 @@ def main() -> int:
             validation_collator,
             weights,
             device,
+            output_dir,
         )
         model.load_state_dict(full_state)
         model.to("cpu")
@@ -2498,6 +2774,21 @@ def main() -> int:
         "standalone": True,
         "base_model": args.model_name,
         "base_checkpoint_identity": checkpoint_identity,
+        "total_training_epochs": args.epochs,
+        "max_epochs_this_run": args.max_epochs_this_run,
+        "completed_training_epochs": (
+            int(history["epoch"].max()) if not history.empty else 0
+        ),
+        "resumed_training_state": (
+            file_identity(args.resume_training_state)
+            if args.resume_training_state is not None
+            else None
+        ),
+        "saved_training_state": (
+            file_identity(output_dir / "training_state_last.pt")
+            if (output_dir / "training_state_last.pt").is_file()
+            else None
+        ),
         "backbone_frozen": args.freeze_backbone,
         "multi_gpu_requested": args.multi_gpu,
         "visible_cuda_gpus": torch.cuda.device_count(),
