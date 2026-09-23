@@ -95,16 +95,37 @@ def stratified_sample(
     rows: list[dict[str, Any]], samples_per_group_label: int, seed: int
 ) -> list[dict[str, Any]]:
     rng = random.Random(seed)
-    strata: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    strata: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        strata[(row["audit_group"], row["source_class"])].append(row)
+        strata[
+            (
+                row["audit_group"],
+                row["source_class"],
+                clean(row.get("clip_kind")).casefold() or "<missing>",
+            )
+        ].append(row)
     selected: list[dict[str, Any]] = []
-    for key in sorted(strata):
-        values = strata[key]
-        rng.shuffle(values)
-        chosen = values[: min(samples_per_group_label, len(values))]
-        selected.extend(chosen)
-        print(f"Selected {len(chosen):,}/{len(values):,} clips for {key[0]}/{key[1]}")
+    label_kinds = sorted({(key[1], key[2]) for key in strata})
+    for label, kind in label_kinds:
+        local = strata.get(("local", label, kind), [])
+        remote = strata.get(("remote", label, kind), [])
+        if not local or not remote:
+            print(
+                f"Skipped unmatched stratum {label}/{kind}: "
+                f"local={len(local):,}, remote={len(remote):,}"
+            )
+            continue
+        rng.shuffle(local)
+        rng.shuffle(remote)
+        count = min(samples_per_group_label, len(local), len(remote))
+        selected.extend(local[:count])
+        selected.extend(remote[:count])
+        print(
+            f"Selected {count:,} local + {count:,} remote clips for "
+            f"{label}/{kind} (available local={len(local):,}, remote={len(remote):,})"
+        )
+    if not selected:
+        raise ValueError("No source-class/clip-kind strata occur in both local and remote data")
     rng.shuffle(selected)
     return selected
 
