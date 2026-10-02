@@ -9,7 +9,9 @@ inside the annotation time/frequency rectangle. The ``annotation_rectangle``
 method instead preserves the complete softened annotation rectangle, matching
 the earlier controlled-background experiment. The isolated foreground is
 placed in a background clip from another recording and scaled to a random,
-band-limited SNR.
+band-limited SNR. Remote-seek clips can be controlled independently for the
+foreground donor and ambient-background roles, allowing remote annotated
+vocalizations to be mixed exclusively with local backgrounds.
 
 Output is a standalone Kaggle-dataset directory containing a generated-only
 trainer manifest and lossless 16 kHz FLAC files.  Do not concatenate the input
@@ -405,8 +407,8 @@ def discover_rows(roots: list[Path], manifest_name: str) -> tuple[pd.DataFrame, 
     return result, manifests
 
 
-def exclude_remote_rows(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Remove remote-seek rows identified by metadata or shard location."""
+def remote_row_mask(frame: pd.DataFrame) -> pd.Series:
+    """Identify remote-seek rows from extraction metadata or shard location."""
     remote = pd.Series(False, index=frame.index)
     if "extraction_mode" in frame:
         remote |= frame["extraction_mode"].fillna("").astype(str).str.casefold().eq(
@@ -424,6 +426,12 @@ def exclude_remote_rows(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     for column in ("donor_source_recording_id", "background_source_recording_id"):
         if column in frame and remote_recordings:
             remote |= frame[column].fillna("").astype(str).isin(remote_recordings)
+    return remote
+
+
+def exclude_remote_rows(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove remote-seek rows identified by metadata or shard location."""
+    remote = remote_row_mask(frame)
     excluded = int(remote.sum())
     return frame.loc[~remote].reset_index(drop=True), excluded
 
@@ -507,10 +515,12 @@ def output_row(
         "donor_source_recording_id": clean(donor.get("source_recording_id")),
         "donor_provider": clean(donor.get("Provider")),
         "donor_dataset": clean(donor.get("Dataset")),
+        "donor_is_remote": bool(donor.get("_is_remote", False)),
         "background_clip_id": clean(background.get("clip_id")),
         "background_source_recording_id": clean(background.get("source_recording_id")),
         "background_provider": clean(background.get("Provider")),
         "background_dataset": clean(background.get("Dataset")),
+        "background_is_remote": bool(background.get("_is_remote", False)),
         "signal_band_rms_before_gain": metrics["signal_band_rms"],
         "background_band_rms": metrics["background_band_rms"],
     }
@@ -630,7 +640,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--exclude-remote-data",
         action="store_true",
-        help="Exclude remote-seek shards/recordings from donors and backgrounds.",
+        help=(
+            "Exclude remote-seek shards/recordings from both donors and backgrounds. "
+            "Equivalent to using both role-specific exclusion flags."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-remote-donors",
+        action="store_true",
+        help="Exclude remote-seek annotated clips from the foreground donor pool only.",
+    )
+    parser.add_argument(
+        "--exclude-remote-backgrounds",
+        action="store_true",
+        help="Exclude remote-seek ambient clips from the background pool only.",
     )
     parser.add_argument("--kaggle-dataset-id", default=DEFAULT_DATASET_ID)
     parser.add_argument("--kaggle-title", default="Multispecies Cetacean PCA Vocalization Mixtures")
@@ -682,6 +705,12 @@ def main() -> int:
             raise ValueError("--max-input-rows must be positive")
         frame = frame.sample(n=min(args.max_input_rows, len(frame)), random_state=args.seed).reset_index(drop=True)
 
+    # Preserve the storage/extraction role in generated manifests so remote
+    # donor and background participation can be audited directly.
+    frame["_is_remote"] = remote_row_mask(frame)
+    exclude_remote_donors = args.exclude_remote_data or args.exclude_remote_donors
+    exclude_remote_backgrounds = args.exclude_remote_data or args.exclude_remote_backgrounds
+
     labels = comma_values(args.donor_labels)
     invalid = set(labels) - VALID_SOURCE_LABELS
     if invalid:
@@ -711,11 +740,33 @@ def main() -> int:
             axis=1,
         )
         donor_mask &= safe & kw_safe
+    excluded_remote_donor_rows = int((donor_mask & frame["_is_remote"]).sum()) if exclude_remote_donors else 0
+    if exclude_remote_donors:
+        donor_mask &= ~frame["_is_remote"]
     donors = {label: frame.loc[donor_mask & frame["model_source_label"].eq(label)].copy() for label in labels}
-    backgrounds = frame.loc[
+    remote_donor_counts = {
+        label: int(donors[label]["_is_remote"].sum()) for label in labels
+    }
+    background_mask = (
         frame["clip_kind"].fillna("").astype(str).str.casefold().eq("background")
         & frame["model_source_label"].eq("Abiotic")
-    ].copy()
+    )
+    excluded_remote_background_rows = (
+        int((background_mask & frame["_is_remote"]).sum()) if exclude_remote_backgrounds else 0
+    )
+    if exclude_remote_backgrounds:
+        background_mask &= ~frame["_is_remote"]
+    backgrounds = frame.loc[background_mask].copy()
+    remote_background_count = int(backgrounds["_is_remote"].sum())
+    if exclude_remote_donors:
+        print(f"Excluded remote donor rows:      {excluded_remote_donor_rows:,}")
+    if exclude_remote_backgrounds:
+        print(f"Excluded remote background rows: {excluded_remote_background_rows:,}")
+    print(
+        "Eligible remote donors: "
+        + ", ".join(f"{label}={remote_donor_counts[label]:,}" for label in labels)
+    )
+    print(f"Eligible remote backgrounds: {remote_background_count:,}")
     if backgrounds.empty:
         raise ValueError("No ambient training backgrounds (clip_kind=background) were found")
     for label, count in counts.items():
@@ -872,15 +923,23 @@ def main() -> int:
         "input_manifests": [str(path) for path in manifests],
         "input_training_rows": len(frame),
         "exclude_remote_data": args.exclude_remote_data,
+        "exclude_remote_donors": exclude_remote_donors,
+        "exclude_remote_backgrounds": exclude_remote_backgrounds,
         "excluded_remote_rows": excluded_remote_rows,
+        "excluded_remote_donor_rows": excluded_remote_donor_rows,
+        "excluded_remote_background_rows": excluded_remote_background_rows,
         "eligible_donors": {label: len(donors[label]) for label in labels},
+        "eligible_remote_donors": remote_donor_counts,
         "ambient_backgrounds": len(backgrounds),
+        "ambient_remote_backgrounds": remote_background_count,
         "requested_label_counts": counts,
         "saved_label_counts": dict(Counter(clean(row.get("model_source_label")) for row in rows)),
         "donor_provider_counts": dict(Counter(clean(row.get("donor_provider")) for row in rows)),
         "background_provider_counts": dict(Counter(clean(row.get("background_provider")) for row in rows)),
         "donor_dataset_counts": dict(Counter(clean(row.get("donor_dataset")) for row in rows)),
         "background_dataset_counts": dict(Counter(clean(row.get("background_dataset")) for row in rows)),
+        "remote_donor_mixtures": sum(bool(row.get("donor_is_remote")) for row in rows),
+        "remote_background_mixtures": sum(bool(row.get("background_is_remote")) for row in rows),
         "unique_donor_recordings": len({clean(row.get("donor_source_recording_id")) for row in rows}),
         "unique_background_recordings": len({clean(row.get("background_source_recording_id")) for row in rows}),
         "saved_total": len(rows),
