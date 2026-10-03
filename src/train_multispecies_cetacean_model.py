@@ -1951,21 +1951,6 @@ def train_audio_model(
             "high_pass_filter_argument": args.high_pass_filter,
             "high_pass_cutoff_hz_argument": args.high_pass_cutoff_hz,
             "high_pass_order_argument": args.high_pass_order,
-            "level_normalization_argument": args.level_normalization,
-            "level_normalization_mode_argument": args.level_normalization_mode,
-            "target_active_rms_dbfs_argument": args.target_active_rms_dbfs,
-            "level_normalization_max_gain_db_argument": (
-                args.level_normalization_max_gain_db
-            ),
-            "level_normalization_max_attenuation_db_argument": (
-                args.level_normalization_max_attenuation_db
-            ),
-            "level_normalization_floor_dbfs_argument": (
-                args.level_normalization_floor_dbfs
-            ),
-            "level_normalization_active_percentile_argument": (
-                args.level_normalization_active_percentile
-            ),
         },
         "augmentation": {
             "random_gain": bool(args.random_gain),
@@ -1988,6 +1973,28 @@ def train_audio_model(
             ),
         },
     }
+    level_normalization_signature = {
+        "level_normalization_argument": args.level_normalization,
+        "level_normalization_mode_argument": args.level_normalization_mode,
+        "target_active_rms_dbfs_argument": args.target_active_rms_dbfs,
+        "level_normalization_max_gain_db_argument": (
+            args.level_normalization_max_gain_db
+        ),
+        "level_normalization_max_attenuation_db_argument": (
+            args.level_normalization_max_attenuation_db
+        ),
+        "level_normalization_floor_dbfs_argument": (
+            args.level_normalization_floor_dbfs
+        ),
+        "level_normalization_active_percentile_argument": (
+            args.level_normalization_active_percentile
+        ),
+    }
+    # Preserve exact compatibility with training states created before level
+    # normalization was added. New fields become part of the signature only
+    # when the user explicitly configures this preprocessing step.
+    if any(value is not None for value in level_normalization_signature.values()):
+        state_signature["preprocessing"].update(level_normalization_signature)
     best_score = -math.inf
     best_state: dict[str, torch.Tensor] = {}
     best_evaluation: tuple[dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]] | None = None
