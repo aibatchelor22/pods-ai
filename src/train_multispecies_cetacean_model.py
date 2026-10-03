@@ -197,6 +197,71 @@ class WaveformAugmenter:
         return np.clip(output, -1.0, 1.0).astype(np.float32, copy=False)
 
 
+class ActiveRmsNormalizer:
+    """Apply bounded, robust waveform-level normalization.
+
+    Level is estimated from the loudest fraction of short-time RMS frames so
+    silence does not dominate the estimate. Nearly silent clips are left
+    unchanged, and gain/attenuation are bounded to avoid extreme corrections.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        target_dbfs: float = -45.0,
+        max_gain_db: float = 12.0,
+        max_attenuation_db: float = 12.0,
+        floor_dbfs: float = -70.0,
+        active_percentile: float = 80.0,
+    ) -> None:
+        self.target_dbfs = target_dbfs
+        self.max_gain_db = max_gain_db
+        self.max_attenuation_db = max_attenuation_db
+        self.floor_dbfs = floor_dbfs
+        self.active_percentile = active_percentile
+        self.frame_samples = max(1, round(sample_rate * 0.025))
+        self.hop_samples = max(1, round(sample_rate * 0.010))
+
+    def active_rms(self, audio: np.ndarray) -> float:
+        if audio.size == 0:
+            return 0.0
+        if len(audio) < self.frame_samples:
+            return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+        starts = np.arange(0, len(audio) - self.frame_samples + 1, self.hop_samples)
+        squared = np.square(audio, dtype=np.float64)
+        cumulative = np.pad(np.cumsum(squared), (1, 0))
+        frame_energy = cumulative[starts + self.frame_samples] - cumulative[starts]
+        frame_rms = np.sqrt(frame_energy / self.frame_samples)
+        frame_rms = frame_rms[np.isfinite(frame_rms)]
+        if frame_rms.size == 0:
+            return 0.0
+        threshold = float(np.percentile(frame_rms, self.active_percentile))
+        active = frame_rms[frame_rms >= threshold]
+        if active.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(active))))
+
+    def __call__(self, audio: np.ndarray) -> np.ndarray:
+        level = self.active_rms(audio)
+        floor = 10.0 ** (self.floor_dbfs / 20.0)
+        if not math.isfinite(level) or level < floor:
+            return audio.astype(np.float32, copy=False)
+        current_dbfs = 20.0 * math.log10(max(level, np.finfo(np.float32).tiny))
+        gain_db = float(
+            np.clip(
+                self.target_dbfs - current_dbfs,
+                -self.max_attenuation_db,
+                self.max_gain_db,
+            )
+        )
+        output = audio.astype(np.float32, copy=True)
+        output *= 10.0 ** (gain_db / 20.0)
+        peak = float(np.max(np.abs(output))) if output.size else 0.0
+        if peak > 1.0:
+            output /= peak
+        return output.astype(np.float32, copy=False)
+
+
 class ASTFeatureAugmenter:
     """Training-only random frequency-response curves for normalized AST features."""
 
@@ -320,12 +385,14 @@ class ArchiveAudioCollator:
         mean_subtract: bool,
         high_pass_cutoff_hz: float | None,
         high_pass_order: int,
+        level_normalizer: ActiveRmsNormalizer | None = None,
         augmenter: WaveformAugmenter | None = None,
         feature_augmenter: ASTFeatureAugmenter | None = None,
     ) -> None:
         self.feature_extractor = feature_extractor
         self.target_samples = round(clip_seconds * SAMPLE_RATE)
         self.mean_subtract = mean_subtract
+        self.level_normalizer = level_normalizer
         self.augmenter = augmenter
         self.feature_augmenter = feature_augmenter
         self.handles: dict[str, zipfile.ZipFile] = {}
@@ -384,6 +451,8 @@ class ArchiveAudioCollator:
                 audio = sosfiltfilt(self.high_pass_sos, audio).astype(np.float32)
             except ValueError:
                 audio = sosfilt(self.high_pass_sos, audio).astype(np.float32)
+        if self.level_normalizer is not None:
+            audio = self.level_normalizer(audio)
         if self.augmenter is not None:
             audio = self.augmenter(audio)
         return audio
@@ -1152,6 +1221,25 @@ def preprocessing_from_checkpoint(args: argparse.Namespace) -> tuple[dict[str, A
         "high_pass_filter": bool(augmentation.get("high_pass_filter", False)),
         "high_pass_cutoff_hz": float(augmentation.get("high_pass_cutoff_hz", 50.0)),
         "high_pass_order": int(augmentation.get("high_pass_order", 4)),
+        "level_normalization": bool(augmentation.get("level_normalization", False)),
+        "level_normalization_mode": str(
+            augmentation.get("level_normalization_mode", "active_rms")
+        ),
+        "target_active_rms_dbfs": float(
+            augmentation.get("target_active_rms_dbfs", -45.0)
+        ),
+        "level_normalization_max_gain_db": float(
+            augmentation.get("level_normalization_max_gain_db", 12.0)
+        ),
+        "level_normalization_max_attenuation_db": float(
+            augmentation.get("level_normalization_max_attenuation_db", 12.0)
+        ),
+        "level_normalization_floor_dbfs": float(
+            augmentation.get("level_normalization_floor_dbfs", -70.0)
+        ),
+        "level_normalization_active_percentile": float(
+            augmentation.get("level_normalization_active_percentile", 80.0)
+        ),
         "clip_seconds": args.clip_seconds,
     }
     if args.mean_subtract is not None:
@@ -1162,6 +1250,24 @@ def preprocessing_from_checkpoint(args: argparse.Namespace) -> tuple[dict[str, A
         settings["high_pass_cutoff_hz"] = args.high_pass_cutoff_hz
     if args.high_pass_order is not None:
         settings["high_pass_order"] = args.high_pass_order
+    if args.level_normalization is not None:
+        settings["level_normalization"] = args.level_normalization
+    if args.level_normalization_mode is not None:
+        settings["level_normalization_mode"] = args.level_normalization_mode
+    if args.target_active_rms_dbfs is not None:
+        settings["target_active_rms_dbfs"] = args.target_active_rms_dbfs
+    if args.level_normalization_max_gain_db is not None:
+        settings["level_normalization_max_gain_db"] = args.level_normalization_max_gain_db
+    if args.level_normalization_max_attenuation_db is not None:
+        settings["level_normalization_max_attenuation_db"] = (
+            args.level_normalization_max_attenuation_db
+        )
+    if args.level_normalization_floor_dbfs is not None:
+        settings["level_normalization_floor_dbfs"] = args.level_normalization_floor_dbfs
+    if args.level_normalization_active_percentile is not None:
+        settings["level_normalization_active_percentile"] = (
+            args.level_normalization_active_percentile
+        )
     identity = {
         "model_name": args.model_name,
         "weights": file_identity(checkpoint[1]) if checkpoint is not None else None,
@@ -1845,6 +1951,21 @@ def train_audio_model(
             "high_pass_filter_argument": args.high_pass_filter,
             "high_pass_cutoff_hz_argument": args.high_pass_cutoff_hz,
             "high_pass_order_argument": args.high_pass_order,
+            "level_normalization_argument": args.level_normalization,
+            "level_normalization_mode_argument": args.level_normalization_mode,
+            "target_active_rms_dbfs_argument": args.target_active_rms_dbfs,
+            "level_normalization_max_gain_db_argument": (
+                args.level_normalization_max_gain_db
+            ),
+            "level_normalization_max_attenuation_db_argument": (
+                args.level_normalization_max_attenuation_db
+            ),
+            "level_normalization_floor_dbfs_argument": (
+                args.level_normalization_floor_dbfs
+            ),
+            "level_normalization_active_percentile_argument": (
+                args.level_normalization_active_percentile
+            ),
         },
         "augmentation": {
             "random_gain": bool(args.random_gain),
@@ -2296,6 +2417,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-pass-cutoff-hz", type=float)
     parser.add_argument("--high-pass-order", type=int)
     parser.add_argument(
+        "--level-normalization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Apply bounded active-RMS waveform normalization after deterministic "
+            "filtering and before training-only augmentation."
+        ),
+    )
+    parser.add_argument(
+        "--level-normalization-mode",
+        choices=["active_rms"],
+        default=None,
+    )
+    parser.add_argument("--target-active-rms-dbfs", type=float)
+    parser.add_argument("--level-normalization-max-gain-db", type=float)
+    parser.add_argument("--level-normalization-max-attenuation-db", type=float)
+    parser.add_argument("--level-normalization-floor-dbfs", type=float)
+    parser.add_argument("--level-normalization-active-percentile", type=float)
+    parser.add_argument(
         "--random-gain",
         action="store_true",
         help="Apply random waveform gain during full-backbone training only.",
@@ -2372,6 +2512,20 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"{name} must be between 0 and 1")
     if args.gain_db < 0:
         parser.error("--gain-db cannot be negative")
+    for value, name in (
+        (args.level_normalization_max_gain_db, "--level-normalization-max-gain-db"),
+        (
+            args.level_normalization_max_attenuation_db,
+            "--level-normalization-max-attenuation-db",
+        ),
+    ):
+        if value is not None and value < 0:
+            parser.error(f"{name} cannot be negative")
+    if (
+        args.level_normalization_active_percentile is not None
+        and not 0.0 <= args.level_normalization_active_percentile < 100.0
+    ):
+        parser.error("--level-normalization-active-percentile must be in [0, 100)")
     if args.max_shift_ms < 0 or args.time_shift_fade_ms < 0:
         parser.error("time-shift durations cannot be negative")
     if args.max_shift_ms >= args.clip_seconds * 1000.0:
@@ -2553,12 +2707,29 @@ def main() -> int:
         if args.filteraugment
         else None
     )
+    level_normalizer = (
+        ActiveRmsNormalizer(
+            sample_rate=SAMPLE_RATE,
+            target_dbfs=preprocessing["target_active_rms_dbfs"],
+            max_gain_db=preprocessing["level_normalization_max_gain_db"],
+            max_attenuation_db=preprocessing[
+                "level_normalization_max_attenuation_db"
+            ],
+            floor_dbfs=preprocessing["level_normalization_floor_dbfs"],
+            active_percentile=preprocessing[
+                "level_normalization_active_percentile"
+            ],
+        )
+        if preprocessing["level_normalization"]
+        else None
+    )
     validation_collator = ArchiveAudioCollator(
         feature_extractor,
         args.clip_seconds,
         preprocessing["mean_subtract"],
         preprocessing["high_pass_cutoff_hz"] if preprocessing["high_pass_filter"] else None,
         preprocessing["high_pass_order"],
+        level_normalizer=level_normalizer,
     )
     waveform_augmenter = (
         WaveformAugmenter(
@@ -2581,6 +2752,7 @@ def main() -> int:
         preprocessing["mean_subtract"],
         preprocessing["high_pass_cutoff_hz"] if preprocessing["high_pass_filter"] else None,
         preprocessing["high_pass_order"],
+        level_normalizer=level_normalizer,
         augmenter=waveform_augmenter,
         feature_augmenter=feature_augmenter,
     )
@@ -2617,6 +2789,17 @@ def main() -> int:
         print(
             f"High-pass settings:     {preprocessing['high_pass_cutoff_hz']:g} Hz, "
             f"order {preprocessing['high_pass_order']}"
+        )
+    print(f"Level normalization:    {preprocessing['level_normalization']}")
+    if preprocessing["level_normalization"]:
+        print(
+            "Level-normalization settings: "
+            f"{preprocessing['level_normalization_mode']}, "
+            f"target={preprocessing['target_active_rms_dbfs']:g} dBFS, "
+            f"gain=+{preprocessing['level_normalization_max_gain_db']:g}/"
+            f"-{preprocessing['level_normalization_max_attenuation_db']:g} dB, "
+            f"floor={preprocessing['level_normalization_floor_dbfs']:g} dBFS, "
+            f"active percentile={preprocessing['level_normalization_active_percentile']:g}"
         )
     print(
         "Training augmentation:   "
