@@ -50,6 +50,7 @@ class FullSpectrogramMultispeciesCetaceanInference(
         aggregation_config: Optional[Mapping[str, Any]] = None,
         compact_ast_frames: bool = True,
         compact_position_embedding_mode: str = "crop",
+        amp: bool = False,
     ) -> None:
         super().__init__(
             model_path=model_path,
@@ -64,6 +65,7 @@ class FullSpectrogramMultispeciesCetaceanInference(
                 "compact_position_embedding_mode must be 'crop' or 'interpolate'"
             )
         self.compact_position_embedding_mode = compact_position_embedding_mode
+        self.amp = bool(amp) and torch.device(self.device).type == "cuda"
         self._position_embedding_cache: dict[
             tuple[str, int, int], torch.Tensor
         ] = {}
@@ -193,6 +195,17 @@ class FullSpectrogramMultispeciesCetaceanInference(
         segment_duration: float,
         hop_duration: float,
     ) -> torch.Tensor:
+        # Per-window level normalization cannot be reproduced by scaling one
+        # shared full-recording fbank. Preserve checkpoint correctness by
+        # falling back to the reference window frontend for normalized models.
+        if self.level_normalization:
+            windows = self._windows(audio, segment_duration, hop_duration)
+            return self.feature_extractor(
+                windows,
+                sampling_rate=SAMPLE_RATE,
+                padding=True,
+                return_tensors="pt",
+            )["input_values"]
         try:
             import torchaudio
         except ImportError as exc:
@@ -280,12 +293,13 @@ class FullSpectrogramMultispeciesCetaceanInference(
             ) / (feature_std * 2.0)
         return input_values
 
-    def predict(
+    def predict_window_probabilities(
         self,
         wav_file_path: str,
         segment_duration: int = 3,
         hop_duration: int = 2,
-    ) -> dict[str, Any]:
+    ) -> dict[str, np.ndarray]:
+        """Return unaggregated trigger/source/ecotype probabilities."""
         input_values = self._compute_input_values(
             self._read_audio(wav_file_path),
             float(segment_duration),
@@ -298,18 +312,34 @@ class FullSpectrogramMultispeciesCetaceanInference(
         }
         with torch.inference_mode():
             for start in range(0, len(input_values), self.inference_batch_size):
-                logits = self.model(
-                    input_values=input_values[
-                        start : start + self.inference_batch_size
-                    ].to(self.device)
-                )
+                values = input_values[
+                    start : start + self.inference_batch_size
+                ].to(self.device)
+                with torch.autocast(
+                    device_type=torch.device(self.device).type,
+                    dtype=torch.float16,
+                    enabled=self.amp,
+                ):
+                    logits = self.model(input_values=values)
                 for name, values in zip(parts, logits):
                     parts[name].append(
-                        torch.softmax(values, dim=-1).cpu().numpy()
+                        torch.softmax(values.float(), dim=-1).cpu().numpy()
                     )
-        probabilities = {
+        return {
             name: np.concatenate(values) for name, values in parts.items()
         }
+
+    def predict(
+        self,
+        wav_file_path: str,
+        segment_duration: int = 3,
+        hop_duration: int = 2,
+    ) -> dict[str, Any]:
+        probabilities = self.predict_window_probabilities(
+            wav_file_path,
+            segment_duration=segment_duration,
+            hop_duration=hop_duration,
+        )
         aggregated = aggregate_probabilities(probabilities, self.aggregation)
         global_label = aggregated["global_label"]
         return {

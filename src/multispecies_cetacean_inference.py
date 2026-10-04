@@ -33,6 +33,42 @@ ECOTYPE_LABELS = {"NRKW": 0, "SRKW": 1, "OKW": 2, "SAR": 3, "TKW": 4}
 OUTPUT_LABELS = ("other/background", "humpback", "resident", "transient")
 
 
+def _active_rms_normalize(
+    audio: np.ndarray,
+    target_dbfs: float,
+    max_gain_db: float,
+    max_attenuation_db: float,
+    floor_dbfs: float,
+    active_percentile: float,
+) -> np.ndarray:
+    """Match the trainer's bounded active-RMS normalization."""
+    frame_samples = round(SAMPLE_RATE * 0.025)
+    hop_samples = round(SAMPLE_RATE * 0.010)
+    if len(audio) < frame_samples:
+        level = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) if len(audio) else 0.0
+    else:
+        starts = np.arange(0, len(audio) - frame_samples + 1, hop_samples)
+        squared = np.square(audio, dtype=np.float64)
+        cumulative = np.pad(np.cumsum(squared), (1, 0))
+        frame_rms = np.sqrt(
+            (cumulative[starts + frame_samples] - cumulative[starts]) / frame_samples
+        )
+        threshold = float(np.percentile(frame_rms, active_percentile))
+        active = frame_rms[frame_rms >= threshold]
+        level = float(np.sqrt(np.mean(np.square(active)))) if active.size else 0.0
+    if not math.isfinite(level) or level < 10.0 ** (floor_dbfs / 20.0):
+        return np.asarray(audio, dtype=np.float32)
+    current_dbfs = 20.0 * math.log10(max(level, np.finfo(np.float32).tiny))
+    gain_db = float(
+        np.clip(target_dbfs - current_dbfs, -max_attenuation_db, max_gain_db)
+    )
+    output = np.asarray(audio, dtype=np.float32) * (10.0 ** (gain_db / 20.0))
+    peak = float(np.max(np.abs(output))) if output.size else 0.0
+    if peak > 1.0:
+        output /= peak
+    return np.asarray(output, dtype=np.float32)
+
+
 @dataclass(frozen=True)
 class AggregationConfig:
     """Tuned 60-second operating point; all fields are config-map overridable."""
@@ -357,6 +393,22 @@ class MultispeciesCetaceanInference(ModelInference):
         self.high_pass_filter = bool(preprocessing.get("high_pass_filter", False))
         self.high_pass_cutoff_hz = float(preprocessing.get("high_pass_cutoff_hz", 50))
         self.high_pass_order = int(preprocessing.get("high_pass_order", 4))
+        self.level_normalization = bool(preprocessing.get("level_normalization", False))
+        self.target_active_rms_dbfs = float(
+            preprocessing.get("target_active_rms_dbfs", -45.0)
+        )
+        self.level_normalization_max_gain_db = float(
+            preprocessing.get("level_normalization_max_gain_db", 12.0)
+        )
+        self.level_normalization_max_attenuation_db = float(
+            preprocessing.get("level_normalization_max_attenuation_db", 12.0)
+        )
+        self.level_normalization_floor_dbfs = float(
+            preprocessing.get("level_normalization_floor_dbfs", -70.0)
+        )
+        self.level_normalization_active_percentile = float(
+            preprocessing.get("level_normalization_active_percentile", 80.0)
+        )
 
     @staticmethod
     def _read_audio(path: str) -> np.ndarray:
@@ -402,6 +454,15 @@ class MultispeciesCetaceanInference(ModelInference):
                     window = sosfiltfilt(high_pass_sos, window).astype(np.float32)
                 except ValueError:
                     window = sosfilt(high_pass_sos, window).astype(np.float32)
+            if self.level_normalization:
+                window = _active_rms_normalize(
+                    window,
+                    self.target_active_rms_dbfs,
+                    self.level_normalization_max_gain_db,
+                    self.level_normalization_max_attenuation_db,
+                    self.level_normalization_floor_dbfs,
+                    self.level_normalization_active_percentile,
+                )
             windows.append(window)
         return windows
 

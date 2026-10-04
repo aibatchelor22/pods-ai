@@ -44,6 +44,7 @@ from scipy.signal import butter, resample_poly, sosfilt, sosfiltfilt
 from transformers import AutoFeatureExtractor
 
 from train_multispecies_cetacean_model import (
+    ActiveRmsNormalizer,
     ECOTYPE_ID2LABEL,
     ECOTYPE_LABELS,
     SAMPLE_RATE,
@@ -187,6 +188,23 @@ def preprocessing_for_model(model_name: str) -> dict[str, Any]:
         "high_pass_filter": bool(values.get("high_pass_filter", False)),
         "high_pass_cutoff_hz": float(values.get("high_pass_cutoff_hz", 50.0)),
         "high_pass_order": int(values.get("high_pass_order", 4)),
+        "level_normalization": bool(values.get("level_normalization", False)),
+        "level_normalization_mode": str(
+            values.get("level_normalization_mode", "active_rms")
+        ),
+        "target_active_rms_dbfs": float(values.get("target_active_rms_dbfs", -45.0)),
+        "level_normalization_max_gain_db": float(
+            values.get("level_normalization_max_gain_db", 12.0)
+        ),
+        "level_normalization_max_attenuation_db": float(
+            values.get("level_normalization_max_attenuation_db", 12.0)
+        ),
+        "level_normalization_floor_dbfs": float(
+            values.get("level_normalization_floor_dbfs", -70.0)
+        ),
+        "level_normalization_active_percentile": float(
+            values.get("level_normalization_active_percentile", 80.0)
+        ),
     }
 
 
@@ -586,7 +604,12 @@ def high_pass_filter(settings: dict[str, Any]) -> np.ndarray | None:
     )
 
 
-def preprocess_window(audio: np.ndarray, settings: dict[str, Any], sos: np.ndarray | None) -> np.ndarray:
+def preprocess_window(
+    audio: np.ndarray,
+    settings: dict[str, Any],
+    sos: np.ndarray | None,
+    level_normalizer: ActiveRmsNormalizer | None = None,
+) -> np.ndarray:
     result = np.asarray(audio, dtype=np.float32)
     if settings["mean_subtract"]:
         result = result - float(result.mean())
@@ -595,6 +618,8 @@ def preprocess_window(audio: np.ndarray, settings: dict[str, Any], sos: np.ndarr
             result = sosfiltfilt(sos, result)
         except ValueError:
             result = sosfilt(sos, result)
+    if level_normalizer is not None:
+        result = level_normalizer(result)
     return np.asarray(result, dtype=np.float32)
 
 
@@ -604,6 +629,7 @@ def read_contiguous_batch(
     window_sec: float,
     settings: dict[str, Any],
     sos: np.ndarray | None,
+    level_normalizer: ActiveRmsNormalizer | None = None,
 ) -> list[np.ndarray]:
     source_rate = int(handle.samplerate)
     target_length = round(window_sec * SAMPLE_RATE)
@@ -623,7 +649,7 @@ def read_contiguous_batch(
         waveform = np.asarray(mono[relative : relative + target_length], dtype=np.float32)
         if len(waveform) < target_length:
             waveform = np.pad(waveform, (0, target_length - len(waveform)))
-        windows.append(preprocess_window(waveform, settings, sos))
+        windows.append(preprocess_window(waveform, settings, sos, level_normalizer))
     return windows
 
 
@@ -750,6 +776,22 @@ def infer_recordings(
     timings = Counter()
     settings = bundles[0].preprocessing
     sos = high_pass_filter(settings)
+    level_normalizer = (
+        ActiveRmsNormalizer(
+            sample_rate=SAMPLE_RATE,
+            target_dbfs=settings["target_active_rms_dbfs"],
+            max_gain_db=settings["level_normalization_max_gain_db"],
+            max_attenuation_db=settings[
+                "level_normalization_max_attenuation_db"
+            ],
+            floor_dbfs=settings["level_normalization_floor_dbfs"],
+            active_percentile=settings[
+                "level_normalization_active_percentile"
+            ],
+        )
+        if settings["level_normalization"]
+        else None
+    )
     temp_root = Path(args.temp_dir) if args.temp_dir else None
     for file_index, recording in enumerate(recordings, start=1):
         active = [bundle for bundle in bundles if recording.recording_id not in bundle.completed_recordings]
@@ -780,7 +822,12 @@ def infer_recordings(
                         batch_starts = starts[offset : offset + args.batch_size]
                         io_started = time.perf_counter()
                         waveforms = read_contiguous_batch(
-                            handle, batch_starts, args.window_sec, settings, sos
+                            handle,
+                            batch_starts,
+                            args.window_sec,
+                            settings,
+                            sos,
+                            level_normalizer,
                         )
                         features = extractor(
                             waveforms,

@@ -274,6 +274,22 @@ def infer_full_spectrogram_recordings(
     predictor.high_pass_filter = bool(preprocessing["high_pass_filter"])
     predictor.high_pass_cutoff_hz = float(preprocessing["high_pass_cutoff_hz"])
     predictor.high_pass_order = int(preprocessing["high_pass_order"])
+    predictor.level_normalization = bool(preprocessing["level_normalization"])
+    predictor.target_active_rms_dbfs = float(
+        preprocessing["target_active_rms_dbfs"]
+    )
+    predictor.level_normalization_max_gain_db = float(
+        preprocessing["level_normalization_max_gain_db"]
+    )
+    predictor.level_normalization_max_attenuation_db = float(
+        preprocessing["level_normalization_max_attenuation_db"]
+    )
+    predictor.level_normalization_floor_dbfs = float(
+        preprocessing["level_normalization_floor_dbfs"]
+    )
+    predictor.level_normalization_active_percentile = float(
+        preprocessing["level_normalization_active_percentile"]
+    )
 
     frames: list[pd.DataFrame] = []
     started = time.perf_counter()

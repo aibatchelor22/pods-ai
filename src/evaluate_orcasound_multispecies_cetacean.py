@@ -26,6 +26,7 @@ from scipy.signal import butter, resample_poly, sosfilt, sosfiltfilt
 from transformers import AutoFeatureExtractor
 
 from train_multispecies_cetacean_model import (
+    ActiveRmsNormalizer,
     ECOTYPE_LABELS,
     SAMPLE_RATE,
     SOURCE_LABELS,
@@ -147,6 +148,25 @@ def checkpoint_preprocessing(model_name: str) -> dict[str, Any]:
         "high_pass_filter": bool(augmentation.get("high_pass_filter", False)),
         "high_pass_cutoff_hz": float(augmentation.get("high_pass_cutoff_hz", 50.0)),
         "high_pass_order": int(augmentation.get("high_pass_order", 4)),
+        "level_normalization": bool(augmentation.get("level_normalization", False)),
+        "level_normalization_mode": str(
+            augmentation.get("level_normalization_mode", "active_rms")
+        ),
+        "target_active_rms_dbfs": float(
+            augmentation.get("target_active_rms_dbfs", -45.0)
+        ),
+        "level_normalization_max_gain_db": float(
+            augmentation.get("level_normalization_max_gain_db", 12.0)
+        ),
+        "level_normalization_max_attenuation_db": float(
+            augmentation.get("level_normalization_max_attenuation_db", 12.0)
+        ),
+        "level_normalization_floor_dbfs": float(
+            augmentation.get("level_normalization_floor_dbfs", -70.0)
+        ),
+        "level_normalization_active_percentile": float(
+            augmentation.get("level_normalization_active_percentile", 80.0)
+        ),
     }
 
 
@@ -180,6 +200,22 @@ def audio_windows(
             fs=SAMPLE_RATE,
             output="sos",
         )
+    level_normalizer = (
+        ActiveRmsNormalizer(
+            sample_rate=SAMPLE_RATE,
+            target_dbfs=preprocessing["target_active_rms_dbfs"],
+            max_gain_db=preprocessing["level_normalization_max_gain_db"],
+            max_attenuation_db=preprocessing[
+                "level_normalization_max_attenuation_db"
+            ],
+            floor_dbfs=preprocessing["level_normalization_floor_dbfs"],
+            active_percentile=preprocessing[
+                "level_normalization_active_percentile"
+            ],
+        )
+        if preprocessing["level_normalization"]
+        else None
+    )
     for index in range(positions):
         start = index * hop_samples
         segment = audio[start : start + segment_samples]
@@ -195,6 +231,8 @@ def audio_windows(
                 segment = sosfiltfilt(high_pass_sos, segment).astype(np.float32)
             except ValueError:
                 segment = sosfilt(high_pass_sos, segment).astype(np.float32)
+        if level_normalizer is not None:
+            segment = level_normalizer(segment)
         windows.append(np.asarray(segment, dtype=np.float32))
         starts.append(start / SAMPLE_RATE)
     return windows, np.asarray(starts, dtype=np.float64)
